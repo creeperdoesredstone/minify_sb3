@@ -202,16 +202,6 @@ def _collect_dangling_in_input(value, ids, dangling):
 			_collect_dangling_in_input(v, ids, dangling)
 
 
-def _has_dangling_block_refs(target):
-	return bool(_dangling_block_ids(target))
-
-
-def _dangling_in_input(value, ids):
-	dangling = set()
-	_collect_dangling_in_input(value, ids, dangling)
-	return bool(dangling)
-
-
 def strip_sprite_comments(project, stats):
 	for target in project.get("targets", []):
 		if target.get("isStage"):
@@ -1283,17 +1273,19 @@ def remove_unreachable_blocks(project, stats):
 		blocks = target.get("blocks", {})
 		roots = {
 			bid for bid, b in blocks.items()
-			if isinstance(b, list) or b.get("topLevel") or b.get("parent") is None
+			if isinstance(b, list) or b.get("topLevel")
 		}
-		edges = _build_block_graph(target)     # build ONCE per target, not per node
+		edges = _build_block_graph(target)  # build once per target
 		reachable = set()
 		stack = list(roots)
+
 		while stack:
 			bid = stack.pop()
 			if bid in reachable or bid not in blocks:
 				continue
 			reachable.add(bid)
 			stack.extend(edges.get(bid, ()))
+		
 		for bid in list(blocks):
 			if bid not in reachable:
 				del blocks[bid]
