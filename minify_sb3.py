@@ -7,7 +7,7 @@ import zipfile
 from collections import Counter
 
 
-BLOCK_ID_ALPHABET = '!@#$%^*()+_-={}|[]:;<>?,./~ABCDEFGHJKLMNOPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789"'
+BLOCK_ID_ALPHABET = '!@#$%^*()+_-={}|[]:;<>?,./~ABCDEFGHJKLMNOPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789'
 
 
 class Ansi:
@@ -83,7 +83,7 @@ def _replace_input_block_ids(value, block_ids):
 
 def rename_block_ids(project, stats):
 	total_stats = 0
-	all_maps = {}   # {target_index: {old_block_id: new_block_id}}
+	all_maps = {}
 	dangling_skipped = 0
 
 	for ti, target in enumerate(project.get("targets", [])):
@@ -92,69 +92,77 @@ def rename_block_ids(project, stats):
 		if not old_ids:
 			continue
 
-		if _has_dangling_block_refs(target):
-			dangling_skipped += 1
-			continue
-
-		block_ids = _rename_id_map(old_ids)
+		dangling = _dangling_block_ids(target)
+		block_ids = _rename_id_map(old_ids, existing_ids=dangling)
 		all_maps[ti] = block_ids
-		total_stats += len(block_ids)
 
-		target["blocks"] = {
-			block_ids.get(old_id, old_id): block for old_id, block in blocks.items()
-		}
-		for block in target["blocks"].values():
+		new_blocks = {block_ids.get(old_id, old_id): block for old_id, block in blocks.items()}
+		for block in new_blocks.values():
 			if isinstance(block, dict):
 				for key in ("next", "parent"):
-					if key in block:
-						block[key] = block_ids.get(block[key], block[key])
+					if block.get(key) in block_ids:
+						block[key] = block_ids[block[key]]
 				for value in (block.get("inputs") or {}).values():
 					_replace_input_block_ids(value, block_ids)
-			# bare-list primitives (isinstance(block, list)): index 2 is a
-			# variable/list id, not a block id -- nothing to rewrite here.
 		for comment in (target.get("comments") or {}).values():
 			if isinstance(comment, dict) and "blockId" in comment and comment["blockId"] is not None:
 				comment["blockId"] = block_ids.get(comment["blockId"], comment["blockId"])
+		target["blocks"] = new_blocks
+		total_stats += len(block_ids)
 
 	stats["block_ids"] += total_stats
 	stats["dangling_refs_skipped"] += dangling_skipped
 	return all_maps
 
 
-def _has_dangling_block_refs(target):
+def _dangling_block_ids(target):
 	blocks = target.get("blocks", {})
 	ids = set(blocks)
+	dangling = set()
 	for block in blocks.values():
 		if not isinstance(block, dict):
 			continue
 		for key in ("next", "parent"):
 			v = block.get(key)
 			if isinstance(v, str) and v not in ids:
-				return True
+				dangling.add(v)
 		for value in (block.get("inputs") or {}).values():
-			if _dangling_in_input(value, ids):
-				return True
+			_collect_dangling_in_input(value, ids, dangling)
 	for comment in (target.get("comments") or {}).values():
 		if isinstance(comment, dict):
 			bid = comment.get("blockId")
 			if isinstance(bid, str) and bid not in ids:
-				return True
-	return False
+				dangling.add(bid)
+	return dangling
+
+
+def _collect_dangling_in_input(value, ids, dangling):
+	if not isinstance(value, list) or not value:
+		return
+	if value[0] in (1, 2) and len(value) > 1:
+		if isinstance(value[1], str) and value[1] not in ids:
+			dangling.add(value[1])
+	elif value[0] == 3:
+		if len(value) > 1 and isinstance(value[1], str) and value[1] not in ids:
+			dangling.add(value[1])
+		if len(value) > 2:
+			if isinstance(value[2], str) and value[2] not in ids:
+				dangling.add(value[2])
+			else:
+				_collect_dangling_in_input(value[2], ids, dangling)
+	else:
+		for v in value:
+			_collect_dangling_in_input(v, ids, dangling)
+
+
+def _has_dangling_block_refs(target):
+	return bool(_dangling_block_ids(target))
 
 
 def _dangling_in_input(value, ids):
-	if not isinstance(value, list) or not value:
-		return False
-	if value[0] in (1, 2) and len(value) > 1:
-		return isinstance(value[1], str) and value[1] not in ids
-	if value[0] == 3:
-		if len(value) > 1 and isinstance(value[1], str) and value[1] not in ids:
-			return True
-		if len(value) > 2:
-			if isinstance(value[2], str):
-				return value[2] not in ids
-			return _dangling_in_input(value[2], ids)
-	return False
+	dangling = set()
+	_collect_dangling_in_input(value, ids, dangling)
+	return bool(dangling)
 
 
 def strip_sprite_comments(project, stats):
@@ -229,6 +237,15 @@ def round_positions(project, stats):
 					n = _round_num(comment[k])
 					if n != comment[k] or type(n) is not type(comment[k]):
 						comment[k] = n
+						stats["rounded"] += 1
+		for costume in target.get("costumes", []):
+			if not isinstance(costume, dict):
+				continue
+			for k in ("rotationCenterX", "rotationCenterY"):
+				if k in costume:
+					n = _round_num(costume[k])
+					if n != costume[k] or type(n) is not type(costume[k]):
+						costume[k] = n
 						stats["rounded"] += 1
 
 
@@ -354,6 +371,7 @@ LIST_SHOWHIDE_OPS = {"data_showlist", "data_hidelist"}
 
 DEFAULT_LIST_BYTES = 4096
 DEFAULT_LIST_ITEMS = 1000
+DEFAULT_EPSILON = 1e-8
 
 WAV_TO_MP3_BITRATE = "128k"
 WAV_TO_MP3_SAMPLE_RATE = 44100
@@ -839,38 +857,39 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 					hits.add(ti)
 		return hits
 
+	allocated_ids = set()
 	if rename_variables:
 		stage_ids = list(targets[stage_index].get("variables", {}).keys()) if stage_index is not None else []
-		stage_new_ids = _rename_id_map(stage_ids) if stage_ids else {}
+		stage_new_ids = _rename_id_map(stage_ids, existing_ids=allocated_ids) if stage_ids else {}
+		allocated_ids.update(stage_new_ids.values())
 		if stage_index is not None:
 			for old, new in stage_new_ids.items():
 				var_map[(stage_index, old)] = new
-		reserved_targets = sprites_referencing_stage_ids(stage_var_ids, 12)
-		forbidden = set(stage_new_ids.values())
 		for ti, target in enumerate(targets):
 			if ti == stage_index:
 				continue
 			ids = list((target.get("variables") or {}).keys())
 			if not ids:
 				continue
-			new_ids = _rename_id_map(ids, existing_ids=(forbidden if ti in reserved_targets else ()))
+			new_ids = _rename_id_map(ids, existing_ids=allocated_ids)
+			allocated_ids.update(new_ids.values())
 			for old, new in new_ids.items():
 				var_map[(ti, old)] = new
 	if rename_lists:
 		stage_ids = list(targets[stage_index].get("lists", {}).keys()) if stage_index is not None else []
-		stage_new_ids = _rename_id_map(stage_ids) if stage_ids else {}
+		stage_new_ids = _rename_id_map(stage_ids, existing_ids=allocated_ids) if stage_ids else {}
+		allocated_ids.update(stage_new_ids.values())
 		if stage_index is not None:
 			for old, new in stage_new_ids.items():
 				list_map[(stage_index, old)] = new
-		reserved_targets = sprites_referencing_stage_ids(stage_list_ids, 13)
-		forbidden = set(stage_new_ids.values())
 		for ti, target in enumerate(targets):
 			if ti == stage_index:
 				continue
 			ids = list((target.get("lists") or {}).keys())
 			if not ids:
 				continue
-			new_ids = _rename_id_map(ids, existing_ids=(forbidden if ti in reserved_targets else ()))
+			new_ids = _rename_id_map(ids, existing_ids=allocated_ids)
+			allocated_ids.update(new_ids.values())
 			for old, new in new_ids.items():
 				list_map[(ti, old)] = new
 
@@ -984,7 +1003,7 @@ def _replace_broadcast_ids_in_value(value, mapping):
 			_replace_broadcast_ids_in_value(v, mapping)
 
 
-def rename_broadcast_ids(project, stats):
+def rename_broadcast_ids(project, stats, existing_ids=()):
 	ids = set()
 	for target in project.get("targets", []):
 		for old_id in (target.get("broadcasts") or {}):
@@ -997,7 +1016,7 @@ def rename_broadcast_ids(project, stats):
 						ids.add(f[1])
 				for value in (block.get("inputs") or {}).values():
 					_collect_broadcast_ids_in_value(value, ids)
-	mapping = _rename_id_map(sorted(ids))
+	mapping = _rename_id_map(sorted(ids), existing_ids=existing_ids)
 	for target in project.get("targets", []):
 		if target.get("broadcasts"):
 			target["broadcasts"] = {
@@ -1147,7 +1166,10 @@ def _collect_block_refs(value, blocks, out):
 			if len(value) > 1 and isinstance(value[1], str) and value[1] in blocks:
 				out.add(value[1])
 			if value[0] == 3 and len(value) > 2:
-				_collect_block_refs(value[2], blocks, out)
+				if isinstance(value[2], str) and value[2] in blocks:
+					out.add(value[2])
+				else:
+					_collect_block_refs(value[2], blocks, out)
 		else:
 			for v in value:
 				_collect_block_refs(v, blocks, out)
@@ -1241,16 +1263,19 @@ def remove_unused_procedures(project, stats):
 	return removable_total
 
 
-def normalize_numbers(project, stats):
+def normalize_numbers(project, stats, epsilon):
 	changed = 0
 	def rec(v):
 		nonlocal changed
 		if isinstance(v, bool):
 			return v
-		if isinstance(v, float) and v == v and v not in (float("inf"), float("-inf")):
+		if isinstance(v, float) and v not in (float("inf"), float("-inf")):
 			if v.is_integer() and not (v == 0 and str(v).startswith("-")):
 				changed += 1
 				return int(v)
+			if round(v) != 0 and abs(v - round(v)) < epsilon:
+				changed += 1
+				return round(v)
 			return v
 		if isinstance(v, list):
 			return [rec(x) for x in v]
@@ -1332,6 +1357,13 @@ def convert_wav_sounds_to_mp3(project, assets, stats):
 	return conversions
 
 
+def remove_sound_metadata(project):
+	for target in project.get("targets", []):
+		for sound in target.get("sounds", []):
+			if isinstance(sound, dict):
+				sound.pop("rate", None)
+				sound.pop("sampleCount", None)
+
 class Options:
 	def __init__(
 		self,
@@ -1355,6 +1387,8 @@ class Options:
 		compression_level=9,
 		list_bytes=DEFAULT_LIST_BYTES,
 		list_items=DEFAULT_LIST_ITEMS,
+		normalize_epsilon=DEFAULT_EPSILON,
+		keep_sound_metadata=False
 	):
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
@@ -1384,9 +1418,11 @@ class Options:
 		self.wav_conversions = {}   # {old_filename: new_filename}, set by apply_transforms
 		self.list_bytes, self.list_items = list_bytes, list_items
 		self.cleared_lists = frozenset()  # {(target_index, list_id)} approved by user
+		self.normalize_epsilon = normalize_epsilon
+		self.keep_sound_metadata = keep_sound_metadata
 
 
-def apply_transforms(project, opts, assets=None):
+def apply_transforms(project, opts: Options, assets=None):
 	stats = minify_blocks(project)
 	if opts.convert_wav_to_mp3 and assets is not None:
 		opts.wav_conversions = convert_wav_sounds_to_mp3(project, assets, stats)
@@ -1408,18 +1444,25 @@ def apply_transforms(project, opts, assets=None):
 		remove_unused_procedures(project, stats)
 	if opts.remove_unreachable:
 		remove_unreachable_blocks(project, stats)
+	used_data_ids = set()
 	if opts.rename_variable_ids or opts.rename_list_ids:
 		opts.renamed_variable_ids, opts.renamed_list_ids = rename_variable_list_ids(
 			project, stats, opts.rename_variable_ids, opts.rename_list_ids
 		)
+		used_data_ids.update(opts.renamed_variable_ids.values())
+		used_data_ids.update(opts.renamed_list_ids.values())
 	if opts.rename_broadcast_ids:
-		opts.renamed_broadcast_ids = rename_broadcast_ids(project, stats)
+		opts.renamed_broadcast_ids = rename_broadcast_ids(
+			project, stats, existing_ids=used_data_ids
+		)
 	if opts.rename_argument_ids:
 		opts.renamed_argument_ids = rename_argument_ids(project, stats)
 	if opts.rename_block_ids:
 		opts.renamed_block_ids = rename_block_ids(project, stats)
 	if opts.normalize_numbers:
-		normalize_numbers(project, stats)
+		normalize_numbers(project, stats, opts.normalize_epsilon)
+	if not opts.keep_sound_metadata:
+		remove_sound_metadata(project)
 	return stats
 
 
@@ -1538,7 +1581,6 @@ def _restore_data_ids(project, variable_ids, list_ids):
 			m["id"] = restore_var(ti, m.get("id"))
 		elif m.get("opcode") == "data_listcontents":
 			m["id"] = restore_list(ti, m.get("id"))
-
 
 
 def _restore_broadcast_ids(project, mapping):
@@ -1715,14 +1757,18 @@ def verify(original_path, minified_path, opts):
 			if set(to) != set(tm):
 				return False, f"{name!r}: target keys changed"
 			for k in to:
-				if k in ("blocks", "comments", "lists", "variables"):
+				if k in ("blocks", "comments", "lists", "variables", "sounds", "costumes"):
 					continue
 				if to[k] != tm[k]:
+					if opts.normalize_numbers and _num_eq(to[k], tm[k]):
+						continue
 					return False, f"{name!r}: {k} changed"
 
-			if set(tm.get("variables", {})) - set(to.get("variables", {})):
+			to_vars = to.get("variables", {})
+			tm_vars = tm.get("variables", {})
+			if set(tm_vars) - set(to_vars):
 				return False, f"{name!r}: unexpected variable ids appeared"
-			missing_vars = set(to.get("variables", {})) - set(tm.get("variables", {}))
+			missing_vars = set(to_vars) - set(tm_vars)
 			if missing_vars and not opts.remove_unused_variables:
 				return False, f"{name!r}: variable id set changed"
 			if missing_vars:
@@ -1730,13 +1776,28 @@ def verify(original_path, minified_path, opts):
 				still_used = {vid for vid in missing_vars if (ti, vid) in used_vars}
 				if still_used:
 					return False, f"{name!r}: referenced variable was removed"
-			for vid, vo in to.get("variables", {}).items():
-				if vid in tm.get("variables", {}) and vo != tm["variables"][vid]:
+			for vid, vo in to_vars.items():
+				if vid in tm_vars:
+					vm = tm_vars[vid]
+					if vo == vm:
+						continue
+					if (
+						opts.normalize_numbers
+						and isinstance(vo, list)
+						and isinstance(vm, list)
+						and len(vo) == len(vm)
+						and vo[0] == vm[0]
+						and (_num_eq(vo[1], vm[1]) or vo[1] == vm[1])
+						and (len(vo) < 3 or vo[2:] == vm[2:])
+					):
+						continue
 					return False, f"{name!r}: variable {vo[0] if isinstance(vo, list) and vo else vid!r} changed"
 
-			if set(tm["lists"]) - set(to["lists"]):
+			to_lists = to.get("lists", {})
+			tm_lists = tm.get("lists", {})
+			if set(tm_lists) - set(to_lists):
 				return False, f"{name!r}: unexpected list ids appeared"
-			missing_lists = set(to["lists"]) - set(tm["lists"])
+			missing_lists = set(to_lists) - set(tm_lists)
 			if missing_lists and not opts.remove_unused_lists:
 				return False, f"{name!r}: list id set changed"
 			if missing_lists:
@@ -1744,11 +1805,26 @@ def verify(original_path, minified_path, opts):
 				still_used = {lid for lid in missing_lists if (ti, lid) in used_lists}
 				if still_used:
 					return False, f"{name!r}: referenced list was removed"
-			for lid, lo in to["lists"].items():
-				if lid not in tm["lists"]:
+			for lid, lo in to_lists.items():
+				if lid not in tm_lists:
 					continue
-				lm = tm["lists"][lid]
+				lm = tm_lists[lid]
 				if lo == lm:
+					continue
+				if (
+					opts.normalize_numbers
+					and isinstance(lo, list)
+					and isinstance(lm, list)
+					and len(lo) == len(lm)
+					and lo[0] == lm[0]
+					and isinstance(lo[1], list)
+					and isinstance(lm[1], list)
+					and len(lo[1]) == len(lm[1])
+					and all(
+						x == y or _num_eq(x, y)
+						for x, y in zip(lo[1], lm[1])
+					)
+				):
 					continue
 				if not (
 					(ti, lid) in approved
@@ -1828,6 +1904,17 @@ def verify(original_path, minified_path, opts):
 			for snd in tm.get("sounds", []):
 				if "md5ext" not in snd:
 					return False, f"sound {snd.get('name')!r} lost md5ext"
+
+			to_costumes = to.get("costumes", [])
+			tm_costumes = tm.get("costumes", [])
+			if len(to_costumes) != len(tm_costumes):
+				return False, f"{name!r}: costume count changed"
+			for co, cm in zip(to_costumes, tm_costumes):
+				for key, value in cm.items():
+					if key in ("rotationCenterX", "rotationCenterY"):
+						continue
+					if value != co.get(key):
+						return False, f"costume data doesn't match at key '{key}'"
 
 			if _check_argument_id_consistency(to, name) is None:
 				err = _check_argument_id_consistency(tm, name)
@@ -1953,7 +2040,7 @@ def minify_sb3(src, dst, opts=None):
 			for item in zin.infolist()
 			if item.filename != "project.json"
 		}
-		original_asset_names = set(assets)
+		# original_asset_names = set(assets)
 
 		stats = apply_transforms(project, opts, assets)
 		out_json = dumps_compact(project, opts.sort_keys).encode("utf-8")
@@ -2007,6 +2094,7 @@ if __name__ == "__main__":
 		"--remove-unused-procedures",
 		"--normalize-numbers",
 		"--sort-keys",
+		"--keep-sound-metadata",
 	}
 	valued = {"--list-bytes", "--list-items", "--compression-level"}
 	values, bad = {}, []
@@ -2054,6 +2142,8 @@ if __name__ == "__main__":
 		compression_level=values.get("--compression-level", 9),
 		list_bytes=values.get("--list-bytes", DEFAULT_LIST_BYTES),
 		list_items=values.get("--list-items", DEFAULT_LIST_ITEMS),
+		normalize_epsilon=values.get("--normalize_epsilon", DEFAULT_EPSILON),
+		keep_sound_metadata="--keep-sound-metadata" in flags,
 	)
 	dst = args[1] if len(args) > 1 else os.path.splitext(args[0])[0] + "_minified.sb3"
 	if os.path.abspath(args[0]) == os.path.abspath(dst):
