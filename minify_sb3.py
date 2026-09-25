@@ -175,7 +175,7 @@ def minify_blocks(project):
 	stats = Counter()
 	for target in project.get("targets", []):
 		for block in target.get("blocks", {}).values():
-			if not isinstance(block, dict):  # bare primitive [12,name,id,x,y]
+			if not isinstance(block, dict):  # primitive [12, name, id, x, y]
 				continue
 			if block.get("topLevel") is False:
 				del block["topLevel"]
