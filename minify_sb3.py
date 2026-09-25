@@ -1,9 +1,11 @@
+import copy
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import zipfile
+import zlib
 from collections import Counter
 
 
@@ -81,7 +83,48 @@ def _replace_input_block_ids(value, block_ids):
 				_replace_input_block_ids(value[2], block_ids)
 
 
-def rename_block_ids(project, stats):
+def _count_input_block_refs(value, blocks, refs):
+	if not isinstance(value, list) or not value:
+		return
+	if value[0] in (1, 2) and len(value) > 1:
+		if isinstance(value[1], str) and value[1] in blocks:
+			refs[value[1]] += 1
+	elif value[0] == 3:
+		if len(value) > 1 and isinstance(value[1], str) and value[1] in blocks:
+			refs[value[1]] += 1
+		if len(value) > 2:
+			if isinstance(value[2], str) and value[2] in blocks:
+				refs[value[2]] += 1
+			else:
+				_count_input_block_refs(value[2], blocks, refs)
+	else:
+		for v in value:
+			_count_input_block_refs(v, blocks, refs)
+
+
+def _count_block_references(target):
+	blocks = target.get("blocks", {})
+	refs = Counter()
+	for bid, block in blocks.items():
+		refs[bid] += 1
+		if isinstance(block, dict):
+			nxt = block.get("next")
+			if isinstance(nxt, str) and nxt in blocks:
+				refs[nxt] += 1
+			par = block.get("parent")
+			if isinstance(par, str) and par in blocks:
+				refs[par] += 1
+			for value in (block.get("inputs") or {}).values():
+				_count_input_block_refs(value, blocks, refs)
+	for comment in (target.get("comments") or {}).values():
+		if isinstance(comment, dict):
+			cbid = comment.get("blockId")
+			if isinstance(cbid, str) and cbid in blocks:
+				refs[cbid] += 1
+	return refs
+
+
+def rename_block_ids(project, stats, frequency_order=False):
 	total_stats = 0
 	all_maps = {}
 	dangling_skipped = 0
@@ -91,6 +134,10 @@ def rename_block_ids(project, stats):
 		old_ids = list(blocks.keys())
 		if not old_ids:
 			continue
+
+		if frequency_order:
+			refs = _count_block_references(target)
+			old_ids = sorted(old_ids, key=lambda x: (-refs[x], x))
 
 		dangling = _dangling_block_ids(target)
 		block_ids = _rename_id_map(old_ids, existing_ids=dangling)
@@ -710,43 +757,56 @@ def _field_id(block, names):
 	return None
 
 
-def _collect_data_ids(project):
+def _collect_data_references(project, var_owners=None, list_owners=None):
 	targets = project.get("targets", [])
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
 	stage_var_ids = set(targets[stage_index].get("variables", {})) if stage_index is not None else set()
 	stage_list_ids = set(targets[stage_index].get("lists", {})) if stage_index is not None else set()
 
-	used_vars = set()      # {(target_index, id)}
-	used_lists = set()     # {(target_index, id)}
-	used_broadcasts = set()
+	var_refs = {}
+	list_refs = {}
+	broadcast_refs = {}
 
-	def resolve_var(ti, i):
+	def add_var_ref(ti, i, desc):
 		if not isinstance(i, str):
 			return
 		target_ids = targets[ti].get("variables", {})
 		if i in target_ids:
-			used_vars.add((ti, i))
+			var_refs.setdefault((ti, i), []).append(desc)
 		elif stage_index is not None and i in stage_var_ids:
-			used_vars.add((stage_index, i))
+			var_refs.setdefault((stage_index, i), []).append(desc)
+		elif var_owners and i in var_owners:
+			var_refs.setdefault((var_owners[i], i), []).append(desc)
+		else:
+			var_refs.setdefault((ti, i), []).append(desc)
 
-	def resolve_list(ti, i):
+	def add_list_ref(ti, i, desc):
 		if not isinstance(i, str):
 			return
 		target_ids = targets[ti].get("lists", {})
 		if i in target_ids:
-			used_lists.add((ti, i))
+			list_refs.setdefault((ti, i), []).append(desc)
 		elif stage_index is not None and i in stage_list_ids:
-			used_lists.add((stage_index, i))
+			list_refs.setdefault((stage_index, i), []).append(desc)
+		elif list_owners and i in list_owners:
+			list_refs.setdefault((list_owners[i], i), []).append(desc)
+		else:
+			list_refs.setdefault((ti, i), []).append(desc)
 
 	for ti, target in enumerate(targets):
-		for block in target.get("blocks", {}).values():
+		tname = target.get("name", f"target_{ti}")
+		for bid, block in target.get("blocks", {}).items():
+			b_op = block.get("opcode") if isinstance(block, dict) else "primitive"
+			desc = f"block {bid!r} ({b_op}) in {tname!r}"
 			for v in _walk_block_values(block):
 				if isinstance(v, list) and v:
 					tag = v[0]
 					if tag == 12 and len(v) > 2 and isinstance(v[2], str):
-						resolve_var(ti, v[2])
+						add_var_ref(ti, v[2], desc)
 					elif tag == 13 and len(v) > 2 and isinstance(v[2], str):
-						resolve_list(ti, v[2])
+						add_list_ref(ti, v[2], desc)
+					elif tag == 11 and len(v) > 2 and isinstance(v[2], str):
+						broadcast_refs.setdefault(v[2], []).append(desc)
 
 			if not isinstance(block, dict):
 				continue
@@ -755,11 +815,20 @@ def _collect_data_ids(project):
 				if not (isinstance(f, list) and len(f) > 1 and isinstance(f[1], str)):
 					continue
 				if name == "VARIABLE":
-					resolve_var(ti, f[1])
+					add_var_ref(ti, f[1], desc)
 				elif name == "LIST":
-					resolve_list(ti, f[1])
+					add_list_ref(ti, f[1], desc)
 				elif name in ("BROADCAST_OPTION", "BROADCAST_INPUT"):
-					used_broadcasts.add(f[1])
+					broadcast_refs.setdefault(f[1], []).append(desc)
+
+			if block.get("opcode") == "sensing_of_property_menu":
+				prop_field = fields.get("PROPERTY")
+				if isinstance(prop_field, list) and len(prop_field) > 0 and isinstance(prop_field[0], str):
+					prop_name = prop_field[0]
+					for target_idx, t in enumerate(targets):
+						for vid, vdata in (t.get("variables") or {}).items():
+							if isinstance(vdata, list) and len(vdata) > 0 and vdata[0] == prop_name:
+								add_var_ref(target_idx, vid, f"sensing_of property {prop_name!r} in {desc}")
 
 	name_to_index = {t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")}
 	for m in project.get("monitors", []):
@@ -770,12 +839,19 @@ def _collect_data_ids(project):
 		if ti is None:
 			continue
 		op = m.get("opcode")
-		if op == "data_variable" and isinstance(m.get("id"), str):
-			resolve_var(ti, m["id"])
-		elif op == "data_listcontents" and isinstance(m.get("id"), str):
-			resolve_list(ti, m["id"])
+		mid = m.get("id")
+		desc = f"monitor {mid!r} ({op})"
+		if op == "data_variable" and isinstance(mid, str):
+			add_var_ref(ti, mid, desc)
+		elif op == "data_listcontents" and isinstance(mid, str):
+			add_list_ref(ti, mid, desc)
 
-	return used_vars, used_lists, used_broadcasts
+	return var_refs, list_refs, broadcast_refs
+
+
+def _collect_data_ids(project):
+	var_refs, list_refs, broadcast_refs = _collect_data_references(project)
+	return set(var_refs.keys()), set(list_refs.keys()), set(broadcast_refs.keys())
 
 
 def _rename_id_map(ids, existing_ids=()):
@@ -805,14 +881,16 @@ def _replace_field_id(block, field_names, mapping):
 	return changed
 
 
-def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists=True):
+def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists=True, frequency_order=False):
 	targets = project.get("targets", [])
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
 	stage_var_ids = set(targets[stage_index].get("variables", {})) if stage_index is not None else set()
 	stage_list_ids = set(targets[stage_index].get("lists", {})) if stage_index is not None else set()
 
-	var_map = {}    # {(ti, old_id): new_id}
-	list_map = {}   # {(ti, old_id): new_id}
+	var_refs, list_refs, _ = _collect_data_references(project) if frequency_order else ({}, {}, {})
+
+	var_map = {}
+	list_map = {}
 
 	def sprites_referencing_stage_ids(stage_ids, tag):
 		hits = set()
@@ -860,6 +938,8 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 	allocated_ids = set()
 	if rename_variables:
 		stage_ids = list(targets[stage_index].get("variables", {}).keys()) if stage_index is not None else []
+		if frequency_order and stage_index is not None:
+			stage_ids = sorted(stage_ids, key=lambda vid: (-len(var_refs.get((stage_index, vid), [])), vid))
 		stage_new_ids = _rename_id_map(stage_ids, existing_ids=allocated_ids) if stage_ids else {}
 		allocated_ids.update(stage_new_ids.values())
 		if stage_index is not None:
@@ -871,12 +951,16 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 			ids = list((target.get("variables") or {}).keys())
 			if not ids:
 				continue
+			if frequency_order:
+				ids = sorted(ids, key=lambda vid: (-len(var_refs.get((ti, vid), [])), vid))
 			new_ids = _rename_id_map(ids, existing_ids=allocated_ids)
 			allocated_ids.update(new_ids.values())
 			for old, new in new_ids.items():
 				var_map[(ti, old)] = new
 	if rename_lists:
 		stage_ids = list(targets[stage_index].get("lists", {}).keys()) if stage_index is not None else []
+		if frequency_order and stage_index is not None:
+			stage_ids = sorted(stage_ids, key=lambda lid: (-len(list_refs.get((stage_index, lid), [])), lid))
 		stage_new_ids = _rename_id_map(stage_ids, existing_ids=allocated_ids) if stage_ids else {}
 		allocated_ids.update(stage_new_ids.values())
 		if stage_index is not None:
@@ -888,6 +972,8 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 			ids = list((target.get("lists") or {}).keys())
 			if not ids:
 				continue
+			if frequency_order:
+				ids = sorted(ids, key=lambda lid: (-len(list_refs.get((ti, lid), [])), lid))
 			new_ids = _rename_id_map(ids, existing_ids=allocated_ids)
 			allocated_ids.update(new_ids.values())
 			for old, new in new_ids.items():
@@ -1003,7 +1089,7 @@ def _replace_broadcast_ids_in_value(value, mapping):
 			_replace_broadcast_ids_in_value(v, mapping)
 
 
-def rename_broadcast_ids(project, stats, existing_ids=()):
+def rename_broadcast_ids(project, stats, existing_ids=(), frequency_order=False):
 	ids = set()
 	for target in project.get("targets", []):
 		for old_id in (target.get("broadcasts") or {}):
@@ -1016,7 +1102,12 @@ def rename_broadcast_ids(project, stats, existing_ids=()):
 						ids.add(f[1])
 				for value in (block.get("inputs") or {}).values():
 					_collect_broadcast_ids_in_value(value, ids)
-	mapping = _rename_id_map(sorted(ids), existing_ids=existing_ids)
+	if frequency_order:
+		_, _, bcast_refs = _collect_data_references(project)
+		sorted_ids = sorted(ids, key=lambda bid: (-len(bcast_refs.get(bid, [])), bid))
+	else:
+		sorted_ids = sorted(ids)
+	mapping = _rename_id_map(sorted_ids, existing_ids=existing_ids)
 	for target in project.get("targets", []):
 		if target.get("broadcasts"):
 			target["broadcasts"] = {
@@ -1125,8 +1216,16 @@ def remove_unused_data(project, stats, remove_variables=True, remove_lists=True)
 
 def remove_unused_broadcasts(project, stats):
 	used = _collect_data_ids(project)[2]
-	stats["broadcasts_unused"] += 0
-	return used
+	removed = 0
+	for target in project.get("targets", []):
+		bcasts = target.get("broadcasts")
+		if isinstance(bcasts, dict):
+			for bid in list(bcasts):
+				if bid not in used:
+					del bcasts[bid]
+					removed += 1
+	stats["broadcasts_removed"] += removed
+	return removed
 
 
 def _is_hat(block):
@@ -1430,6 +1529,38 @@ def remove_project_meta(project, stats):
 	return count
 
 
+def compact_numeric_inputs(project, stats):
+	count = 0
+	for target in project.get("targets", []):
+		for block in target.get("blocks", {}).values():
+			if not isinstance(block, dict):
+				continue
+			for ival in (block.get("inputs") or {}).values():
+				if not isinstance(ival, list):
+					continue
+				for item in ival[1:]:
+					if isinstance(item, list) and len(item) > 1 and item[0] in _NUMERIC_TAGS:
+						v = item[1]
+						if isinstance(v, str):
+							try:
+								iv = int(v)
+								if str(iv) == v:
+									item[1] = iv
+									count += 1
+									continue
+							except ValueError:
+								pass
+							try:
+								fv = float(v)
+								if "." in v and "e" not in v.lower() and str(fv) == v and not (fv != fv or fv in (float("inf"), float("-inf"))):
+									item[1] = fv
+									count += 1
+							except ValueError:
+								pass
+	stats["numeric_inputs_compacted"] += count
+	return count
+
+
 class Options:
 	def __init__(
 		self,
@@ -1445,6 +1576,7 @@ class Options:
 		rename_argument_ids=False,
 		remove_unused_variables=False,
 		remove_unused_lists=False,
+		remove_unused_broadcasts=False,
 		remove_unreachable=False,
 		remove_unused_procedures=False,
 		normalize_numbers=False,
@@ -1459,7 +1591,11 @@ class Options:
 		list_bytes=DEFAULT_LIST_BYTES,
 		list_items=DEFAULT_LIST_ITEMS,
 		normalize_epsilon=DEFAULT_EPSILON,
-		keep_sound_metadata=False
+		keep_sound_metadata=False,
+		preserve_asset_compression=False,
+		frequency_block_ids=False,
+		frequency_data_ids=False,
+		compact_numeric_inputs=False,
 	):
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
@@ -1475,6 +1611,7 @@ class Options:
 		self.rename_argument_ids = rename_argument_ids
 		self.remove_unused_variables = remove_unused_variables
 		self.remove_unused_lists = remove_unused_lists
+		self.remove_unused_broadcasts = remove_unused_broadcasts
 		self.remove_unreachable = remove_unreachable
 		self.remove_unused_procedures = remove_unused_procedures
 		self.normalize_numbers = normalize_numbers
@@ -1486,6 +1623,10 @@ class Options:
 		self.convert_wav_to_mp3 = convert_wav_to_mp3
 		self.sort_keys = sort_keys
 		self.compression_level = compression_level
+		self.preserve_asset_compression = preserve_asset_compression
+		self.frequency_block_ids = frequency_block_ids
+		self.frequency_data_ids = frequency_data_ids
+		self.compact_numeric_inputs = compact_numeric_inputs
 		self.renamed_block_ids = {}
 		self.renamed_variable_ids = {}
 		self.renamed_list_ids = {}
@@ -1512,29 +1653,39 @@ def apply_transforms(project, opts: Options, assets=None):
 		clean_monitors(project, stats)
 	if opts.cleared_lists:
 		clear_large_lists(project, opts.cleared_lists, stats)
-	if opts.remove_unused_variables or opts.remove_unused_lists:
-		remove_unused_data(
-			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
-		)
+	if opts.remove_unreachable:
+		remove_unreachable_blocks(project, stats)
 	if opts.remove_unused_procedures:
 		remove_unused_procedures(project, stats)
 	if opts.remove_unreachable:
 		remove_unreachable_blocks(project, stats)
+	if opts.remove_unused_variables or opts.remove_unused_lists:
+		remove_unused_data(
+			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
+		)
+	if opts.remove_unused_broadcasts:
+		remove_unused_broadcasts(project, stats)
 	used_data_ids = set()
 	if opts.rename_variable_ids or opts.rename_list_ids:
 		opts.renamed_variable_ids, opts.renamed_list_ids = rename_variable_list_ids(
-			project, stats, opts.rename_variable_ids, opts.rename_list_ids
+			project, stats, opts.rename_variable_ids, opts.rename_list_ids,
+			frequency_order=opts.frequency_data_ids,
 		)
 		used_data_ids.update(opts.renamed_variable_ids.values())
 		used_data_ids.update(opts.renamed_list_ids.values())
 	if opts.rename_broadcast_ids:
 		opts.renamed_broadcast_ids = rename_broadcast_ids(
-			project, stats, existing_ids=used_data_ids
+			project, stats, existing_ids=used_data_ids,
+			frequency_order=opts.frequency_data_ids,
 		)
 	if opts.rename_argument_ids:
 		opts.renamed_argument_ids = rename_argument_ids(project, stats)
 	if opts.rename_block_ids:
-		opts.renamed_block_ids = rename_block_ids(project, stats)
+		opts.renamed_block_ids = rename_block_ids(
+			project, stats, frequency_order=opts.frequency_block_ids
+		)
+	if opts.compact_numeric_inputs:
+		compact_numeric_inputs(project, stats)
 	if opts.normalize_numbers:
 		normalize_numbers(project, stats, opts.normalize_epsilon)
 	if not opts.keep_sound_metadata:
@@ -1765,59 +1916,88 @@ def _check_argument_id_consistency(target, where):
 	return None
 
 
+def _input_val_eq(vo, vm, opts):
+	if vo == vm:
+		return True
+	if opts.normalize_numbers and (_num_eq(vo, vm) or vo == vm):
+		return True
+	if opts.compact_numeric_inputs and isinstance(vo, str) and isinstance(vm, (int, float)):
+		try:
+			if isinstance(vm, int) and str(int(vo)) == vo and int(vo) == vm:
+				return True
+			if isinstance(vm, float) and str(float(vo)) == vo and float(vo) == vm:
+				return True
+		except ValueError:
+			pass
+	return False
+
+
+def _check_inputs_match(oi, mi, opts):
+	if oi == mi:
+		return True
+	if not (isinstance(oi, list) and isinstance(mi, list) and len(oi) == len(mi)):
+		return False
+	if not oi or not mi or oi[0] != mi[0]:
+		return False
+	if oi[0] in (1, 2):
+		if isinstance(oi[1], list) and isinstance(mi[1], list) and len(oi[1]) == len(mi[1]):
+			if oi[1][0] == mi[1][0] and oi[1][0] in _NUMERIC_TAGS:
+				return _input_val_eq(oi[1][1], mi[1][1], opts)
+	elif oi[0] == 3:
+		if oi[1] != mi[1]:
+			return False
+		if len(oi) > 2 and len(mi) > 2:
+			if (
+				opts.covered
+				and isinstance(oi[2], list)
+				and isinstance(mi[2], list)
+				and len(oi[2]) == 2
+				and len(mi[2]) == 2
+				and oi[2][0] == mi[2][0]
+				and oi[2][0] in (4, 5, 6, 7, 8, 10)
+			):
+				return True
+			if isinstance(oi[2], list) and isinstance(mi[2], list) and len(oi[2]) == len(mi[2]):
+				if oi[2][0] == mi[2][0] and oi[2][0] in _NUMERIC_TAGS:
+					return _input_val_eq(oi[2][1], mi[2][1], opts)
+	return False
+
+
 def _check_blocks(o, m, opts, where):
 	if set(o) != set(m):
-		# comment link is the only key allowed to disappear, and only when stripping comments
 		gone = set(o) - set(m)
 		extra = set(m) - set(o)
 		if extra or not (opts.comments and gone <= {"comment"}):
-			return f"{where}: block keys changed {sorted(gone)} / {sorted(extra)}"
+			return f"{where} (opcode: {o.get('opcode')}): block keys changed. Missing keys: {sorted(gone)}, unexpected extra keys: {sorted(extra)}"
 	for k in o:
 		if k not in m:
-			continue  # 'comment', handled above
+			continue
 		if k in ("x", "y") and opts.positions:
 			if not _num_eq(o[k], m[k]) and o[k] != m[k]:
-				return f"{where}: {k} changed {o[k]!r} -> {m[k]!r}"
+				return f"{where} (opcode: {o.get('opcode')}): coordinate {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
 		elif k == "inputs":
 			if set(o["inputs"]) != set(m["inputs"]):
-				return f"{where}: input names changed"
+				return f"{where} (opcode: {o.get('opcode')}): input names changed. Original inputs: {sorted(o['inputs'])}, minified inputs: {sorted(m['inputs'])}"
 			for name in o["inputs"]:
 				oi, mi = o["inputs"][name], m["inputs"][name]
-				if oi == mi:
-					continue
-				# only obscured shadow literal of a covered input is allowed
-				ok = (
-					opts.covered
-					and isinstance(oi, list)
-					and isinstance(mi, list)
-					and len(oi) == 3
-					and len(mi) == 3
-					and oi[0] == 3
-					and mi[0] == 3
-					and oi[1] == mi[1]  # covering block untouched
-					and isinstance(oi[2], list)
-					and isinstance(mi[2], list)
-					and len(oi[2]) == 2
-					and len(mi[2]) == 2
-					and oi[2][0] == mi[2][0]  # type tag untouched
-					and oi[2][0] in (4, 5, 6, 7, 8, 10)
-				)  # never color/broadcast
-				if not ok:
-					return f"{where}: input {name!r} changed {oi!r} -> {mi!r}"
+				if not _check_inputs_match(oi, mi, opts):
+					return f"{where} (opcode: {o.get('opcode')}): input {name!r} changed from original {oi!r} to minified {mi!r}"
 		elif o[k] != m[k]:
-			return f"{where}: {k} changed"
+			return f"{where} (opcode: {o.get('opcode')}): property {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
 	return None
 
 
 def verify(original_path, minified_path, opts):
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
 		if b.testzip() is not None:
-			return False, "output zip failed CRC test"
+			return False, f"output zip '{minified_path}' failed CRC test"
 		if set(a.namelist()) != set(b.namelist()):
-			return False, "zip entry lists differ"
+			diff_missing = sorted(set(a.namelist()) - set(b.namelist()))
+			diff_extra = sorted(set(b.namelist()) - set(a.namelist()))
+			return False, f"zip archive entries differ. Missing: {diff_missing[:10]}, unexpected extra: {diff_extra[:10]}"
 		for name in a.namelist():
 			if name != "project.json" and a.read(name) != b.read(name):
-				return False, f"asset changed: {name}"
+				return False, f"asset byte-for-byte mismatch: {name!r} ({len(a.read(name))} bytes vs {len(b.read(name))} bytes)"
 
 		orig = _reinflate(json.loads(a.read("project.json")))
 		mini = _reinflate(json.loads(b.read("project.json")))
@@ -1843,35 +2023,70 @@ def verify(original_path, minified_path, opts):
 					mm = mini.get("meta") or {}
 					if mo.get("semver") == mm.get("semver") and mo.get("vm") == mm.get("vm"):
 						continue
-				return False, f"top-level key {key!r} changed"
+				return False, f"Top-level project key {key!r} changed: original has {orig.get(key)!r}, minified has {mini.get(key)!r}"
 		if len(orig["targets"]) != len(mini["targets"]):
-			return False, "target count changed"
+			return False, f"Target count changed: original has {len(orig['targets'])}, minified has {len(mini['targets'])}"
+
+		orig_var_owners = {}
+		orig_list_owners = {}
+		for ti, target in enumerate(orig.get("targets", [])):
+			for vid in target.get("variables", {}):
+				orig_var_owners[vid] = ti
+			for lid in target.get("lists", {}):
+				orig_list_owners[lid] = ti
 
 		approved = set(getattr(opts, "cleared_lists", ()) or ())
+		mini_var_refs, mini_list_refs, mini_bcast_refs = _collect_data_references(
+			mini, var_owners=orig_var_owners, list_owners=orig_list_owners
+		)
+
 		for ti, (to, tm) in enumerate(zip(orig["targets"], mini["targets"])):
-			name = to.get("name")
+			name = to.get("name", f"target_{ti}")
 			if set(to) != set(tm):
-				return False, f"{name!r}: target keys changed"
+				return False, f"Target {ti} ({name!r}): target keys changed. Missing: {sorted(set(to) - set(tm))}, unexpected extra: {sorted(set(tm) - set(to))}"
 			for k in to:
-				if k in ("blocks", "comments", "lists", "variables", "sounds", "costumes"):
+				if k in ("blocks", "comments", "lists", "variables", "sounds", "costumes", "broadcasts"):
 					continue
 				if to[k] != tm[k]:
 					if opts.normalize_numbers and _num_eq(to[k], tm[k]):
 						continue
-					return False, f"{name!r}: {k} changed"
+					return False, f"Target {ti} ({name!r}): property {k!r} changed from {to[k]!r} to {tm[k]!r}"
+
+			to_bcasts = to.get("broadcasts", {})
+			tm_bcasts = tm.get("broadcasts", {})
+			if set(tm_bcasts) - set(to_bcasts):
+				return False, f"Target {ti} ({name!r}): unexpected new broadcast ID(s) appeared in minified project: {sorted(set(tm_bcasts) - set(to_bcasts))}"
+			missing_bcasts = set(to_bcasts) - set(tm_bcasts)
+			if missing_bcasts and not (opts.remove_unused_broadcasts or (opts.remove_empty_containers and not to.get("isStage") and not to_bcasts)):
+				return False, f"Target {ti} ({name!r}): {len(missing_bcasts)} broadcast(s) removed without --remove-unused-broadcasts: {sorted(missing_bcasts)}"
+			if missing_bcasts and opts.remove_unused_broadcasts:
+				still_used_bcasts = {bid: mini_bcast_refs.get(bid, []) for bid in missing_bcasts if bid in mini_bcast_refs}
+				if still_used_bcasts:
+					first_bid = next(iter(still_used_bcasts))
+					return False, (
+						f"Target {ti} ({name!r}): broadcast {to_bcasts.get(first_bid)!r} (id: {first_bid!r}) was removed, "
+						f"but is still referenced in the minified project by: {', '.join(still_used_bcasts[first_bid])}"
+					)
+			for bid, bo in to_bcasts.items():
+				if bid in tm_bcasts and bo != tm_bcasts[bid]:
+					return False, f"Target {ti} ({name!r}): broadcast name for id {bid!r} changed from {bo!r} to {tm_bcasts[bid]!r}"
 
 			to_vars = to.get("variables", {})
 			tm_vars = tm.get("variables", {})
 			if set(tm_vars) - set(to_vars):
-				return False, f"{name!r}: unexpected variable ids appeared"
+				return False, f"Target {ti} ({name!r}): unexpected new variable ID(s) appeared in minified project: {sorted(set(tm_vars) - set(to_vars))}"
 			missing_vars = set(to_vars) - set(tm_vars)
 			if missing_vars and not opts.remove_unused_variables:
-				return False, f"{name!r}: variable id set changed"
+				return False, f"Target {ti} ({name!r}): {len(missing_vars)} variable(s) removed without --remove-unused-variables: {sorted(missing_vars)}"
 			if missing_vars:
-				used_vars = _collect_data_ids(orig)[0]
-				still_used = {vid for vid in missing_vars if (ti, vid) in used_vars}
+				still_used = {vid: mini_var_refs.get((ti, vid), []) for vid in missing_vars if (ti, vid) in mini_var_refs}
 				if still_used:
-					return False, f"{name!r}: referenced variable was removed"
+					first_vid = next(iter(still_used))
+					first_name = to_vars[first_vid][0] if isinstance(to_vars[first_vid], list) and to_vars[first_vid] else first_vid
+					return False, (
+						f"Target {ti} ({name!r}): variable {first_name!r} (id: {first_vid!r}) was removed, "
+						f"but is still referenced in the minified project by: {', '.join(still_used[first_vid])}"
+					)
 			for vid, vo in to_vars.items():
 				if vid in tm_vars:
 					vm = tm_vars[vid]
@@ -1887,20 +2102,24 @@ def verify(original_path, minified_path, opts):
 						and (len(vo) < 3 or vo[2:] == vm[2:])
 					):
 						continue
-					return False, f"{name!r}: variable {vo[0] if isinstance(vo, list) and vo else vid!r} changed"
+					return False, f"Target {ti} ({name!r}): variable {vo[0] if isinstance(vo, list) and vo else vid!r} (id: {vid!r}) value changed from {vo!r} to {vm!r}"
 
 			to_lists = to.get("lists", {})
 			tm_lists = tm.get("lists", {})
 			if set(tm_lists) - set(to_lists):
-				return False, f"{name!r}: unexpected list ids appeared"
+				return False, f"Target {ti} ({name!r}): unexpected new list ID(s) appeared in minified project: {sorted(set(tm_lists) - set(to_lists))}"
 			missing_lists = set(to_lists) - set(tm_lists)
 			if missing_lists and not opts.remove_unused_lists:
-				return False, f"{name!r}: list id set changed"
+				return False, f"Target {ti} ({name!r}): {len(missing_lists)} list(s) removed without --remove-unused-lists: {sorted(missing_lists)}"
 			if missing_lists:
-				used_lists = _collect_data_ids(orig)[1]
-				still_used = {lid for lid in missing_lists if (ti, lid) in used_lists}
+				still_used = {lid: mini_list_refs.get((ti, lid), []) for lid in missing_lists if (ti, lid) in mini_list_refs}
 				if still_used:
-					return False, f"{name!r}: referenced list was removed"
+					first_lid = next(iter(still_used))
+					first_name = to_lists[first_lid][0] if isinstance(to_lists[first_lid], list) and to_lists[first_lid] else first_lid
+					return False, (
+						f"Target {ti} ({name!r}): list {first_name!r} (id: {first_lid!r}) was removed, "
+						f"but is still referenced in the minified project by: {', '.join(still_used[first_lid])}"
+					)
 			for lid, lo in to_lists.items():
 				if lid not in tm_lists:
 					continue
@@ -1931,15 +2150,15 @@ def verify(original_path, minified_path, opts):
 				):
 					return (
 						False,
-						f"{name!r}: list {lo[0]!r} changed but was not approved for clearing",
+						f"Target {ti} ({name!r}): list {lo[0]!r} (id: {lid!r}) changed from {len(lo[1]) if isinstance(lo, list) and len(lo)>1 and isinstance(lo[1], list) else 'N/A'} items to {len(lm[1]) if isinstance(lm, list) and len(lm)>1 and isinstance(lm[1], list) else 'N/A'} items but was not approved for clearing",
 					)
 
-			# blocks
 			if set(tm["blocks"]) - set(to["blocks"]):
-				return False, f"{name!r}: new block ids appeared"
+				extra_blocks = sorted(set(tm["blocks"]) - set(to["blocks"]))
+				return False, f"Target {ti} ({name!r}): {len(extra_blocks)} unexpected new block ID(s) appeared: {extra_blocks[:10]}"
 			missing_blocks = set(to["blocks"]) - set(tm["blocks"])
 			if missing_blocks and not (opts.remove_unreachable or opts.remove_unused_procedures):
-				return False, f"{name!r}: block id set changed"
+				return False, f"Target {ti} ({name!r}): {len(missing_blocks)} block(s) removed without --remove-unreachable or --remove-unused-procedures: {sorted(missing_blocks)[:10]}"
 			for bid, bo in to["blocks"].items():
 				if bid not in tm["blocks"]:
 					continue
@@ -1953,64 +2172,64 @@ def verify(original_path, minified_path, opts):
 						and all(_num_eq(x, y) or x == y for x, y in zip(bo[3:], bm[3:]))
 					)
 					if not (ok and (opts.positions or bo == bm)):
-						return False, f"{name!r}/{bid!r}: primitive changed"
+						return False, f"Target {ti} ({name!r}), primitive block {bid!r} changed from {bo!r} to {bm!r}"
 					continue
-				err = _check_blocks(bo, bm, opts, f"{name!r}/{bid!r}")
+				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}")
 				if err:
 					return False, err
-				# structural rules the VM / sb3fix rely on
 				if not isinstance(bm.get("inputs"), dict) or not isinstance(
 					bm.get("fields"), dict
 				):
 					return (
 						False,
-						f"{name!r}/{bid!r}: inputs/fields not objects (sb3fix rejects)",
+						f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): inputs or fields is not a dict (violates Scratch VM format)",
 					)
 				if "next" not in bm or "parent" not in bm:
-					return False, f"{name!r}/{bid!r}: lost next/parent"
+					return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute"
 				mu = bm.get("mutation")
 				if mu is not None and ("tagName" not in mu or "children" not in mu):
-					return False, f"{name!r}/{bid!r}: lost mutation tagName/children"
+					return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children"
 
-			# comments
 			co, cm = to["comments"], tm["comments"]
 			if not isinstance(cm, dict):
-				return False, f"{name!r}: comments not an object (sb3fix rejects)"
+				return False, f"Target {ti} ({name!r}): comments is not a dict (violates Scratch VM format)"
 			if opts.comments and not to.get("isStage"):
 				if cm:
-					return False, f"{name!r}: comments remain"
+					return False, f"Target {ti} ({name!r}): comments remain ({len(cm)} comments) despite comment stripping enabled"
 			else:
 				if set(co) != set(cm):
-					return False, f"{name!r}: comment id set changed"
+					return False, f"Target {ti} ({name!r}): comment ID set changed. Missing: {sorted(set(co) - set(cm))}, extra: {sorted(set(cm) - set(co))}"
 				for cid in co:
 					for f in set(co[cid]) | set(cm[cid]):
 						x, y = co[cid].get(f), cm[cid].get(f)
 						if f in ("x", "y", "width", "height") and opts.positions:
 							if not (x == y or _num_eq(x, y)):
-								return False, f"{name!r}: comment {cid!r} {f} changed"
+								return False, f"Target {ti} ({name!r}): comment {cid!r} attribute {f!r} changed from {x!r} to {y!r}"
 						elif x != y:
-							return False, f"{name!r}: comment {cid!r} {f} changed"
+							return False, f"Target {ti} ({name!r}): comment {cid!r} attribute {f!r} changed from {x!r} to {y!r}"
 			if opts.comments and not to.get("isStage"):
-				if any(
-					isinstance(x, dict) and "comment" in x
-					for x in tm["blocks"].values()
-				):
-					return False, f"{name!r}: dangling block.comment link"
+				dangling_comments = [
+					bid for bid, x in tm["blocks"].items()
+					if isinstance(x, dict) and "comment" in x
+				]
+				if dangling_comments:
+					return False, f"Target {ti} ({name!r}): dangling block.comment link in block(s): {dangling_comments[:10]}"
 
 			for snd in tm.get("sounds", []):
 				if "md5ext" not in snd:
-					return False, f"sound {snd.get('name')!r} lost md5ext"
+					return False, f"Target {ti} ({name!r}): sound {snd.get('name')!r} lost required md5ext attribute"
 
 			to_costumes = to.get("costumes", [])
 			tm_costumes = tm.get("costumes", [])
 			if len(to_costumes) != len(tm_costumes):
-				return False, f"{name!r}: costume count changed"
+				return False, f"Target {ti} ({name!r}): costume count changed from {len(to_costumes)} to {len(tm_costumes)}"
 			for co, cm in zip(to_costumes, tm_costumes):
+				cname = co.get("name")
 				for key, value in cm.items():
 					if key in ("rotationCenterX", "rotationCenterY"):
 						continue
 					if value != co.get(key):
-						return False, f"costume data doesn't match at key '{key}'"
+						return False, f"Target {ti} ({name!r}), costume {cname!r}: attribute {key!r} changed from {co.get(key)!r} to {value!r}"
 				if opts.remove_costume_metadata:
 					diff = set(co) - set(cm)
 					for d in diff:
@@ -2018,16 +2237,15 @@ def verify(original_path, minified_path, opts):
 							continue
 						if d == "bitmapResolution" and co.get("dataFormat") == "svg" and co.get("bitmapResolution") == 1:
 							continue
-						return False, f"unexpected costume key {d!r} removed"
+						return False, f"Target {ti} ({name!r}), costume {cname!r}: unexpected attribute {d!r} was removed by costume metadata cleanup"
 				elif set(co) != set(cm):
-					return False, f"costume keys changed without --remove-costume-metadata"
+					return False, f"Target {ti} ({name!r}), costume {cname!r}: costume attributes changed without --remove-costume-metadata"
 
 			if _check_argument_id_consistency(to, name) is None:
 				err = _check_argument_id_consistency(tm, name)
 				if err:
 					return False, err
 
-		# monitors
 		err = _check_monitors(orig, mini, opts)
 		if err:
 			return False, err
@@ -2037,7 +2255,7 @@ def verify(original_path, minified_path, opts):
 def _check_monitors(orig, mini, opts):
 	mo, mm = orig.get("monitors", []), mini.get("monitors", [])
 	if not opts.monitors:
-		return None if mo == mm else "monitors changed with --keep-monitors"
+		return None if mo == mm else "monitors changed without monitor optimization (use --keep-monitors to preserve)"
 
 	def key(m):
 		return (m.get("id"), m.get("spriteName"), m.get("opcode"))
@@ -2048,9 +2266,9 @@ def _check_monitors(orig, mini, opts):
 	for m in mm:
 		k = key(m)
 		if k not in by_key:
-			return f"monitor {k} appeared from nowhere"
+			return f"Monitor {k} appeared in minified project but was not present in original"
 		if order.index(k) < prev:
-			return "monitor order changed"
+			return f"Monitor {k} order changed in project monitors list"
 		prev = order.index(k)
 		o = by_key[k]
 		for f in set(o) | set(m):
@@ -2061,9 +2279,8 @@ def _check_monitors(orig, mini, opts):
 				continue
 			if f == "value" and m.get(f) == ([] if is_list else 0):
 				continue
-			return f"monitor {k}: field {f!r} changed {o.get(f)!r} -> {m.get(f)!r}"
+			return f"Monitor {k} (opcode: {o.get('opcode')}, sprite: {o.get('spriteName')}): field {f!r} changed from {o.get(f)!r} to {m.get(f)!r}"
 
-	# every removed monitor must be one we are allowed to remove
 	survivors = {key(m) for m in mm}
 	targets = orig["targets"]
 	stage = next((t for t in targets if t.get("isStage")), None)
@@ -2074,7 +2291,7 @@ def _check_monitors(orig, mini, opts):
 		if key(m) in survivors:
 			continue
 		if m.get("opcode") not in ("data_variable", "data_listcontents"):
-			return f"removed a non-variable/list monitor {key(m)}"
+			return f"Removed non-variable/list monitor {key(m)} (opcode: {m.get('opcode')!r})"
 		owner = by_name.get(m.get("spriteName")) if m.get("spriteName") else stage
 		store = "lists" if m["opcode"] == "data_listcontents" else "variables"
 		orphan = owner is None or m.get("id") not in owner.get(store, {})
@@ -2084,9 +2301,9 @@ def _check_monitors(orig, mini, opts):
 			and _is_default_layout(m)
 		)
 		if not (orphan or unused):
-			return f"monitor {key(m)} removed but is neither orphaned nor unused"
+			return f"Monitor {key(m)} (opcode: {m.get('opcode')}, sprite: {m.get('spriteName')}, id: {m.get('id')}) was removed but is neither orphaned nor a default-layout unused monitor"
 		if m.get("visible") is True:
-			return f"a visible monitor {key(m)} was removed"
+			return f"A visible monitor {key(m)} (opcode: {m.get('opcode')}, sprite: {m.get('spriteName')}) was removed"
 	return None
 
 
@@ -2116,6 +2333,7 @@ STAT_ORDER = [
 	("argument_ids", "argument IDs renamed"),
 	("variables_removed", "unused variables removed"),
 	("lists_removed", "unused lists removed"),
+	("broadcasts_removed", "unused broadcasts removed"),
 	("blocks_removed", "unreachable/procedure blocks removed"),
 	("procedures_removed", "unused procedures removed"),
 	("numbers_normalized", "integral numbers normalized"),
@@ -2124,6 +2342,7 @@ STAT_ORDER = [
 	("costume_metadata_removed", "redundant costume metadata removed"),
 	("empty_containers_removed", "empty target containers removed"),
 	("project_meta_cleaned", "project meta fields cleaned"),
+	("numeric_inputs_compacted", "numeric string inputs compacted"),
 ]
 
 
@@ -2146,19 +2365,47 @@ def minify_sb3(src, dst, opts=None):
 				return 130
 			opts.cleared_lists = frozenset(picked)
 
+		asset_infos = {item.filename: item for item in zin.infolist() if item.filename != "project.json"}
 		assets = {
 			item.filename: zin.read(item.filename)
 			for item in zin.infolist()
 			if item.filename != "project.json"
 		}
-		# original_asset_names = set(assets)
 
 		stats = apply_transforms(project, opts, assets)
 		out_json = dumps_compact(project, opts.sort_keys).encode("utf-8")
 		with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=opts.compression_level) as zout:
 			zout.writestr("project.json", out_json)
 			for name, data in assets.items():
-				zout.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=opts.compression_level)
+				written = False
+				if opts.preserve_asset_compression and name in asset_infos and zin.read(name) == data:
+					orig_info = asset_infos[name]
+					if orig_info.compress_type == zipfile.ZIP_DEFLATED:
+						py_comp_size = len(zlib.compress(data, opts.compression_level)) - 6
+						if orig_info.compress_size <= py_comp_size:
+							zin.fp.seek(orig_info.header_offset)
+							header = zin.fp.read(30)
+							fn_len = int.from_bytes(header[26:28], "little")
+							extra_len = int.from_bytes(header[28:30], "little")
+							zin.fp.seek(orig_info.header_offset + 30 + fn_len + extra_len)
+							raw_comp = zin.fp.read(orig_info.compress_size)
+
+							zinfo = zipfile.ZipInfo(name)
+							zinfo.date_time = orig_info.date_time
+							zinfo.compress_type = zipfile.ZIP_DEFLATED
+							zinfo.CRC = orig_info.CRC
+							zinfo.file_size = orig_info.file_size
+							zinfo.compress_size = orig_info.compress_size
+							zinfo.header_offset = zout.fp.tell()
+
+							zout.fp.write(zinfo.FileHeader())
+							zout.fp.write(raw_comp)
+							zout.filelist.append(zinfo)
+							zout.NameToInfo[name] = zinfo
+							zout.start_dir = zout.fp.tell()
+							written = True
+				if not written:
+					zout.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=opts.compression_level)
 
 	print(
 		f'Input : "{src}"\nOutput: "{dst}"\n\n'
@@ -2190,6 +2437,7 @@ if __name__ == "__main__":
 	args = [a for a in sys.argv[1:] if not a.startswith("--")]
 	toggles = {
 		"--all-optimizations",
+		"--all-flags",
 		"--keep-comments",
 		"--keep-positions",
 		"--keep-covered",
@@ -2202,6 +2450,7 @@ if __name__ == "__main__":
 		"--rename-argument-ids",
 		"--remove-unused-variables",
 		"--remove-unused-lists",
+		"--remove-unused-broadcasts",
 		"--remove-unreachable",
 		"--remove-unused-procedures",
 		"--normalize-numbers",
@@ -2212,6 +2461,12 @@ if __name__ == "__main__":
 		"--remove-project-meta",
 		"--sort-keys",
 		"--keep-sound-metadata",
+		"--preserve-asset-compression",
+		"--frequency-block-ids",
+		"--order-block-ids-by-frequency",
+		"--frequency-data-ids",
+		"--order-data-ids-by-frequency",
+		"--compact-numeric-inputs",
 	}
 	valued = {"--list-bytes", "--list-items", "--compression-level"}
 	values, bad = {}, []
@@ -2239,34 +2494,39 @@ if __name__ == "__main__":
 	if not args:
 		print(__doc__)
 		sys.exit(1)
-	all_flags = "--all-optimizations" in flags
+	all_optimizations = "--all-optimizations" in flags or "--all-flags" in flags
 	opts = Options(
-		comments="--keep-comments" not in flags,
-		positions="--keep-positions" not in flags,
-		covered="--keep-covered" not in flags,
-		monitors="--keep-monitors" not in flags,
-		lists="--keep-lists" not in flags,
-		rename_block_ids=all_flags or "--rename-block-ids" in flags,
-		rename_variable_ids=all_flags or "--rename-variable-ids" in flags,
-		rename_list_ids=all_flags or "--rename-list-ids" in flags,
-		rename_broadcast_ids=all_flags or "--rename-broadcast-ids" in flags,
-		rename_argument_ids=all_flags or "--rename-argument-ids" in flags,
-		remove_unused_variables=all_flags or "--remove-unused-variables" in flags,
-		remove_unused_lists=all_flags or "--remove-unused-lists" in flags,
-		remove_unreachable=all_flags or "--remove-unreachable" in flags,
-		remove_unused_procedures=all_flags or "--remove-unused-procedures" in flags,
-		normalize_numbers=all_flags or "--normalize-numbers" in flags,
-		remove_empty_fields=all_flags or "--remove-empty-fields" in flags,
-		remove_empty_inputs=all_flags or "--remove-empty-inputs" in flags,
-		remove_costume_metadata=all_flags or "--remove-costume-metadata" in flags,
-		remove_empty_containers=all_flags or "--remove-empty-containers" in flags,
-		remove_project_meta=all_flags or "--remove-project-meta" in flags,
+		comments=("--keep-comments" not in flags),
+		positions=("--keep-positions" not in flags),
+		covered=("--keep-covered" not in flags),
+		monitors=("--keep-monitors" not in flags),
+		lists=False if ("--keep-lists" in flags or all_optimizations) else True,
+		rename_block_ids=all_optimizations or "--rename-block-ids" in flags or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
+		rename_variable_ids=all_optimizations or "--rename-variable-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
+		rename_list_ids=all_optimizations or "--rename-list-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
+		rename_broadcast_ids=all_optimizations or "--rename-broadcast-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
+		rename_argument_ids=all_optimizations or "--rename-argument-ids" in flags,
+		remove_unused_variables=all_optimizations or "--remove-unused-variables" in flags,
+		remove_unused_lists=all_optimizations or "--remove-unused-lists" in flags,
+		remove_unused_broadcasts=all_optimizations or "--remove-unused-broadcasts" in flags,
+		remove_unreachable=all_optimizations or "--remove-unreachable" in flags,
+		remove_unused_procedures=all_optimizations or "--remove-unused-procedures" in flags,
+		normalize_numbers=all_optimizations or "--normalize-numbers" in flags,
+		remove_empty_fields=all_optimizations or "--remove-empty-fields" in flags,
+		remove_empty_inputs=all_optimizations or "--remove-empty-inputs" in flags,
+		remove_costume_metadata=all_optimizations or "--remove-costume-metadata" in flags,
+		remove_empty_containers=all_optimizations or "--remove-empty-containers" in flags,
+		remove_project_meta=all_optimizations or "--remove-project-meta" in flags,
+		preserve_asset_compression=all_optimizations or "--preserve-asset-compression" in flags,
+		frequency_block_ids=all_optimizations or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
+		frequency_data_ids=all_optimizations or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
+		compact_numeric_inputs=all_optimizations or "--compact-numeric-inputs" in flags,
 		sort_keys="--sort-keys" in flags,
 		compression_level=values.get("--compression-level", 9),
 		list_bytes=values.get("--list-bytes", DEFAULT_LIST_BYTES),
 		list_items=values.get("--list-items", DEFAULT_LIST_ITEMS),
-		normalize_epsilon=values.get("--normalize-epsilon", DEFAULT_EPSILON),
-		keep_sound_metadata="--keep-sound-metadata" in flags,
+		normalize_epsilon=values.get("--normalize_epsilon", DEFAULT_EPSILON),
+		keep_sound_metadata=("--keep-sound-metadata" in flags),
 	)
 	dst = args[1] if len(args) > 1 else os.path.splitext(args[0])[0] + "_minified.sb3"
 	if os.path.abspath(args[0]) == os.path.abspath(dst):
