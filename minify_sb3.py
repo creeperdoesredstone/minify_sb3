@@ -2189,7 +2189,7 @@ if __name__ == "__main__":
 	flags = [a for a in sys.argv[1:] if a.startswith("--")]
 	args = [a for a in sys.argv[1:] if not a.startswith("--")]
 	toggles = {
-		"--all-flags",
+		"--all-optimizations",
 		"--keep-comments",
 		"--keep-positions",
 		"--keep-covered",
@@ -2239,7 +2239,7 @@ if __name__ == "__main__":
 	if not args:
 		print(__doc__)
 		sys.exit(1)
-	all_flags = "--all-flags" in flags
+	all_flags = "--all-optimizations" in flags
 	opts = Options(
 		comments="--keep-comments" not in flags,
 		positions="--keep-positions" not in flags,
@@ -2265,7 +2265,7 @@ if __name__ == "__main__":
 		compression_level=values.get("--compression-level", 9),
 		list_bytes=values.get("--list-bytes", DEFAULT_LIST_BYTES),
 		list_items=values.get("--list-items", DEFAULT_LIST_ITEMS),
-		normalize_epsilon=values.get("--normalize_epsilon", DEFAULT_EPSILON),
+		normalize_epsilon=values.get("--normalize-epsilon", DEFAULT_EPSILON),
 		keep_sound_metadata="--keep-sound-metadata" in flags,
 	)
 	dst = args[1] if len(args) > 1 else os.path.splitext(args[0])[0] + "_minified.sb3"
