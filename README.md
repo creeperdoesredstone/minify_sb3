@@ -18,7 +18,7 @@ python minify_sb3.py input.sb3 [output.sb3]
     [--all-optimizations]
 ```
 
-The default behavior already applies the core safe minifications. The `--keep-*` flags disable individual transforms. The `--all-optimizations` flag turns on all optional transformations in one go.
+The default behavior already applies the core safe minifications. The `--keep-*` flags disable individual transforms. `--all-optimizations` or `--all-flags` flags turn on all optional transformations in one go.
 
 ## What the script does by default
 
@@ -31,7 +31,7 @@ These are the transformations that are applied automatically unless explicitly d
 - `mutation.warp` values are normalized from the string forms `"true"` and `"false"` to real booleans.
 - The script keeps required empty container objects intact by default and only removes them when you explicitly enable `--remove-empty-fields` or `--remove-empty-inputs`.
 - All `.wav` sound files are converted to `.mp3` automatically using `ffmpeg`. It is important to note that this functionality is not exposed as a CLI flag.
-- The `rate` and `sampleCount` metadata of each sound asset is removed, unless the flag `--keep-sound-metadata` is set.
+- The `rate` and `sampleCount` metadata of each sound asset are removed, unless the flag `--keep-sound-metadata` is set.
 
 ### Sprite comments and block comment links
 
@@ -44,7 +44,7 @@ This is enabled by default and can be skipped with `--keep-comments`.
 ### Position rounding
 
 - Block coordinates and primitive positions are rounded to whole numbers.
-- Comment positions and sizes are rounded too.
+- Comment positions and sizes are rounded.
 - Costume rotation centers are rounded when they are editor-only layout values.
 
 This is safe because these values are editor/layout metadata. Disable it with `--keep-positions`.
@@ -88,7 +88,7 @@ These are not applied unless requested with the corresponding flag or `--all-opt
 
 - `--rename-block-ids`: renames block IDs using Scratch's compact character set and rewrites every block reference.
 - `--rename-variable-ids`: renames variable and list IDs while keeping ownership and references coherent.
-- `--rename-list-ids`: same as above but only for lists.
+- `--rename-list-ids`: same as above, but only for lists.
 - `--rename-broadcast-ids`: renames broadcast IDs while preserving their names.
 - `--rename-argument-ids`: renames custom block argument IDs inside procedure mutation metadata and inputs.
 
@@ -111,7 +111,7 @@ These are good for aggressively shrinking projects, but they can change behavior
 - `--remove-costume-metadata`: strips redundant costume metadata like default `md5ext` values and SVG `bitmapResolution` defaults.
 - `--remove-empty-containers`: removes empty `broadcasts` and `comments` objects from sprites.
 - `--remove-project-meta`: removes project metadata keys such as `meta.agent` and `meta.platform`.
-- `--keep-sound-metadata`: preserves `rate` and `sampleCount` on sounds; otherwise they are removed.
+- `--keep-sound-metadata`: preserves `rate` and `sampleCount` on sounds; otherwise, they are removed.
 - `--sort-keys`: canonicalizes object key ordering for compression experiments.
 
 ### Archive compression and output control
@@ -142,7 +142,7 @@ After writing the output archive, the script reloads both the original and minif
 - any optional renames or removals are still consistent with Scratch’s reference system
 - monitor, block, and procedural state remain valid
 
-If a mismatch is detected, the output file is deleted and the original archive is left untouched.
+If a mismatch is detected, the output file is deleted, and the original archive is left untouched.
 
 ## Example workflow
 
