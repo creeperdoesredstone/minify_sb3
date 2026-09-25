@@ -9,7 +9,7 @@ import zlib
 from collections import Counter
 
 
-BLOCK_ID_ALPHABET = '!@#$%^*()+_-={}|[]:;<>?,./~ABCDEFGHJKLMNOPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789'
+BLOCK_ID_ALPHABET = '!@#$%^*()+_-={}|[]:;?,./~ABCDEFGHJKLMNOPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789'
 
 
 class Ansi:
@@ -854,15 +854,15 @@ def _collect_data_ids(project):
 	return set(var_refs.keys()), set(list_refs.keys()), set(broadcast_refs.keys())
 
 
-def _rename_id_map(ids, existing_ids=()):
+def _rename_id_map(ids, existing_ids=(), prefix=""):
 	reserved = set(existing_ids)
 	result = {}
 	n = 0
 	for old in ids:
-		new = _short_id(n)
+		new = f"{prefix}{_short_id(n)}"
 		while new in reserved or new in result.values():
 			n += 1
-			new = _short_id(n)
+			new = f"{prefix}{_short_id(n)}"
 		result[old] = new
 		n += 1
 	return result
@@ -1586,6 +1586,7 @@ class Options:
 		remove_empty_containers=False,
 		remove_project_meta=False,
 		convert_wav_to_mp3=False,
+		compress_assets=False,
 		sort_keys=False,
 		compression_level=9,
 		list_bytes=DEFAULT_LIST_BYTES,
@@ -1620,7 +1621,8 @@ class Options:
 		self.remove_costume_metadata = remove_costume_metadata
 		self.remove_empty_containers = remove_empty_containers
 		self.remove_project_meta = remove_project_meta
-		self.convert_wav_to_mp3 = convert_wav_to_mp3
+		self.compress_assets = compress_assets
+		self.convert_wav_to_mp3 = convert_wav_to_mp3 or compress_assets
 		self.sort_keys = sort_keys
 		self.compression_level = compression_level
 		self.preserve_asset_compression = preserve_asset_compression
@@ -2426,9 +2428,9 @@ def minify_sb3(src, dst, opts=None):
 	if not ok:
 		print(Ansi.error(f"Verification failed: {msg}"))
 		os.remove(dst)
-		print(Ansi.muted("Output deleted. Original untouched."))
+		print(Ansi.muted("Output deleted."))
 		return 2
-	print(Ansi.success("Verified: only the intended fields differ, all assets bfb ident."))
+	print(Ansi.success("Verified successfully."))
 	return 0
 
 
@@ -2462,6 +2464,8 @@ if __name__ == "__main__":
 		"--sort-keys",
 		"--keep-sound-metadata",
 		"--preserve-asset-compression",
+		"--compress-assets",
+		"--convert-wav-to-mp3",
 		"--frequency-block-ids",
 		"--order-block-ids-by-frequency",
 		"--frequency-data-ids",
@@ -2521,6 +2525,7 @@ if __name__ == "__main__":
 		frequency_block_ids=all_optimizations or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
 		frequency_data_ids=all_optimizations or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
 		compact_numeric_inputs=all_optimizations or "--compact-numeric-inputs" in flags,
+		compress_assets=all_optimizations or "--compress-assets" in flags or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
 		compression_level=values.get("--compression-level", 9),
 		list_bytes=values.get("--list-bytes", DEFAULT_LIST_BYTES),
