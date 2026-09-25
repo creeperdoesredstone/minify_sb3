@@ -1364,6 +1364,72 @@ def remove_sound_metadata(project):
 				sound.pop("rate", None)
 				sound.pop("sampleCount", None)
 
+
+def remove_empty_fields(project, stats):
+	count = 0
+	for target in project.get("targets", []):
+		for block in target.get("blocks", {}).values():
+			if isinstance(block, dict) and block.get("fields") == {}:
+				del block["fields"]
+				count += 1
+	stats["empty_fields_removed"] += count
+	return count
+
+
+def remove_empty_inputs(project, stats):
+	count = 0
+	for target in project.get("targets", []):
+		for block in target.get("blocks", {}).values():
+			if isinstance(block, dict) and block.get("inputs") == {}:
+				del block["inputs"]
+				count += 1
+	stats["empty_inputs_removed"] += count
+	return count
+
+
+def remove_costume_metadata(project, stats):
+	count = 0
+	for target in project.get("targets", []):
+		for costume in target.get("costumes", []):
+			if isinstance(costume, dict):
+				aid = costume.get("assetId")
+				fmt = costume.get("dataFormat")
+				if aid and fmt and costume.get("md5ext") == f"{aid}.{fmt}":
+					del costume["md5ext"]
+					count += 1
+				if fmt == "svg" and costume.get("bitmapResolution") == 1:
+					del costume["bitmapResolution"]
+					count += 1
+	stats["costume_metadata_removed"] += count
+	return count
+
+
+def remove_empty_containers(project, stats):
+	count = 0
+	for target in project.get("targets", []):
+		if not target.get("isStage"):
+			if target.get("broadcasts") == {}:
+				del target["broadcasts"]
+				count += 1
+			if target.get("comments") == {}:
+				del target["comments"]
+				count += 1
+	stats["empty_containers_removed"] += count
+	return count
+
+
+def remove_project_meta(project, stats):
+	count = 0
+	meta = project.get("meta")
+	if isinstance(meta, dict):
+		for key in ("agent", "platform"):
+			if key in meta:
+				del meta[key]
+				count += 1
+	stats["project_meta_cleaned"] += count
+	return count
+
+
 class Options:
 	def __init__(
 		self,
@@ -1382,6 +1448,11 @@ class Options:
 		remove_unreachable=False,
 		remove_unused_procedures=False,
 		normalize_numbers=False,
+		remove_empty_fields=False,
+		remove_empty_inputs=False,
+		remove_costume_metadata=False,
+		remove_empty_containers=False,
+		remove_project_meta=False,
 		convert_wav_to_mp3=False,
 		sort_keys=False,
 		compression_level=9,
@@ -1396,7 +1467,7 @@ class Options:
 			covered,
 			monitors,
 		)
-		self.lists = lists  # detect + prompt for large lists
+		self.lists = lists
 		self.rename_block_ids = rename_block_ids
 		self.rename_variable_ids = rename_variable_ids
 		self.rename_list_ids = rename_list_ids
@@ -1407,6 +1478,11 @@ class Options:
 		self.remove_unreachable = remove_unreachable
 		self.remove_unused_procedures = remove_unused_procedures
 		self.normalize_numbers = normalize_numbers
+		self.remove_empty_fields = remove_empty_fields
+		self.remove_empty_inputs = remove_empty_inputs
+		self.remove_costume_metadata = remove_costume_metadata
+		self.remove_empty_containers = remove_empty_containers
+		self.remove_project_meta = remove_project_meta
 		self.convert_wav_to_mp3 = convert_wav_to_mp3
 		self.sort_keys = sort_keys
 		self.compression_level = compression_level
@@ -1415,9 +1491,9 @@ class Options:
 		self.renamed_list_ids = {}
 		self.renamed_broadcast_ids = {}
 		self.renamed_argument_ids = {}
-		self.wav_conversions = {}   # {old_filename: new_filename}, set by apply_transforms
+		self.wav_conversions = {}
 		self.list_bytes, self.list_items = list_bytes, list_items
-		self.cleared_lists = frozenset()  # {(target_index, list_id)} approved by user
+		self.cleared_lists = frozenset()
 		self.normalize_epsilon = normalize_epsilon
 		self.keep_sound_metadata = keep_sound_metadata
 
@@ -1463,14 +1539,29 @@ def apply_transforms(project, opts: Options, assets=None):
 		normalize_numbers(project, stats, opts.normalize_epsilon)
 	if not opts.keep_sound_metadata:
 		remove_sound_metadata(project)
+	if opts.remove_empty_fields:
+		remove_empty_fields(project, stats)
+	if opts.remove_empty_inputs:
+		remove_empty_inputs(project, stats)
+	if opts.remove_costume_metadata:
+		remove_costume_metadata(project, stats)
+	if opts.remove_empty_containers:
+		remove_empty_containers(project, stats)
+	if opts.remove_project_meta:
+		remove_project_meta(project, stats)
 	return stats
 
 
 def _reinflate(project):
 	for target in project.get("targets", []):
+		if not target.get("isStage"):
+			target.setdefault("broadcasts", {})
+			target.setdefault("comments", {})
 		for block in target.get("blocks", {}).values():
 			if not isinstance(block, dict):
 				continue
+			block.setdefault("fields", {})
+			block.setdefault("inputs", {})
 			block.setdefault("topLevel", False)
 			block.setdefault("shadow", False)
 			mut = block.get("mutation")
@@ -1747,6 +1838,11 @@ def verify(original_path, minified_path, opts):
 
 		for key in set(orig) | set(mini):
 			if key not in ("targets", "monitors") and orig.get(key) != mini.get(key):
+				if key == "meta" and opts.remove_project_meta:
+					mo = orig.get("meta") or {}
+					mm = mini.get("meta") or {}
+					if mo.get("semver") == mm.get("semver") and mo.get("vm") == mm.get("vm"):
+						continue
 				return False, f"top-level key {key!r} changed"
 		if len(orig["targets"]) != len(mini["targets"]):
 			return False, "target count changed"
@@ -1915,6 +2011,16 @@ def verify(original_path, minified_path, opts):
 						continue
 					if value != co.get(key):
 						return False, f"costume data doesn't match at key '{key}'"
+				if opts.remove_costume_metadata:
+					diff = set(co) - set(cm)
+					for d in diff:
+						if d == "md5ext" and co.get("md5ext") == f"{co.get('assetId')}.{co.get('dataFormat')}":
+							continue
+						if d == "bitmapResolution" and co.get("dataFormat") == "svg" and co.get("bitmapResolution") == 1:
+							continue
+						return False, f"unexpected costume key {d!r} removed"
+				elif set(co) != set(cm):
+					return False, f"costume keys changed without --remove-costume-metadata"
 
 			if _check_argument_id_consistency(to, name) is None:
 				err = _check_argument_id_consistency(tm, name)
@@ -2013,6 +2119,11 @@ STAT_ORDER = [
 	("blocks_removed", "unreachable/procedure blocks removed"),
 	("procedures_removed", "unused procedures removed"),
 	("numbers_normalized", "integral numbers normalized"),
+	("empty_fields_removed", "empty block fields removed"),
+	("empty_inputs_removed", "empty block inputs removed"),
+	("costume_metadata_removed", "redundant costume metadata removed"),
+	("empty_containers_removed", "empty target containers removed"),
+	("project_meta_cleaned", "project meta fields cleaned"),
 ]
 
 
@@ -2070,7 +2181,7 @@ def minify_sb3(src, dst, opts=None):
 		os.remove(dst)
 		print(Ansi.muted("Output deleted. Original untouched."))
 		return 2
-	print(Ansi.success("Verified: only the intended fields differ; all assets byte-identical."))
+	print(Ansi.success("Verified: only the intended fields differ, all assets bfb ident."))
 	return 0
 
 
@@ -2078,6 +2189,7 @@ if __name__ == "__main__":
 	flags = [a for a in sys.argv[1:] if a.startswith("--")]
 	args = [a for a in sys.argv[1:] if not a.startswith("--")]
 	toggles = {
+		"--all-flags",
 		"--keep-comments",
 		"--keep-positions",
 		"--keep-covered",
@@ -2093,6 +2205,11 @@ if __name__ == "__main__":
 		"--remove-unreachable",
 		"--remove-unused-procedures",
 		"--normalize-numbers",
+		"--remove-empty-fields",
+		"--remove-empty-inputs",
+		"--remove-costume-metadata",
+		"--remove-empty-containers",
+		"--remove-project-meta",
 		"--sort-keys",
 		"--keep-sound-metadata",
 	}
@@ -2122,22 +2239,28 @@ if __name__ == "__main__":
 	if not args:
 		print(__doc__)
 		sys.exit(1)
+	all_flags = "--all-flags" in flags
 	opts = Options(
 		comments="--keep-comments" not in flags,
 		positions="--keep-positions" not in flags,
 		covered="--keep-covered" not in flags,
 		monitors="--keep-monitors" not in flags,
 		lists="--keep-lists" not in flags,
-		rename_block_ids="--rename-block-ids" in flags,
-		rename_variable_ids="--rename-variable-ids" in flags,
-		rename_list_ids="--rename-list-ids" in flags,
-		rename_broadcast_ids="--rename-broadcast-ids" in flags,
-		rename_argument_ids="--rename-argument-ids" in flags,
-		remove_unused_variables="--remove-unused-variables" in flags,
-		remove_unused_lists="--remove-unused-lists" in flags,
-		remove_unreachable="--remove-unreachable" in flags,
-		remove_unused_procedures="--remove-unused-procedures" in flags,
-		normalize_numbers="--normalize-numbers" in flags,
+		rename_block_ids=all_flags or "--rename-block-ids" in flags,
+		rename_variable_ids=all_flags or "--rename-variable-ids" in flags,
+		rename_list_ids=all_flags or "--rename-list-ids" in flags,
+		rename_broadcast_ids=all_flags or "--rename-broadcast-ids" in flags,
+		rename_argument_ids=all_flags or "--rename-argument-ids" in flags,
+		remove_unused_variables=all_flags or "--remove-unused-variables" in flags,
+		remove_unused_lists=all_flags or "--remove-unused-lists" in flags,
+		remove_unreachable=all_flags or "--remove-unreachable" in flags,
+		remove_unused_procedures=all_flags or "--remove-unused-procedures" in flags,
+		normalize_numbers=all_flags or "--normalize-numbers" in flags,
+		remove_empty_fields=all_flags or "--remove-empty-fields" in flags,
+		remove_empty_inputs=all_flags or "--remove-empty-inputs" in flags,
+		remove_costume_metadata=all_flags or "--remove-costume-metadata" in flags,
+		remove_empty_containers=all_flags or "--remove-empty-containers" in flags,
+		remove_project_meta=all_flags or "--remove-project-meta" in flags,
 		sort_keys="--sort-keys" in flags,
 		compression_level=values.get("--compression-level", 9),
 		list_bytes=values.get("--list-bytes", DEFAULT_LIST_BYTES),
