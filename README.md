@@ -125,12 +125,11 @@ The script is deliberately conservative. Certain fields cannot be removed withou
 
 These are the invariants it protects:
 
-- `fields: {}` and `inputs: {}` are kept when they are used by the project format, because strict validators such as `sb3fix` reject missing container objects in some cases.
 - `next` and `parent` must remain non-null where the VM expects them.
 - `mutation.tagName` and `mutation.children` must be retained so block XML conversion works when the project is opened in the editor.
 - sound `md5ext` values and asset IDs must remain consistent so audio still loads.
 - project assets, variable/list definitions, comments, costumes, sounds, and monitor entries must not be removed wholesale unless a transform explicitly does so.
-- numeric strings such as `"5"` are never converted to numbers for safety; the VM distinguishes string-vs-number semantics in comparisons.
+- numeric strings such as `"5"` are never converted to numbers for safety; the VM distinguishes strings and numbers.
 
 ## Verification
 
@@ -138,7 +137,7 @@ After writing the output archive, the script reloads both the original and minif
 
 - the zip entry list matches exactly
 - all non-`project.json` entries are byte-for-byte identical
-- the `project.json` structure differs only in the intended, allowed ways
+- the `project.json` structure differs only in the intended ways
 - any optional renames or removals are still consistent with Scratch’s reference system
 - monitor, block, and procedural state remain valid
 
