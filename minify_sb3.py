@@ -1781,12 +1781,29 @@ def compact_redundant_field_ids(project, stats):
 	return count
 
 
-def compact_experimental_mutation_metadata(project, stats):
+
+def compact_mutation_hasnext(project, stats):
+	"""Remove mutation.hasnext only when it is explicitly false."""
+	count = 0
+	for target in project.get("targets", []):
+		for block in (target.get("blocks") or {}).values():
+			if not isinstance(block, dict):
+				continue
+			mut = block.get("mutation")
+			if not isinstance(mut, dict):
+				continue
+			if mut.get("hasnext") in (False, "false"):
+				del mut["hasnext"]
+				count += 1
+	stats["mutation_hasnext_compacted"] += count
+	return count
+
+def compact_mutation_metadata(project, stats):
 	"""Losslessly compact JSON-encoded custom-block mutation arrays.
 
 	TurboWarp's editor expects mutation.tagName and mutation.children to exist
 	when it converts blocks back to XML, so those properties must not be removed.
-	This experimental pass instead canonicalizes the JSON strings used by
+	This instead canonicalizes the JSON strings used by
 	argumentids, argumentnames, and argumentdefaults without changing their
 	decoded values.
 	"""
@@ -1816,6 +1833,259 @@ def compact_experimental_mutation_metadata(project, stats):
 	return count
 
 
+
+def _resolve_variable_owner(project, ti, variable_id):
+	"""Resolve a variable reference using Scratch's local-then-global scope rules."""
+	targets = project.get("targets", [])
+	if not isinstance(variable_id, str):
+		return None
+	if 0 <= ti < len(targets) and variable_id in (targets[ti].get("variables") or {}):
+		return (ti, variable_id)
+	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
+	if stage_index is not None and variable_id in (targets[stage_index].get("variables") or {}):
+		return (stage_index, variable_id)
+	return None
+
+
+def _variable_literal(value):
+	"""Return the shortest Scratch primitive representation for a scalar variable value."""
+	if isinstance(value, bool):
+		# Scratch scalar variables normally deserialize as strings/numbers. Treat a
+		# boolean as unsupported rather than silently changing its serialized type.
+		return None
+	if isinstance(value, (int, float)):
+		if isinstance(value, float) and not math.isfinite(value):
+			return None
+		return [4, value]
+	if isinstance(value, str):
+		return [10, value]
+	return None
+
+
+def _primitive_json_len(value):
+	return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def _find_constant_variables(project):
+	"""Find variables with exactly one set-variable-to and at least one reporter use."""
+	targets = project.get("targets", [])
+	set_blocks = {}
+	reporter_counts = Counter()
+	change_counts = Counter()
+	setter_ids = {}
+
+	def scan_input(value, ti):
+		if not isinstance(value, list) or not value:
+			if isinstance(value, dict):
+				for child in value.values():
+					scan_input(child, ti)
+			return
+		if value[0] == 12 and len(value) > 2 and isinstance(value[2], str):
+			owner = _resolve_variable_owner(project, ti, value[2])
+			if owner is not None:
+				reporter_counts[owner] += 1
+		for child in value:
+			if isinstance(child, (list, dict)):
+				scan_input(child, ti)
+
+	for ti, target in enumerate(targets):
+		for bid, block in (target.get("blocks") or {}).items():
+			if not isinstance(block, dict):
+				continue
+			fields = block.get("fields") or {}
+			f = fields.get("VARIABLE")
+			if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str):
+				owner = _resolve_variable_owner(project, ti, f[1])
+				if owner is not None:
+					if block.get("opcode") == "data_setvariableto":
+						set_blocks[owner] = set_blocks.get(owner, 0) + 1
+						setter_ids.setdefault(owner, []).append(bid)
+					elif block.get("opcode") == "data_changevariableby":
+						change_counts[owner] = change_counts.get(owner, 0) + 1
+			for value in (block.get("inputs") or {}).values():
+				scan_input(value, ti)
+
+	candidates = []
+	for owner, count in set_blocks.items():
+		if count != 1 or reporter_counts.get(owner, 0) <= 0:
+			continue
+		ti, vid = owner
+		entry = (targets[ti].get("variables") or {}).get(vid)
+		if not isinstance(entry, list) or len(entry) < 2:
+			continue
+		# Cloud variables are externally mutable and must never be folded.
+		if len(entry) >= 3 and entry[2] is True:
+			continue
+		literal = _variable_literal(entry[1])
+		if literal is None:
+			continue
+		old = [12, entry[0], vid]
+		per_use = _primitive_json_len(old) - _primitive_json_len(literal)
+		total = per_use * reporter_counts[owner]
+		scope = "GLOBAL" if targets[ti].get("isStage") else f"local:{targets[ti].get('name')}"
+		candidates.append({
+			"ti": ti,
+			"id": vid,
+			"scope": scope,
+			"name": str(entry[0]),
+			"value": entry[1],
+			"reporters": reporter_counts[owner],
+			"bytes": total,
+			"per_use": per_use,
+			"changes": change_counts.get(owner, 0),
+			"setter": setter_ids[owner][0],
+			"literal": literal,
+		})
+	candidates.sort(key=lambda c: (-c["bytes"], c["scope"], c["name"], c["id"]))
+	return candidates
+
+
+def _replace_constant_variable_reporters(value, ti, selected, project, stats):
+	"""Replace serialized variable-reporter primitives with selected literals."""
+	if not isinstance(value, list) or not value:
+		if isinstance(value, dict):
+			changed = 0
+			for child in value.values():
+				changed += _replace_constant_variable_reporters(child, ti, selected, project, stats)
+			return changed
+		return 0
+	changed = 0
+	if value[0] == 12 and len(value) > 2 and isinstance(value[2], str):
+		owner = _resolve_variable_owner(project, ti, value[2])
+		if owner in selected:
+			literal = selected[owner]
+			before = _primitive_json_len(value)
+			after = _primitive_json_len(literal)
+			value[:] = copy.deepcopy(literal)
+			stats["constant_variable_reporters"] += 1
+			stats["constant_variable_bytes_saved"] += before - after
+			return 1
+	for child in value:
+		if isinstance(child, (list, dict)):
+			changed += _replace_constant_variable_reporters(child, ti, selected, project, stats)
+	return changed
+
+
+def fold_constant_variables(project, selected, stats):
+	if not selected:
+		return 0
+	selected_map = { (ti, vid): literal for (ti, vid), literal in selected.items() }
+	changed = 0
+	for ti, target in enumerate(project.get("targets", [])):
+		for block in (target.get("blocks") or {}).values():
+			if not isinstance(block, dict):
+				continue
+			for value in (block.get("inputs") or {}).values():
+				changed += _replace_constant_variable_reporters(value, ti, selected_map, project, stats)
+	return changed
+
+
+def prompt_for_constant_variables(project, candidates) -> dict:
+	"""Interactively choose singleton-set variables whose reporter reads may be folded."""
+	if not candidates:
+		print(Ansi.muted("\nNo constant-variable candidates found."))
+		return {}
+
+	positive = [c for c in candidates if c["bytes"] > 0]
+	negative = [c for c in candidates if c["bytes"] < 0]
+	total_positive = sum(c["bytes"] for c in positive)
+	w_scope = max(len(c["scope"]) for c in candidates)
+	w_name = min(34, max(len(c["name"]) for c in candidates))
+
+	print("")
+	print(Ansi.heading(
+		f"Constant variables found: {len(candidates)}  "
+		f"({sum(c['reporters'] for c in candidates):,} reporter uses)"
+	))
+	print(Ansi.muted(
+		f"  Positive-size candidates: {len(positive)} (about {total_positive:,} bytes saved)"
+	))
+	print(Ansi.muted(
+		f"  Negative-size candidates: {len(negative)} (folding would increase project.json)"
+	))
+	print("")
+	print(f"  {'#':>4}  {'scope':<{w_scope}}  {'variable':<{w_name}}  {'uses':>5}  {'bytes':>8}  notes")
+	for i, c in enumerate(candidates, 1):
+		nm = c["name"] if len(c["name"]) <= w_name else c["name"][:w_name - 1] + "…"
+		notes = []
+		if c["bytes"] < 0:
+			notes.append("LOSS")
+		if c["changes"]:
+			notes.append(f"+{c['changes']} change")
+		print(f" {i:>4}  {c['scope']:<{w_scope}}  {nm:<{w_name}}  {c['reporters']:>5,}  {c['bytes']:>+8,}  {'; '.join(notes)}")
+	print("")
+	print(Ansi.warning(
+		"  This replaces every serialized variable reporter with the variable's "
+		"initial value from project.json. Variables with change-by blocks are marked."
+	))
+	print(Ansi.muted("  Negative byte estimates are marked LOSS and are not selected by 'p'."))
+	print("")
+	print(Ansi.muted("  Enter / n       keep every variable"))
+	print(Ansi.muted("  p               fold only candidates that reduce project.json"))
+	print(Ansi.muted("  a               fold all candidates"))
+	print(Ansi.muted("  u               fold only candidates without change-variable-by"))
+	print(Ansi.muted("  1,3,5-7         fold those numbers"))
+	print("")
+
+	while True:
+		try:
+			answer = input(Ansi.prompt("Fold which variables? [Enter = keep all] > ")).strip().lower()
+		except EOFError:
+			print(Ansi.muted("\n(no input available, keeping all variables)"))
+			return {}
+		except KeyboardInterrupt:
+			print(Ansi.warning("\nAborted."))
+			return None
+
+		if answer in ("", "n", "no", "none", "keep"):
+			print(Ansi.success("Keeping all constant variables."))
+			return {}
+		if answer in ("p", "positive", "safe", "s"):
+			picked = {i for i, c in enumerate(candidates, 1) if c["bytes"] > 0}
+		elif answer in ("u", "unchanged"):
+			picked = {i for i, c in enumerate(candidates, 1) if c["changes"] == 0 and c["bytes"] > 0}
+		elif answer in ("a", "all"):
+			picked = set(range(1, len(candidates) + 1))
+		else:
+			try:
+				picked = _parse_selection(answer, len(candidates))
+			except ValueError as e:
+				print(Ansi.error(f"  {e}. Try again."))
+				continue
+
+		chosen = [candidates[i - 1] for i in sorted(picked)]
+		if not chosen:
+			print(Ansi.warning("  Nothing selected. Try again."))
+			continue
+		estimate = sum(c["bytes"] for c in chosen)
+		risky = [c for c in chosen if c["changes"] or c["bytes"] < 0]
+		print(Ansi.success(
+			f"  Selected {len(chosen)} variable(s), estimated project.json change: {estimate:+,} bytes."
+		))
+		if risky:
+			print(Ansi.warning(f"  WARNING: {len(risky)} selected variable(s) need extra care:"))
+			for c in risky[:20]:
+				reasons = []
+				if c["changes"]:
+					reasons.append(f"{c['changes']} change-variable-by")
+				if c["bytes"] < 0:
+					reasons.append("increases JSON size")
+				print(f"    - [{c['scope']}] {c['name']!r}: {', '.join(reasons)}")
+			if len(risky) > 20:
+				print(f"    ... {len(risky) - 20:,} more")
+			try:
+				confirm = input("  Type 'yes' to fold them anyway, anything else to go back > ").strip().lower()
+			except EOFError:
+				print(Ansi.muted("\n(no input available, keeping all variables)"))
+				return {}
+			except KeyboardInterrupt:
+				print(Ansi.warning("\nAborted."))
+				return None
+			if confirm != "yes":
+				print(Ansi.warning("  Not confirmed. Nothing was folded... yet >:)."))
+				continue
+		return {(c["ti"], c["id"]): c["literal"] for c in chosen}
+
 def remove_empty_fields(project, stats):
 	count = 0
 	for target in project.get("targets", []):
@@ -1837,6 +2107,42 @@ def remove_empty_inputs(project, stats):
 	stats["empty_inputs_removed"] += count
 	return count
 
+
+
+def _target_default_properties_for_removal(target):
+	"""Return only target properties with fixed Scratch defaults."""
+	if target.get("isStage"):
+		return {
+			"currentCostume": 0,
+			"volume": 100,
+			"tempo": 60,
+			"videoTransparency": 50,
+			"videoState": "on",
+			"textToSpeechLanguage": None,
+		}
+	return {
+		"currentCostume": 0,
+		"volume": 100,
+		"visible": True,
+		"x": 0,
+		"y": 0,
+		"size": 100,
+		"direction": 90,
+		"draggable": False,
+		"rotationStyle": "all around",
+	}
+
+
+def remove_default_target_properties(project, stats):
+	"""Remove target properties only when their value is exactly Scratch's default."""
+	count = 0
+	for target in project.get("targets", []):
+		for key, default in _target_default_properties_for_removal(target).items():
+			if key in target and target[key] == default and type(target[key]) is type(default):
+				del target[key]
+				count += 1
+	stats["default_target_properties_removed"] += count
+	return count
 
 def remove_costume_metadata(project, stats, assets=None):
 	"""Remove only costume metadata that is provably redundant.
@@ -1877,18 +2183,20 @@ def remove_costume_metadata(project, stats, assets=None):
 	return count
 
 
-def remove_empty_containers(project, stats):
+def remove_empty_target_containers(project, stats):
+	"""Remove schema-optional target containers when they are empty."""
 	count = 0
 	for target in project.get("targets", []):
-		if not target.get("isStage"):
-			if target.get("broadcasts") == {}:
-				del target["broadcasts"]
-				count += 1
-			if target.get("comments") == {}:
-				del target["comments"]
+		for key in ("lists", "broadcasts", "comments"):
+			if target.get(key) == {}:
+				del target[key]
 				count += 1
 	stats["empty_containers_removed"] += count
 	return count
+
+
+# Backwards-compatible internal alias for older callers.
+remove_empty_containers = remove_empty_target_containers
 
 
 def remove_project_meta(project, stats):
@@ -1957,7 +2265,9 @@ class Options:
 		remove_empty_fields=False,
 		remove_empty_inputs=False,
 		remove_costume_metadata=False,
+		remove_default_target_properties=False,
 		remove_empty_containers=False,
+		remove_empty_target_containers=None,
 		remove_project_meta=False,
 		convert_wav_to_mp3=False,
 		compress_assets=False,
@@ -1972,7 +2282,9 @@ class Options:
 		frequency_data_ids=False,
 		compact_numeric_inputs=False,
 		compact_field_ids=False,
+		compact_mutation_hasnext=False,
 		compact_mutation_metadata=False,
+		fold_constant_variables=False,
 	):
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
@@ -1995,7 +2307,11 @@ class Options:
 		self.remove_empty_fields = remove_empty_fields
 		self.remove_empty_inputs = remove_empty_inputs
 		self.remove_costume_metadata = remove_costume_metadata
-		self.remove_empty_containers = remove_empty_containers
+		self.remove_default_target_properties = remove_default_target_properties
+		if remove_empty_target_containers is None:
+			remove_empty_target_containers = remove_empty_containers
+		self.remove_empty_target_containers = remove_empty_target_containers
+		self.remove_empty_containers = remove_empty_target_containers
 		self.remove_project_meta = remove_project_meta
 		self.compress_assets = compress_assets
 		self.convert_wav_to_mp3 = convert_wav_to_mp3
@@ -2006,7 +2322,9 @@ class Options:
 		self.frequency_data_ids = frequency_data_ids
 		self.compact_numeric_inputs = compact_numeric_inputs
 		self.compact_field_ids = compact_field_ids
-		self.experimental_mutation_metadata = compact_mutation_metadata
+		self.compact_mutation_hasnext = compact_mutation_hasnext
+		self.compact_mutation_metadata = compact_mutation_metadata
+		self.fold_constant_variables = fold_constant_variables
 		self.renamed_block_ids = {}
 		self.renamed_variable_ids = {}
 		self.renamed_list_ids = {}
@@ -2019,6 +2337,8 @@ class Options:
 		self.cleared_lists = frozenset()
 		self.normalize_epsilon = normalize_epsilon
 		self.keep_sound_metadata = keep_sound_metadata
+		self.folded_constant_variables = {}
+		self.folded_constant_variable_literals = {}
 
 
 def apply_transforms(project, opts: Options, assets=None):
@@ -2041,6 +2361,8 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_unused_procedures(project, stats)
 	if opts.remove_unreachable:
 		remove_unreachable_blocks(project, stats)
+	if opts.folded_constant_variables:
+		fold_constant_variables(project, opts.folded_constant_variables, stats)
 	if opts.remove_unused_variables or opts.remove_unused_lists:
 		remove_unused_data(
 			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
@@ -2071,8 +2393,10 @@ def apply_transforms(project, opts: Options, assets=None):
 		compact_numeric_inputs(project, stats)
 	if opts.compact_field_ids:
 		compact_redundant_field_ids(project, stats)
-	if opts.experimental_mutation_metadata:
-		compact_experimental_mutation_metadata(project, stats)
+	if opts.compact_mutation_hasnext:
+		compact_mutation_hasnext(project, stats)
+	if opts.compact_mutation_metadata:
+		compact_mutation_metadata(project, stats)
 	if opts.normalize_numbers:
 		normalize_numbers(project, stats, opts.normalize_epsilon)
 	if not opts.keep_sound_metadata:
@@ -2083,8 +2407,10 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_empty_inputs(project, stats)
 	if opts.remove_costume_metadata:
 		remove_costume_metadata(project, stats, assets)
-	if opts.remove_empty_containers:
-		remove_empty_containers(project, stats)
+	if opts.remove_default_target_properties:
+		remove_default_target_properties(project, stats)
+	if opts.remove_empty_target_containers:
+		remove_empty_target_containers(project, stats)
 	if opts.remove_project_meta:
 		remove_project_meta(project, stats)
 	for target in project.get("targets", []):
@@ -2389,9 +2715,25 @@ def _input_has_dangling_block_ref(value, blocks):
 	return False
 
 
-def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=None):
+
+def _folded_input_equivalent(value, literals, project, target_index):
+	"""Canonicalize selected variable reporter primitives in an input value."""
+	if not isinstance(value, list):
+		if isinstance(value, dict):
+			return {k: _folded_input_equivalent(v, literals, project, target_index) for k, v in value.items()}
+		return value
+	if value and value[0] == 12 and len(value) > 2 and isinstance(value[2], str):
+		owner = _resolve_variable_owner(project, target_index, value[2])
+		if owner in literals:
+			return copy.deepcopy(literals[owner])
+	return [_folded_input_equivalent(v, literals, project, target_index) if isinstance(v, (list, dict)) else v for v in value]
+
+def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=None, target_index=None):
 	if oi == mi:
 		return True
+	if opts.fold_constant_variables and getattr(opts, "folded_constant_variable_literals", None):
+		if target_index is not None and _folded_input_equivalent(oi, opts.folded_constant_variable_literals, getattr(opts, "_verify_project", None), target_index) == mi:
+			return True
 	if (
 		(opts.remove_unreachable or opts.remove_unused_procedures)
 		and remaining_blocks is not None
@@ -2402,7 +2744,7 @@ def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=Non
 		if expected is None:
 			return False
 		if expected != oi:
-			return expected == mi or _check_inputs_match(expected, mi, opts, None, None)
+			return expected == mi or _check_inputs_match(expected, mi, opts, None, None, target_index)
 	if not (isinstance(oi, list) and isinstance(mi, list) and len(oi) == len(mi)):
 		return False
 	if not oi or not mi or oi[0] != mi[0]:
@@ -2462,15 +2804,30 @@ def _check_fields_match(original_fields, minified_fields, opts):
 def _check_mutation_match(original_mutation, minified_mutation, opts):
 	if original_mutation == minified_mutation:
 		return True
-	if not (opts.experimental_mutation_metadata and isinstance(original_mutation, dict) and isinstance(minified_mutation, dict)):
+	if not (isinstance(original_mutation, dict) and isinstance(minified_mutation, dict)):
 		return False
-	if set(original_mutation) != set(minified_mutation):
-		return False
+	missing_keys = set(original_mutation) - set(minified_mutation)
+	extra_keys = set(minified_mutation) - set(original_mutation)
+	allowed_missing = set()
+	if opts.compact_mutation_hasnext and missing_keys == {"hasnext"} and original_mutation.get("hasnext") in (False, "false"):
+		allowed_missing.add("hasnext")
+	if opts.compact_mutation_metadata:
+		# canonicalization of these three JSON-string arrays.
+		if missing_keys or extra_keys:
+			if missing_keys - allowed_missing or extra_keys:
+				return False
+	else:
+		if set(original_mutation) != set(minified_mutation) and (missing_keys - allowed_missing or extra_keys):
+			return False
 	for key, ov in original_mutation.items():
+		if key not in minified_mutation:
+			if key in allowed_missing:
+				continue
+			return False
 		mv = minified_mutation[key]
 		if ov == mv:
 			continue
-		if key in ("argumentids", "argumentnames", "argumentdefaults") and isinstance(ov, str) and isinstance(mv, str):
+		if opts.compact_mutation_metadata and key in ("argumentids", "argumentnames", "argumentdefaults") and isinstance(ov, str) and isinstance(mv, str):
 			try:
 				if json.loads(ov) == json.loads(mv):
 					continue
@@ -2480,7 +2837,7 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 	return True
 
 
-def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None):
+def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None, target_index=None):
 	remaining_blocks = remaining_blocks if remaining_blocks is not None else set(original_blocks or ())
 	if set(o) != set(m):
 		gone = set(o) - set(m)
@@ -2513,7 +2870,7 @@ def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None
 				return f"{where} (opcode: {o.get('opcode')}): input names changed. Original inputs: {sorted(o['inputs'])}, minified inputs: {sorted(m['inputs'])}"
 			for name in set(o["inputs"]) & set(m["inputs"]):
 				oi, mi = o["inputs"][name], m["inputs"][name]
-				if not _check_inputs_match(oi, mi, opts, original_blocks, remaining_blocks):
+				if not _check_inputs_match(oi, mi, opts, original_blocks, remaining_blocks, target_index):
 					return f"{where} (opcode: {o.get('opcode')}): input {name!r} changed from original {oi!r} to minified {mi!r}"
 		else:
 			if (
@@ -2868,6 +3225,30 @@ def _expected_removed_blocks(project, opts):
 	return allowed
 
 
+
+def _target_default_properties(target):
+	if target.get("isStage"):
+		return {
+			"currentCostume": 0,
+			"volume": 100,
+			"tempo": 60,
+			"videoTransparency": 50,
+			"videoState": "on",
+			"textToSpeechLanguage": None,
+		}
+	return {
+		"currentCostume": 0,
+		"volume": 100,
+		"visible": True,
+		"x": 0,
+		"y": 0,
+		"size": 100,
+		"direction": 90,
+		"draggable": False,
+		"rotationStyle": "all around",
+	}
+
+
 def verify(original_path, minified_path, opts):
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
 		if a.testzip() is not None:
@@ -2909,6 +3290,7 @@ def verify(original_path, minified_path, opts):
 			return False, "project.json targets must be arrays"
 		orig = _reinflate(orig_raw)
 		mini = _reinflate(mini_raw_project)
+		opts._verify_project = orig
 
 		err = _validate_asset_entries(mini, b, "minified project")
 		if err:
@@ -2971,10 +3353,33 @@ def verify(original_path, minified_path, opts):
 
 		for ti, (to, tm) in enumerate(zip(orig["targets"], mini["targets"])):
 			name = to.get("name", f"target_{ti}")
-			if set(to) != set(tm):
-				return False, f"Target {ti} ({name!r}): target keys changed. Missing: {sorted(set(to) - set(tm))}, unexpected extra: {sorted(set(tm) - set(to))}"
+			missing_target_keys = set(to) - set(tm)
+			extra_target_keys = set(tm) - set(to)
+			allowed_container_keys = set()
+			if opts.remove_empty_target_containers:
+				allowed_container_keys.update(
+				k for k in missing_target_keys
+					if k in ("lists", "broadcasts", "comments") and to.get(k) == {}
+				)
+			if opts.remove_unused_lists and "lists" in missing_target_keys:
+				allowed_container_keys.add("lists")
+			if opts.remove_unused_broadcasts and "broadcasts" in missing_target_keys:
+				allowed_container_keys.add("broadcasts")
+			if opts.comments and not to.get("isStage") and "comments" in missing_target_keys:
+				allowed_container_keys.add("comments")
+			allowed_default_keys = set()
+			if opts.remove_default_target_properties:
+				defaults = _target_default_properties(to)
+				allowed_default_keys = {
+					k for k in missing_target_keys
+					if k in defaults and to.get(k) == defaults[k]
+				}
+			if missing_target_keys - allowed_default_keys - allowed_container_keys or extra_target_keys:
+				return False, f"Target {ti} ({name!r}): target keys changed. Missing: {sorted(missing_target_keys - allowed_default_keys - allowed_container_keys)}, unexpected extra: {sorted(extra_target_keys)}"
 			for k in to:
 				if k in ("blocks", "comments", "lists", "variables", "sounds", "costumes", "broadcasts"):
+					continue
+				if k not in tm and k in allowed_default_keys:
 					continue
 				if to[k] != tm[k]:
 					if opts.normalize_numbers and _num_eq(to[k], tm[k]):
@@ -3109,7 +3514,7 @@ def verify(original_path, minified_path, opts):
 					if not (ok and (opts.positions or bo == bm)):
 						return False, f"Target {ti} ({name!r}), primitive block {bid!r} changed from {bo!r} to {bm!r}"
 					continue
-				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}", to["blocks"], set(tm["blocks"]))
+				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}", to["blocks"], set(tm["blocks"]), ti)
 				if err:
 					return False, err
 				if not isinstance(bm.get("inputs"), dict) or not isinstance(
@@ -3125,10 +3530,10 @@ def verify(original_path, minified_path, opts):
 				if mu is not None:
 					if not isinstance(mu, dict):
 						return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): mutation is not an object"
-					if not opts.experimental_mutation_metadata and ("tagName" not in mu or "children" not in mu):
+					if not opts.compact_mutation_metadata and ("tagName" not in mu or "children" not in mu):
 						return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children"
 
-			co, cm = to["comments"], tm["comments"]
+			co, cm = to.get("comments", {}), tm.get("comments", {})
 			if not isinstance(cm, dict):
 				return False, f"Target {ti} ({name!r}): comments is not a dict (violates Scratch VM format)"
 			if opts.comments and not to.get("isStage"):
@@ -3307,11 +3712,15 @@ STAT_ORDER = [
 	("empty_fields_removed", "empty block fields removed"),
 	("empty_inputs_removed", "empty block inputs removed"),
 	("costume_metadata_removed", "redundant costume metadata removed"),
+	("default_target_properties_removed", "default target properties removed"),
 	("empty_containers_removed", "empty target containers removed"),
 	("project_meta_cleaned", "project meta fields cleaned"),
 	("numeric_inputs_compacted", "numeric string inputs compacted"),
 	("field_ids_compacted", "redundant null field IDs removed"),
-	("mutation_metadata_compacted", "experimental mutation JSON compacted"),
+	("mutation_hasnext_compacted", "mutation hasnext=false removed"),
+	("mutation_metadata_compacted", "mutation JSON compacted"),
+	("constant_variable_reporters", "constant variable reporters folded"),
+	("constant_variable_bytes_saved", "constant-variable JSON bytes saved"),
 ]
 
 
@@ -3333,6 +3742,14 @@ def minify_sb3(src, dst, opts=None):
 				print(Ansi.warning("Nothing was written."))
 				return 130
 			opts.cleared_lists = frozenset(picked)
+		if opts.fold_constant_variables:
+			candidates = _find_constant_variables(project)
+			picked = prompt_for_constant_variables(project, candidates)
+			if picked is None:
+				print(Ansi.warning("Nothing was written."))
+				return 130
+			opts.folded_constant_variables = picked
+			opts.folded_constant_variable_literals = dict(picked)
 
 		asset_infos = {item.filename: item for item in zin.infolist() if item.filename != "project.json"}
 		assets = {
@@ -3426,6 +3843,7 @@ if __name__ == "__main__":
 		"--remove-empty-fields",
 		"--remove-empty-inputs",
 		"--remove-costume-metadata",
+		"--remove-default-target-properties",
 		"--remove-empty-containers",
 		"--remove-project-meta",
 		"--sort-keys",
@@ -3439,7 +3857,10 @@ if __name__ == "__main__":
 		"--order-data-ids-by-frequency",
 		"--compact-numeric-inputs",
 		"--compact-field-ids",
+		"--compact-mutation-hasnext",
 		"--compact-mutation-metadata",
+		"--fold-constant-variables",
+		"--remove-empty-target-containers",
 	}
 	valued = {"--list-bytes", "--list-items", "--compression-level", "--normalize-epsilon"}
 	values, bad = {}, []
@@ -3500,14 +3921,17 @@ if __name__ == "__main__":
 		remove_empty_fields=all_optimizations or "--remove-empty-fields" in flags,
 		remove_empty_inputs=all_optimizations or "--remove-empty-inputs" in flags,
 		remove_costume_metadata=all_optimizations or "--remove-costume-metadata" in flags,
-		remove_empty_containers=all_optimizations or "--remove-empty-containers" in flags,
+		remove_default_target_properties=all_optimizations or "--remove-default-target-properties" in flags,
+		remove_empty_target_containers=all_optimizations or "--remove-empty-containers" in flags or "--remove-empty-target-containers" in flags,
 		remove_project_meta=all_optimizations or "--remove-project-meta" in flags,
 		preserve_asset_compression=all_optimizations or "--preserve-asset-compression" in flags,
 		frequency_block_ids=all_optimizations or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
 		frequency_data_ids=all_optimizations or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
 		compact_numeric_inputs=all_optimizations or "--compact-numeric-inputs" in flags,
 		compact_field_ids=all_optimizations or "--compact-field-ids" in flags,
+		compact_mutation_hasnext=all_optimizations or "--compact-mutation-hasnext" in flags,
 		compact_mutation_metadata="--compact-mutation-metadata" in flags,
+		fold_constant_variables="--fold-constant-variables" in flags,
 		compress_assets=all_optimizations or "--compress-assets" in flags,
 		convert_wav_to_mp3=all_optimizations or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
