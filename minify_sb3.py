@@ -1127,27 +1127,31 @@ def _all_broadcast_ids(project):
 
 
 def _repair_dangling_broadcast_refs(project, stats):
-	"""Restore missing broadcast definitions from references using their serialized names."""
+	"""Restore missing broadcast definitions only when their name is unambiguous."""
 	targets = project.get("targets", [])
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
 	if stage_index is None:
-		return set()
-
+		return set(), {}
 	stage = targets[stage_index]
 	broadcasts = stage.setdefault("broadcasts", {})
 	defined = _all_broadcast_ids(project)
 	repaired = set()
+	conflicts = {}
 	for bid, info in _collect_broadcast_references(project).items():
 		if bid in defined:
 			continue
 		names = sorted(info["names"])
+		if len(names) > 1:
+			conflicts[bid] = names
+			continue
 		broadcasts[bid] = names[0] if names else "message"
 		defined.add(bid)
 		repaired.add(bid)
 	if repaired:
 		stats["broadcast_refs_repaired"] += len(repaired)
-	return repaired
-
+	if conflicts:
+		stats["broadcast_ref_conflicts"] += len(conflicts)
+	return repaired, conflicts
 
 def rename_broadcast_ids(project, stats, existing_ids=(), frequency_order=False):
 	ids = set()
@@ -1403,21 +1407,57 @@ def _repair_dangling_block_ref(value, blocks):
 	return value, changed
 
 
+def _is_known_orphan_argument_reporter(block, blocks):
+	"""Tolerate detached shadow argument reporters left in some Scratch projects."""
+	if not isinstance(block, dict):
+		return False
+	return (
+		block.get("opcode", "").startswith("argument_reporter_")
+		and block.get("shadow") is True
+		and isinstance(block.get("parent"), (type(None), str))
+		and (block.get("parent") is None or block.get("parent") not in blocks)
+	)
+
+
+def _iter_input_block_refs(value):
+	"""Yield block IDs referenced by a serialized Scratch input tuple."""
+	if not isinstance(value, list) or not value:
+		return
+	tag = value[0]
+	if tag in (1, 2):
+		if len(value) > 1:
+			ref = value[1]
+			if isinstance(ref, str):
+				yield ref
+			elif isinstance(ref, (list, dict)):
+				yield from _iter_input_block_refs(ref)
+		return
+	if tag == 3:
+		for ref in value[1:3]:
+			if isinstance(ref, str):
+				yield ref
+			elif isinstance(ref, (list, dict)):
+				yield from _iter_input_block_refs(ref)
+		return
+	for item in value[1:]:
+		if isinstance(item, (list, dict)):
+			yield from _iter_input_block_refs(item)
+
+
 def _repair_dangling_block_refs(target):
-	"""Remove/repair invalid block references."""
+	"""Repair block links in both directions without making ambiguous edges."""
 	blocks = target.get("blocks", {})
 	fixed = 0
 
+	# Remove references that cannot resolve.
 	for block in blocks.values():
 		if not isinstance(block, dict):
 			continue
-
 		for key in ("next", "parent"):
 			ref = block.get(key)
 			if isinstance(ref, str) and ref not in blocks:
 				block[key] = None
 				fixed += 1
-
 		inputs = block.get("inputs")
 		if not isinstance(inputs, dict):
 			continue
@@ -1431,14 +1471,49 @@ def _repair_dangling_block_refs(target):
 				inputs[name] = fixed_value
 			fixed += 1
 
+	# When an existing next/input edge unambiguously identifies the owner,
+	# repair the child's reverse parent link too. Never overwrite another valid parent.
+	input_owners = {}
+	for owner_id, block in blocks.items():
+		if not isinstance(block, dict):
+			continue
+		for value in (block.get("inputs") or {}).values():
+			for child_id in _iter_input_block_refs(value):
+				if child_id in blocks:
+					input_owners.setdefault(child_id, set()).add(owner_id)
+
+	for owner_id, block in blocks.items():
+		if not isinstance(block, dict):
+			continue
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in blocks:
+			child = blocks[nxt]
+			if (
+				isinstance(child, dict)
+				and child.get("parent") is None
+				and child.get("topLevel") is not True
+			):
+				child["parent"] = owner_id
+				fixed += 1
+
+	for child_id, owners in input_owners.items():
+		if len(owners) != 1:
+			continue
+		child = blocks[child_id]
+		if (
+			isinstance(child, dict)
+			and child.get("parent") is None
+			and child.get("topLevel") is not True
+		):
+			child["parent"] = next(iter(owners))
+			fixed += 1
+
 	comments = target.get("comments") or {}
 	for cid in list(comments):
 		c = comments[cid]
 		if isinstance(c, dict) and c.get("blockId") is not None and c["blockId"] not in blocks:
 			del comments[cid]
-
 	return fixed
-
 
 def remove_unreachable_blocks(project, stats):
 	removed = 0
@@ -1466,10 +1541,8 @@ def remove_unreachable_blocks(project, stats):
 				del blocks[bid]
 				removed += 1
 
-		dangling_fixed += _repair_dangling_block_refs(target)
 
 	stats["blocks_removed"] += removed
-	stats["dangling_block_refs_fixed"] += dangling_fixed
 	return removed
 
 
@@ -1713,8 +1786,7 @@ def remove_costume_metadata(project, stats, assets=None):
 	"""Remove only costume metadata that is provably redundant.
 
 		`md5ext` is removable only when it is exactly the canonical
-		`assetId.dataFormat` filename and that asset exists. This avoids
-		breaking projects which deliberately use a non-canonical extension.
+		`assetId.dataFormat` filename and that asset exists.
 
 		`bitmapResolution=1` is removable only for SVG costumes; Scratch's
 		vector costume path treats the omitted value as the default.
@@ -1881,6 +1953,7 @@ class Options:
 		self.renamed_argument_ids = {}
 		self.wav_conversions = {}
 		self.repaired_broadcast_ids = set()
+		self.broadcast_repair_conflicts = {}
 		self.list_bytes, self.list_items = list_bytes, list_items
 		self.cleared_lists = frozenset()
 		self.normalize_epsilon = normalize_epsilon
@@ -1911,8 +1984,7 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_unused_data(
 			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
 		)
-	if opts.remove_unused_broadcasts or opts.rename_broadcast_ids:
-		opts.repaired_broadcast_ids = _repair_dangling_broadcast_refs(project, stats)
+	opts.repaired_broadcast_ids, opts.broadcast_repair_conflicts = _repair_dangling_broadcast_refs(project, stats)
 	if opts.remove_unused_broadcasts:
 		remove_unused_broadcasts(project, stats)
 	used_data_ids = set()
@@ -1950,6 +2022,8 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_empty_containers(project, stats)
 	if opts.remove_project_meta:
 		remove_project_meta(project, stats)
+	for target in project.get("targets", []):
+		stats["dangling_block_refs_fixed"] += _repair_dangling_block_refs(target)
 	return stats
 
 
@@ -2139,13 +2213,15 @@ def _check_broadcast_consistency(project):
 
 	for bid, info in _collect_broadcast_references(project).items():
 		if bid not in definitions:
+			names = sorted(info["names"])
+			if len(names) > 1:
+				return f"broadcast {bid!r} has conflicting reference names {names} and no definition"
 			return f"broadcast reference {bid!r} has no matching definition"
 		defined_name = definitions[bid][0]
 		conflicts = sorted(n for n in info["names"] if n != defined_name)
 		if conflicts:
 			return f"broadcast {bid!r}: definition name {defined_name!r} conflicts with reference name(s) {conflicts}"
 	return None
-
 
 def _check_broadcast_ids_resolve(project):
 	valid = _all_broadcast_ids(project)
@@ -2177,21 +2253,23 @@ def _find_dangling_broadcast(value, valid):
 
 
 def _check_block_references_resolve(project):
+	"""Require all serialized input/next references to resolve."""
 	for target in project.get("targets", []):
 		blocks = target.get("blocks", {})
 		for bid, block in blocks.items():
 			if not isinstance(block, dict):
 				continue
-			for key in ("next", "parent"):
-				ref = block.get(key)
-				if isinstance(ref, str) and ref not in blocks:
-					return f"{target.get('name')!r}/{bid!r}: {key} points to missing block {ref!r}"
+			parent = block.get("parent")
+			if isinstance(parent, str) and parent not in blocks and not _is_known_orphan_argument_reporter(block, blocks):
+				return f"{target.get('name')!r}/{bid!r}: parent points to missing block {parent!r}"
+			nxt = block.get("next")
+			if isinstance(nxt, str) and nxt not in blocks:
+				return f"{target.get('name')!r}/{bid!r}: next points to missing block {nxt!r}"
 			for name, value in (block.get("inputs") or {}).items():
-				fixed, changed = _repair_dangling_block_ref(copy.deepcopy(value), blocks)
-				if changed and fixed != value:
-					return f"{target.get('name')!r}/{bid!r}: input {name!r} contains a missing block reference"
+				for child_id in _iter_input_block_refs(value):
+					if child_id not in blocks:
+						return f"{target.get('name')!r}/{bid!r}: input {name!r} points to missing block {child_id!r}"
 	return None
-
 
 def _check_argument_id_consistency(target, where):
 	for bid, b in target.get("blocks", {}).items():
@@ -2485,11 +2563,15 @@ def _validate_block_structure(project, label):
 				return f"{where}: block is neither object nor variable/list primitive"
 			if not isinstance(block.get("opcode"), str) or not block.get("opcode"):
 				return f"{where}: missing/invalid opcode"
+			_orphan_parent_quirk = False
 			for key in ("next", "parent"):
 				ref = block.get(key)
 				if ref is not None and not isinstance(ref, str):
 					return f"{where}: {key} must be null or a string"
 				if isinstance(ref, str) and ref not in blocks:
+					if key == "parent" and _is_known_orphan_argument_reporter(block, blocks):
+						_orphan_parent_quirk = True
+						continue
 					return f"{where}: {key} points to missing block {ref!r}"
 			if not isinstance(block.get("inputs"), dict) or not isinstance(block.get("fields"), dict):
 				return f"{where}: inputs/fields must be objects"
@@ -2523,7 +2605,7 @@ def _validate_block_structure(project, label):
 				if isinstance(child, dict) and child.get("parent") != bid:
 					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: next -> {nxt!r} but child.parent is {child.get('parent')!r}"
 			parent = block.get("parent")
-			if isinstance(parent, str):
+			if isinstance(parent, str) and not _orphan_parent_quirk:
 				pb = blocks.get(parent)
 				if not isinstance(pb, dict):
 					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent is not an object"
@@ -2582,6 +2664,94 @@ def _check_costumes(original_target, minified_target, opts, zf):
 
 	return None
 
+def _reachable_block_ids(target):
+	blocks = target.get("blocks", {})
+	edges = _build_block_graph(target)
+	roots = {
+		bid for bid, block in blocks.items()
+		if isinstance(block, list) or (isinstance(block, dict) and block.get("topLevel"))
+	}
+	reachable = set()
+	stack = list(roots)
+	while stack:
+		bid = stack.pop()
+		if bid in reachable or bid not in blocks:
+			continue
+		reachable.add(bid)
+		stack.extend(edges.get(bid, ()))
+	return reachable
+
+
+def _dead_procedure_block_ids(target):
+	blocks = target.get("blocks", {})
+	if not blocks:
+		return set()
+	children = {}
+	for bid, block in blocks.items():
+		if not isinstance(block, dict):
+			continue
+		parent = block.get("parent")
+		if isinstance(parent, str) and parent in blocks:
+			children.setdefault(parent, set()).add(bid)
+	definitions = {}
+	for bid, block in blocks.items():
+		if not isinstance(block, dict) or block.get("opcode") != "procedures_definition":
+			continue
+		custom = (block.get("inputs") or {}).get("custom_block") or [None, None]
+		proto_id = custom[1] if len(custom) > 1 and isinstance(custom[1], str) else None
+		proto = blocks.get(proto_id)
+		proc = _procedure_key(proto) if isinstance(proto, dict) else None
+		if proc is None:
+			continue
+		todo, seen = [bid], set()
+		while todo:
+			x = todo.pop()
+			if x in seen or x not in blocks:
+				continue
+			seen.add(x)
+			todo.extend(children.get(x, ()))
+		definitions[(proc, bid)] = seen
+	if not definitions:
+		return set()
+	owned = set().union(*definitions.values())
+	live = set()
+	queue = []
+	def seed_calls(ids):
+		for bid in ids:
+			b = blocks.get(bid)
+			if isinstance(b, dict) and b.get("opcode") == "procedures_call":
+				proc = _procedure_key(b)
+				if proc is not None and proc not in live:
+					queue.append(proc)
+	seed_calls(set(blocks) - owned)
+	while queue:
+		proc = queue.pop()
+		if proc in live:
+			continue
+		live.add(proc)
+		for (defined_proc, _definition_id), closure in definitions.items():
+			if defined_proc == proc:
+				seed_calls(closure)
+	dead = {proc for proc, _ in definitions} - live
+	result = set()
+	for (proc, _definition_id), closure in definitions.items():
+		if proc in dead:
+			result.update(closure)
+	return result
+
+
+def _expected_removed_blocks(project, opts):
+	allowed = []
+	for target in project.get("targets", []):
+		ids = set()
+		if opts.remove_unreachable:
+			ids.update(set(target.get("blocks", {})) - _reachable_block_ids(target))
+		if opts.remove_unused_procedures:
+			ids.update(_dead_procedure_block_ids(target))
+		allowed.append(ids)
+	return allowed
+
+
 def verify(original_path, minified_path, opts):
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
 		if a.testzip() is not None:
@@ -2637,14 +2807,16 @@ def verify(original_path, minified_path, opts):
 		if err:
 			return False, err
 
-		if opts.rename_broadcast_ids or opts.remove_unused_broadcasts or getattr(opts, "repaired_broadcast_ids", None):
-			err = _check_broadcast_ids_resolve(mini_raw_project)
-			if err:
-				return False, err
-		if opts.remove_unreachable or opts.remove_unused_procedures:
-			err = _check_block_references_resolve(mini_raw_project)
-			if err:
-				return False, err
+		conflicts = getattr(opts, "broadcast_repair_conflicts", {}) or {}
+		if conflicts:
+			first_id = sorted(conflicts)[0]
+			return False, f"broadcast {first_id!r} has conflicting reference names {conflicts[first_id]!r}; refusing to guess a definition"
+		err = _check_broadcast_ids_resolve(mini_raw_project)
+		if err:
+			return False, err
+		err = _check_block_references_resolve(mini_raw_project)
+		if err:
+			return False, err
 
 		if opts.rename_block_ids:
 			_restore_block_ids(mini, opts.renamed_block_ids)
@@ -2665,6 +2837,8 @@ def verify(original_path, minified_path, opts):
 				return False, f"Top-level project key {key!r} changed: original has {orig.get(key)!r}, minified has {mini.get(key)!r}"
 		if len(orig["targets"]) != len(mini["targets"]):
 			return False, f"Target count changed: original has {len(orig['targets'])}, minified has {len(mini['targets'])}"
+
+		allowed_removed_by_target = _expected_removed_blocks(orig, opts)
 
 		orig_var_owners = {}
 		orig_list_owners = {}
@@ -2798,8 +2972,12 @@ def verify(original_path, minified_path, opts):
 				extra_blocks = sorted(set(tm["blocks"]) - set(to["blocks"]))
 				return False, f"Target {ti} ({name!r}): {len(extra_blocks)} unexpected new block ID(s) appeared: {extra_blocks[:10]}"
 			missing_blocks = set(to["blocks"]) - set(tm["blocks"])
-			if missing_blocks and not (opts.remove_unreachable or opts.remove_unused_procedures):
-				return False, f"Target {ti} ({name!r}): {len(missing_blocks)} block(s) removed without --remove-unreachable or --remove-unused-procedures: {sorted(missing_blocks)[:10]}"
+			illegal_missing = missing_blocks - allowed_removed_by_target[ti]
+			if illegal_missing:
+				return False, (
+					f"Target {ti} ({name!r}): block(s) were removed even though the original "
+					f"project proves they were reachable/live: {sorted(illegal_missing)[:10]}"
+				)
 			for bid, bo in to["blocks"].items():
 				if bid not in tm["blocks"]:
 					continue
@@ -2870,6 +3048,12 @@ def verify(original_path, minified_path, opts):
 					return False, err
 
 		err = _check_monitors(orig, mini, opts)
+		if err:
+			return False, err
+		err = _check_broadcast_ids_resolve(mini)
+		if err:
+			return False, err
+		err = _check_block_references_resolve(mini)
 		if err:
 			return False, err
 		err = _validate_block_structure(mini, "minified project (final)")
@@ -2990,6 +3174,7 @@ STAT_ORDER = [
 	("dangling_refs_skipped", "sprites skipped (already-dangling refs)"),
 	("dangling_block_refs_fixed", "dangling block references repaired"),
 	("broadcast_refs_repaired", "missing broadcast definitions restored"),
+	("broadcast_ref_conflicts", "conflicting broadcast references"),
 	("variable_ids", "variable IDs renamed"),
 	("list_ids", "list IDs renamed"),
 	("broadcast_ids", "broadcast IDs renamed"),
@@ -3177,7 +3362,7 @@ if __name__ == "__main__":
 		positions=("--keep-positions" not in flags),
 		covered=("--keep-covered" not in flags),
 		monitors=("--keep-monitors" not in flags),
-		lists=("--keep-lists" not in flags),
+		lists=False if ("--keep-lists" in flags or all_optimizations) else True,
 		rename_block_ids=all_optimizations or "--rename-block-ids" in flags or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
 		rename_variable_ids=all_optimizations or "--rename-variable-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
 		rename_list_ids=all_optimizations or "--rename-list-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
