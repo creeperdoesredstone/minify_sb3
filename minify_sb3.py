@@ -2007,6 +2007,141 @@ def fold_constant_variables(project, selected, stats):
 	return changed
 
 
+def _numeric_primitive_value(value):
+	if not (isinstance(value, list) and len(value) == 2 and value[0] in _NUMERIC_TAGS):
+		return None
+	raw = value[1]
+	if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+		return None
+	try:
+		if isinstance(raw, str):
+			text = raw.strip()
+			prefixes = (("0b", 2, "01"), ("0o", 8, "01234567"), ("0x", 16, "0123456789abcdef"))
+			prefix = next((item for item in prefixes if text.lower().startswith(item[0])), None)
+			if prefix is not None:
+				digits = text[2:].lower()
+				if not digits or any(digit not in prefix[2] for digit in digits):
+					return None
+				number = float(int(digits, prefix[1]))
+			else:
+				number = float(raw)
+		else:
+			number = float(raw)
+	except (TypeError, ValueError, OverflowError):
+		return None
+	return number if math.isfinite(number) else None
+
+
+def _constant_expression_from_input(value, blocks, visiting=frozenset()):
+	if not (isinstance(value, list) and len(value) > 1):
+		return None
+	if value[0] in (1, 2):
+		child = value[1]
+	elif value[0] == 3:
+		child = value[1]
+	else:
+		return None
+
+	number = _numeric_primitive_value(child)
+	if number is not None:
+		return [4, number], set()
+	if isinstance(child, str):
+		return _constant_expression_block(child, blocks, visiting)
+	return None
+
+
+def _constant_expression_block(block_id, blocks, visiting):
+	if block_id in visiting:
+		return None
+	block = blocks.get(block_id)
+	if not isinstance(block, dict):
+		return None
+
+	operations = {
+		"operator_add": "add",
+		"operator_subtract": "subtract",
+		"operator_multiply": "multiply",
+		"operator_divide": "divide",
+		"operator_mod": "modulo",
+	}
+	operation = operations.get(block.get("opcode"))
+	if operation is None:
+		return None
+
+	inputs = block.get("inputs") or {}
+	left = _constant_expression_from_input(inputs.get("NUM1"), blocks, visiting | {block_id})
+	right = _constant_expression_from_input(inputs.get("NUM2"), blocks, visiting | {block_id})
+	if left is None or right is None:
+		return None
+
+	left_value = float(left[0][1])
+	right_value = float(right[0][1])
+	try:
+		if operation == "add":
+			result = left_value + right_value
+		elif operation == "subtract":
+			result = left_value - right_value
+		elif operation == "multiply":
+			result = left_value * right_value
+		elif operation == "divide":
+			if right_value == 0:
+				return None
+			result = left_value / right_value
+		else:
+			if right_value == 0:
+				return None
+			result = math.fmod(left_value, right_value)
+	except (OverflowError, ValueError, ZeroDivisionError):
+		return None
+	if not math.isfinite(result):
+		return None
+	value = int(result) if result.is_integer() else result
+	return [4, value], left[1] | right[1] | {block_id}
+
+
+def fold_constant_expressions(project, stats, opts):
+	"""Fold finite numeric arithmetic reporters whose operands are all literals."""
+	targets = project.get("targets", [])
+	opts.folded_constant_expression_inputs = {}
+	opts.folded_constant_expression_blocks = [set() for _ in targets]
+	folded = 0
+
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		candidates = []
+		for parent_id, parent in blocks.items():
+			if not isinstance(parent, dict):
+				continue
+			for input_name, value in (parent.get("inputs") or {}).items():
+				result = _constant_expression_from_input(value, blocks)
+				if result is not None and result[1]:
+					candidates.append((parent_id, input_name, result[0], result[1]))
+
+		consumed_by_candidates = set().union(*(entry[3] for entry in candidates)) if candidates else set()
+		removed = set()
+		for parent_id, input_name, literal, expression_blocks in candidates:
+			if parent_id in consumed_by_candidates:
+				continue
+			parent = blocks.get(parent_id)
+			if not isinstance(parent, dict):
+				continue
+			inputs = parent.get("inputs") or {}
+			if input_name not in inputs:
+				continue
+			replacement = [1, literal]
+			inputs[input_name] = replacement
+			opts.folded_constant_expression_inputs[(ti, parent_id, input_name)] = replacement
+			removed.update(expression_blocks)
+			folded += 1
+
+		for block_id in removed:
+			blocks.pop(block_id, None)
+		opts.folded_constant_expression_blocks[ti] = removed
+
+	stats["constant_expressions_folded"] += folded
+	return folded
+
+
 def prompt_for_constant_variables(project, candidates) -> dict:
 	"""Interactively choose constant-variable candidates whose reporter reads may be folded."""
 	if not candidates:
@@ -2312,6 +2447,7 @@ class Options:
 		compact_mutation_hasnext=False,
 		compact_mutation_metadata=False,
 		fold_constant_variables=False,
+		fold_constant_expressions=False,
 	):
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
@@ -2352,6 +2488,7 @@ class Options:
 		self.compact_mutation_hasnext = compact_mutation_hasnext
 		self.compact_mutation_metadata = compact_mutation_metadata
 		self.fold_constant_variables = fold_constant_variables
+		self.fold_constant_expressions = fold_constant_expressions
 		self.renamed_block_ids = {}
 		self.renamed_variable_ids = {}
 		self.renamed_list_ids = {}
@@ -2366,6 +2503,8 @@ class Options:
 		self.keep_sound_metadata = keep_sound_metadata
 		self.folded_constant_variables = {}
 		self.folded_constant_variable_literals = {}
+		self.folded_constant_expression_inputs = {}
+		self.folded_constant_expression_blocks = []
 
 
 def apply_transforms(project, opts: Options, assets=None):
@@ -2390,6 +2529,8 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_unreachable_blocks(project, stats)
 	if opts.folded_constant_variables:
 		fold_constant_variables(project, opts.folded_constant_variables, stats)
+	if opts.fold_constant_expressions:
+		fold_constant_expressions(project, stats, opts)
 	if opts.remove_unused_variables or opts.remove_unused_lists:
 		remove_unused_data(
 			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
@@ -2877,7 +3018,7 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 	return True
 
 
-def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None, target_index=None):
+def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None, target_index=None, block_id=None):
 	remaining_blocks = remaining_blocks if remaining_blocks is not None else set(original_blocks or ())
 	if set(o) != set(m):
 		gone = set(o) - set(m)
@@ -2910,6 +3051,15 @@ def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None
 				return f"{where} (opcode: {o.get('opcode')}): input names changed. Original inputs: {sorted(o['inputs'])}, minified inputs: {sorted(m['inputs'])}"
 			for name in set(o["inputs"]) & set(m["inputs"]):
 				oi, mi = o["inputs"][name], m["inputs"][name]
+				folded_inputs = getattr(opts, "folded_constant_expression_inputs", {})
+				folded_input = folded_inputs.get((target_index, block_id, name))
+				if folded_input is not None and (
+					folded_input == mi
+					or _check_inputs_match(
+						folded_input, mi, opts, original_blocks, remaining_blocks, target_index
+					)
+				):
+					continue
 				if not _check_inputs_match(oi, mi, opts, original_blocks, remaining_blocks, target_index):
 					return f"{where} (opcode: {o.get('opcode')}): input {name!r} changed from original {oi!r} to minified {mi!r}"
 		else:
@@ -3255,12 +3405,15 @@ def _dead_procedure_block_ids(target):
 
 def _expected_removed_blocks(project, opts):
 	allowed = []
-	for target in project.get("targets", []):
+	for ti, target in enumerate(project.get("targets", [])):
 		ids = set()
 		if opts.remove_unreachable:
 			ids.update(set(target.get("blocks", {})) - _reachable_block_ids(target))
 		if opts.remove_unused_procedures:
 			ids.update(_dead_procedure_block_ids(target))
+		folded_blocks = getattr(opts, "folded_constant_expression_blocks", ())
+		if ti < len(folded_blocks):
+			ids.update(folded_blocks[ti])
 		allowed.append(ids)
 	return allowed
 
@@ -3554,7 +3707,7 @@ def verify(original_path, minified_path, opts):
 					if not (ok and (opts.positions or bo == bm)):
 						return False, f"Target {ti} ({name!r}), primitive block {bid!r} changed from {bo!r} to {bm!r}"
 					continue
-				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}", to["blocks"], set(tm["blocks"]), ti)
+				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}", to["blocks"], set(tm["blocks"]), ti, bid)
 				if err:
 					return False, err
 				if not isinstance(bm.get("inputs"), dict) or not isinstance(
@@ -3761,6 +3914,7 @@ STAT_ORDER = [
 	("mutation_metadata_compacted", "mutation JSON compacted"),
 	("constant_variable_reporters", "constant variable reporters folded"),
 	("constant_variable_bytes_saved", "constant-variable JSON bytes saved"),
+	("constant_expressions_folded", "constant numeric expressions folded"),
 ]
 
 
@@ -3900,6 +4054,7 @@ if __name__ == "__main__":
 		"--compact-mutation-hasnext",
 		"--compact-mutation-metadata",
 		"--fold-constant-variables",
+		"--fold-constant-expressions",
 		"--remove-empty-target-containers",
 	}
 	valued = {"--list-bytes", "--list-items", "--compression-level", "--normalize-epsilon"}
@@ -3972,6 +4127,7 @@ if __name__ == "__main__":
 		compact_mutation_hasnext=all_optimizations or "--compact-mutation-hasnext" in flags,
 		compact_mutation_metadata="--compact-mutation-metadata" in flags,
 		fold_constant_variables="--fold-constant-variables" in flags,
+		fold_constant_expressions=all_optimizations or "--fold-constant-expressions" in flags,
 		compress_assets=all_optimizations or "--compress-assets" in flags,
 		convert_wav_to_mp3=all_optimizations or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
