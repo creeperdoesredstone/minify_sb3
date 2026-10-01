@@ -287,6 +287,7 @@ def round_positions(project, stats):
 						stats["rounded"] += 1
 
 
+# input type tags whose obscured shadow holds a plain number / text literal
 _NUMERIC_TAGS = (4, 5, 6, 7, 8)  # number, positive, whole, integer, angle
 _TEXT_TAG = 10
 
@@ -1126,6 +1127,7 @@ def _all_broadcast_ids(project):
 
 
 def _repair_dangling_broadcast_refs(project, stats):
+	"""Restore missing broadcast definitions only when their name is unambiguous."""
 	targets = project.get("targets", [])
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
 	if stage_index is None:
@@ -1375,7 +1377,7 @@ def _repair_dangling_block_ref(value, blocks):
 					shadow = value[2]
 					if isinstance(shadow, str) and shadow not in blocks:
 						return None, True
-					# preserve shadow value
+					# Preserve the shadow value when the covering block vanished.
 					return [1, shadow], True
 				return None, True
 
@@ -1406,6 +1408,7 @@ def _repair_dangling_block_ref(value, blocks):
 
 
 def _is_known_orphan_argument_reporter(block, blocks):
+	"""Tolerate detached shadow argument reporters left in some Scratch projects."""
 	if not isinstance(block, dict):
 		return False
 	return (
@@ -1417,6 +1420,7 @@ def _is_known_orphan_argument_reporter(block, blocks):
 
 
 def _iter_input_block_refs(value):
+	"""Yield block IDs referenced by a serialized Scratch input tuple."""
 	if not isinstance(value, list) or not value:
 		return
 	tag = value[0]
@@ -1441,10 +1445,11 @@ def _iter_input_block_refs(value):
 
 
 def _repair_dangling_block_refs(target):
+	"""Repair block links in both directions without inventing ambiguous edges."""
 	blocks = target.get("blocks", {})
 	fixed = 0
 
-	# remove unresolved refs
+	# Remove references that cannot resolve.
 	for block in blocks.values():
 		if not isinstance(block, dict):
 			continue
@@ -1466,8 +1471,8 @@ def _repair_dangling_block_refs(target):
 				inputs[name] = fixed_value
 			fixed += 1
 
-	# when an existing next/input edge unambiguously identifies the owner,
-	# repair the child's reverse parent link too
+	# When an existing next/input edge unambiguously identifies the owner,
+	# repair the child's reverse parent link too. Never overwrite another valid parent.
 	input_owners = {}
 	for owner_id, block in blocks.items():
 		if not isinstance(block, dict):
@@ -1576,6 +1581,8 @@ def remove_unused_procedures(project, stats):
 			if proc is None:
 				continue
 
+			# In Scratch serialization, the procedure body is connected through
+			# parent links; definition.next is the next top-level stack, not the body.
 			todo, seen = [bid], set()
 			while todo:
 				x = todo.pop()
@@ -1600,6 +1607,7 @@ def remove_unused_procedures(project, stats):
 					if proc is not None and proc not in live_procs:
 						queue.append(proc)
 
+		# Calls outside procedure closures are the program's procedure entry points.
 		seed_calls(set(blocks) - owned)
 		while queue:
 			proc = queue.pop()
@@ -1736,6 +1744,8 @@ def convert_wav_sounds_to_mp3(project, assets, stats):
 			stats["wav_converted"] += 1
 			stats["wav_bytes_saved"] += len(wav_bytes) - len(mp3_bytes)
 
+	# The source may be shared by several sounds, so remove it only after the
+	# conversion mapping has been established for every reference.
 	for old_name in conversions:
 		assets.pop(old_name, None)
 
@@ -1751,6 +1761,13 @@ def remove_sound_metadata(project):
 
 
 def compact_redundant_field_ids(project, stats):
+	"""Remove the optional null field-ID slot from serialized Scratch fields.
+
+	Scratch field tuples are commonly serialized as [value, null] when a field
+	has no associated variable/list/broadcast ID. The ID slot is optional, so
+	[value] is an equivalent and smaller representation. Only an explicit null
+	slot is removed; empty-string and non-null IDs are preserved.
+	"""
 	count = 0
 	for target in project.get("targets", []):
 		for block in target.get("blocks", {}).values():
@@ -1766,6 +1783,7 @@ def compact_redundant_field_ids(project, stats):
 
 
 def compact_mutation_hasnext(project, stats):
+	"""Remove mutation.hasnext only when it is explicitly false."""
 	count = 0
 	for target in project.get("targets", []):
 		for block in (target.get("blocks") or {}).values():
@@ -1817,6 +1835,7 @@ def compact_mutation_metadata(project, stats):
 
 
 def _resolve_variable_owner(project, ti, variable_id):
+	"""Resolve a variable reference using Scratch's local-then-global scope rules."""
 	targets = project.get("targets", [])
 	if not isinstance(variable_id, str):
 		return None
@@ -1829,7 +1848,10 @@ def _resolve_variable_owner(project, ti, variable_id):
 
 
 def _variable_literal(value):
+	"""Return the shortest Scratch primitive representation for a scalar variable value."""
 	if isinstance(value, bool):
+		# Scratch scalar variables normally deserialize as strings/numbers. Treat a
+		# boolean as unsupported rather than silently changing its serialized type.
 		return None
 	if isinstance(value, (int, float)):
 		if isinstance(value, float) and not math.isfinite(value):
@@ -1861,6 +1883,7 @@ def _primitive_json_len(value):
 
 
 def _find_constant_variables(project):
+	"""Find variables with exactly one set-variable-to and at least one reporter use."""
 	targets = project.get("targets", [])
 	set_blocks = {}
 	reporter_counts = Counter()
@@ -1945,6 +1968,7 @@ def _find_constant_variables(project):
 
 
 def _replace_constant_variable_reporters(value, ti, selected, project, stats):
+	"""Replace serialized variable-reporter primitives with selected literals."""
 	if not isinstance(value, list) or not value:
 		if isinstance(value, dict):
 			changed = 0
@@ -2008,65 +2032,19 @@ def _numeric_primitive_value(value):
 	return number if math.isfinite(number) else None
 
 
-def _to_scratch_number(val):
-	if isinstance(val, bool):
-		return 1.0 if val else 0.0
-	if isinstance(val, (int, float)):
-		return float(val) if math.isfinite(val) else None
-	if isinstance(val, str):
-		text = val.strip()
-		if not text:
-			return 0.0
-
-		# numeric prefix support
-		prefixes = (("0b", 2, "01"), ("0o", 8, "01234567"), ("0x", 16, "0123456789abcdef"))
-		prefix = next((item for item in prefixes if text.lower().startswith(item[0])), None)
-		try:
-			if prefix is not None:
-				digits = text[2:].lower()
-				if not digits or any(digit not in prefix[2] for digit in digits):
-					return None
-				num = float(int(digits, prefix[1]))
-			else:
-				num = float(text)
-			return num if math.isfinite(num) else None
-		except (ValueError, OverflowError, TypeError):
-			return None
-	return None
-
-
-def _to_scratch_bool(val):
-	if isinstance(val, bool):
-		return val
-	if isinstance(val, (int, float)):
-		return val != 0 and not math.isnan(val)
-	if isinstance(val, str):
-		text = val.strip().lower()
-		if text in ("true", "1"):
-			return True
-		if text in ("false", "0", ""):
-			return False
-		num = _to_scratch_number(val)
-		return num != 0 if num is not None else len(val) > 0
-	return False
-
-
 def _constant_expression_from_input(value, blocks, visiting=frozenset()):
 	if not (isinstance(value, list) and len(value) > 1):
 		return None
-	if value[0] in (1, 2, 3):
+	if value[0] in (1, 2):
+		child = value[1]
+	elif value[0] == 3:
 		child = value[1]
 	else:
 		return None
 
 	number = _numeric_primitive_value(child)
 	if number is not None:
-		val = int(number) if number.is_integer() else number
-		return [4, val], set()
-
-	if isinstance(child, list) and len(child) == 2 and child[0] == _TEXT_TAG:
-		return child, set()
-
+		return [4, number], set()
 	if isinstance(child, str):
 		return _constant_expression_block(child, blocks, visiting)
 	return None
@@ -2079,136 +2057,42 @@ def _constant_expression_block(block_id, blocks, visiting):
 	if not isinstance(block, dict):
 		return None
 
-	operation = block.get("opcode")
+	operations = {
+		"operator_add": "add",
+		"operator_subtract": "subtract",
+		"operator_multiply": "multiply",
+		"operator_divide": "divide",
+		"operator_mod": "modulo",
+	}
+	operation = operations.get(block.get("opcode"))
 	if operation is None:
 		return None
 
 	inputs = block.get("inputs") or {}
-	current_visiting = visiting | {block_id}
-
-	def get_in(name):
-		return _constant_expression_from_input(inputs.get(name), blocks, current_visiting)
-
-	# unary operators
-	if operation == "operator_not":
-		operand = get_in("OPERAND")
-		if operand is None:
-			return None
-		res_bool = not _to_scratch_bool(operand[0][1])
-		return [10, "true" if res_bool else "false"], operand[1] | {block_id}
-
-	if operation == "operator_length":
-		operand = get_in("STRING")
-		if operand is None:
-			return None
-		return [4, len(str(operand[0][1]))], operand[1] | {block_id}
-
-	if operation == "operator_mathop":
-		operand = get_in("NUM")
-		if operand is None:
-			return None
-		num = _to_scratch_number(operand[0][1])
-		if num is None:
-			return None
-
-		operator_field = (block.get("fields") or {}).get("OPERATOR")
-		op_name = operator_field[0] if isinstance(operator_field, list) and operator_field else None
-
-		try:
-			match op_name:
-				case "abs": res = abs(num)
-				case "floor": res = math.floor(num)
-				case "ceiling": res = math.ceil(num)
-				case "sqrt":
-					if num < 0: return None
-					res = math.sqrt(num)
-				case "sin": res = math.sin(math.radians(num))
-				case "cos": res = math.cos(math.radians(num))
-				case "tan": res = math.tan(math.radians(num))
-				case "asin":
-					if not -1 <= num <= 1: return None
-					res = math.degrees(math.asin(num))
-				case "acos":
-					if not -1 <= num <= 1: return None
-					res = math.degrees(math.acos(num))
-				case "atan": res = math.degrees(math.atan(num))
-				case "ln":
-					if num <= 0: return None
-					res = math.log(num)
-				case "log":
-					if num <= 0: return None
-					res = math.log10(num)
-				case "e ^": res = math.exp(num)
-				case "10 ^": res = 10 ** num
-				case _: return None
-		except (ValueError, OverflowError, ZeroDivisionError):
-			return None
-
-		if not math.isfinite(res):
-			return None
-		val = int(res) if isinstance(res, float) and res.is_integer() else res
-		return [4, val], operand[1] | {block_id}
-
-	if operation in ("operator_and", "operator_or"):
-		left = get_in("OPERAND1")
-		right = get_in("OPERAND2")
-		if left is None or right is None:
-			return None
-		b_left = _to_scratch_bool(left[0][1])
-		b_right = _to_scratch_bool(right[0][1])
-		res_bool = (b_left and b_right) if operation == "operator_and" else (b_left or b_right)
-		return [10, "true" if res_bool else "false"], left[1] | right[1] | {block_id}
-
-	if operation in ("operator_gt", "operator_lt", "operator_equals"):
-		left = get_in("OPERAND1") or get_in("NUM1")
-		right = get_in("OPERAND2") or get_in("NUM2")
-		if left is None or right is None:
-			return None
-
-		raw_l, raw_r = left[0][1], right[0][1]
-		num_l = _to_scratch_number(raw_l)
-		num_r = _to_scratch_number(raw_r)
-
-		if num_l is not None and num_r is not None:
-			match operation:
-				case "operator_gt": res_bool = num_l > num_r
-				case "operator_lt": res_bool = num_l < num_r
-				case "operator_equals": res_bool = num_l == num_r
-		else:
-			str_l, str_r = str(raw_l).lower(), str(raw_r).lower()
-			match operation:
-				case "operator_gt": res_bool = str_l > str_r
-				case "operator_lt": res_bool = str_l < str_r
-				case "operator_equals": res_bool = str_l == str_r
-
-		return [10, "true" if res_bool else "false"], left[1] | right[1] | {block_id}
-
-	# binary operators
-	left = get_in("NUM1")
-	right = get_in("NUM2")
+	left = _constant_expression_from_input(inputs.get("NUM1"), blocks, visiting | {block_id})
+	right = _constant_expression_from_input(inputs.get("NUM2"), blocks, visiting | {block_id})
 	if left is None or right is None:
 		return None
 
-	left_num = _to_scratch_number(left[0][1])
-	right_num = _to_scratch_number(right[0][1])
-	if left_num is None or right_num is None:
-		return None
-
+	left_value = float(left[0][1])
+	right_value = float(right[0][1])
 	try:
-		match operation:
-			case "operator_add": result = left_num + right_num
-			case "operator_subtract": result = left_num - right_num
-			case "operator_multiply": result = left_num * right_num
-			case "operator_divide":
-				if right_num == 0: return None
-				result = left_num / right_num
-			case "operator_mod":
-				if right_num == 0: return None
-				result = left_num % right_num
-			case _: return None
+		if operation == "add":
+			result = left_value + right_value
+		elif operation == "subtract":
+			result = left_value - right_value
+		elif operation == "multiply":
+			result = left_value * right_value
+		elif operation == "divide":
+			if right_value == 0:
+				return None
+			result = left_value / right_value
+		else:
+			if right_value == 0:
+				return None
+			result = left_value % right_value
 	except (OverflowError, ValueError, ZeroDivisionError):
 		return None
-
 	if not math.isfinite(result):
 		return None
 	value = int(result) if result.is_integer() else result
@@ -2216,6 +2100,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 
 def fold_constant_expressions(project, stats, opts):
+	"""Fold finite numeric arithmetic reporters whose operands are all literals."""
 	targets = project.get("targets", [])
 	opts.folded_constant_expression_inputs = {}
 	opts.folded_constant_expression_blocks = [set() for _ in targets]
@@ -2258,6 +2143,7 @@ def fold_constant_expressions(project, stats, opts):
 
 
 def prompt_for_constant_variables(project, candidates) -> dict:
+	"""Interactively choose constant-variable candidates whose reporter reads may be folded."""
 	if not candidates:
 		print(Ansi.muted("\nNo constant-variable candidates found."))
 		return {}
@@ -2386,6 +2272,7 @@ def remove_empty_inputs(project, stats):
 
 
 def _target_default_properties_for_removal(target):
+	"""Return only target properties with fixed Scratch defaults."""
 	if target.get("isStage"):
 		return {
 			"currentCostume": 0,
@@ -2409,6 +2296,7 @@ def _target_default_properties_for_removal(target):
 
 
 def remove_default_target_properties(project, stats):
+	"""Remove target properties only when their value is exactly Scratch's default."""
 	count = 0
 	for target in project.get("targets", []):
 		for key, default in _target_default_properties_for_removal(target).items():
@@ -2437,7 +2325,7 @@ def remove_costume_metadata(project, stats, assets=None):
 			fmt = costume.get("dataFormat")
 			canonical = f"{aid}.{fmt}" if isinstance(aid, str) and isinstance(fmt, str) else None
 
-			# DON'T remove md5ext unless we can prove it is derivable and the
+			# Do not remove md5ext unless we can prove it is derivable and the
 			# referenced asset is actually present in the archive.
 			if (
 				canonical
@@ -2447,7 +2335,8 @@ def remove_costume_metadata(project, stats, assets=None):
 				del costume["md5ext"]
 				count += 1
 
-			# SVGs use vector geometry directly; bitmapResolution=1 is the default and is safe to omit.
+			# SVGs use vector geometry directly; bitmapResolution=1 is the
+			# default and is safe to omit. Never do this for bitmap costumes.
 			if fmt == "svg" and costume.get("bitmapResolution") == 1:
 				del costume["bitmapResolution"]
 				count += 1
@@ -2457,6 +2346,7 @@ def remove_costume_metadata(project, stats, assets=None):
 
 
 def remove_empty_target_containers(project, stats):
+	"""Remove schema-optional target containers when they are empty."""
 	count = 0
 	for target in project.get("targets", []):
 		for key in ("lists", "broadcasts", "comments"):
@@ -2467,7 +2357,7 @@ def remove_empty_target_containers(project, stats):
 	return count
 
 
-# for backwards compatibility
+# Backwards-compatible internal alias for older callers.
 remove_empty_containers = remove_empty_target_containers
 
 
@@ -2868,6 +2758,7 @@ def _num_eq(a, b):
 
 
 def _check_broadcast_consistency(project):
+	"""Require every broadcast reference to resolve to one consistent message name."""
 	definitions = {}
 	for ti, target in enumerate(project.get("targets", [])):
 		for bid, name in (target.get("broadcasts") or {}).items():
@@ -2921,6 +2812,7 @@ def _find_dangling_broadcast(value, valid):
 
 
 def _check_block_references_resolve(project):
+	"""Require all serialized input/next references to resolve."""
 	for target in project.get("targets", []):
 		blocks = target.get("blocks", {})
 		for bid, block in blocks.items():
@@ -2993,6 +2885,7 @@ def _input_has_dangling_block_ref(value, blocks):
 
 
 def _folded_input_equivalent(value, literals, project, target_index):
+	"""Canonicalize selected variable reporter primitives in an input value."""
 	if not isinstance(value, list):
 		if isinstance(value, dict):
 			return {k: _folded_input_equivalent(v, literals, project, target_index) for k, v in value.items()}
@@ -3100,6 +2993,7 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 	if opts.compact_mutation_hasnext and missing_keys == {"hasnext"} and original_mutation.get("hasnext") in (False, "false"):
 		allowed_missing.add("hasnext")
 	if opts.compact_mutation_metadata:
+		# canonicalization of these three JSON-string arrays.
 		if missing_keys or extra_keys:
 			if missing_keys - allowed_missing or extra_keys:
 				return False
@@ -3192,6 +3086,7 @@ _ASSET_EXTENSIONS = {
 
 
 def _zip_entry_names(zf):
+	"""Return archive entry names, rejecting duplicate/unsafe entries."""
 	infos = zf.infolist()
 	names = [info.filename for info in infos]
 	if len(names) != len(set(names)):
@@ -3224,6 +3119,7 @@ def _asset_filename(entry, kind):
 
 
 def _validate_asset_entries(project, zf, label):
+	"""Validate every referenced costume/sound and its backing archive asset."""
 	try:
 		names, err = _zip_entry_names(zf)
 	except Exception as exc:
@@ -3288,6 +3184,7 @@ def _validate_asset_entries(project, zf, label):
 
 
 def _serialized_input_refs(value, out):
+	"""Collect only positions in Scratch input tuples that are block IDs."""
 	if not isinstance(value, list) or not value:
 		return
 	tag = value[0]
@@ -3310,6 +3207,7 @@ def _serialized_input_refs(value, out):
 
 
 def _validate_block_structure(project, label):
+	"""Strictly validate the block graph of the produced project."""
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks", {})
 		if not isinstance(blocks, dict):
@@ -3360,7 +3258,7 @@ def _validate_block_structure(project, label):
 				if child in blocks:
 					input_parents.setdefault(child, set()).add(bid)
 
-		# next must be reciprocated by parent
+		# next must be reciprocated by parent.
 		for bid, block in blocks.items():
 			if not isinstance(block, dict):
 				continue
@@ -3375,6 +3273,8 @@ def _validate_block_structure(project, label):
 				if not isinstance(pb, dict):
 					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent is not an object"
 				if pb.get("next") != bid and parent not in input_parents.get(bid, set()):
+					# The input-parent map is keyed by child; require this parent to
+					# actually be one of the serialized owners of the child.
 					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent {parent!r} does not reference this block"
 			for child in input_parents.get(bid, set()):
 				cb = blocks.get(bid)
@@ -3588,6 +3488,9 @@ def verify(original_path, minified_path, opts):
 		err = _validate_asset_entries(mini, b, "minified project")
 		if err:
 			return False, err
+		# The original is checked too, but referenced assets may legitimately be
+		# renamed by an explicitly requested WAV->MP3 conversion. Its asset bytes
+		# still have to be internally consistent.
 		err = _validate_asset_entries(orig, a, "original project")
 		if err:
 			return False, err
