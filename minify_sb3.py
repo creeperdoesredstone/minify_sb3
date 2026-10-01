@@ -1862,6 +1862,22 @@ def _variable_literal(value):
 	return None
 
 
+def _is_literal_value(value):
+	if not (isinstance(value, list) and len(value) == 2 and value[0] == 1):
+		return False
+	literal = value[1]
+	if not isinstance(literal, list) or len(literal) != 2:
+		return False
+	tag, raw = literal
+	if tag in _NUMERIC_TAGS:
+		return (
+			not isinstance(raw, bool)
+			and isinstance(raw, (bool, str, int, float))
+			and (not isinstance(raw, float) or math.isfinite(raw))
+		)
+	return tag == _TEXT_TAG and isinstance(raw, str)
+
+
 def _primitive_json_len(value):
 	return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
@@ -1873,6 +1889,7 @@ def _find_constant_variables(project):
 	reporter_counts = Counter()
 	change_counts = Counter()
 	setter_ids = {}
+	literal_setters = set()
 
 	def scan_input(value, ti):
 		if not isinstance(value, list) or not value:
@@ -1900,6 +1917,8 @@ def _find_constant_variables(project):
 					if block.get("opcode") == "data_setvariableto":
 						set_blocks[owner] = set_blocks.get(owner, 0) + 1
 						setter_ids.setdefault(owner, []).append(bid)
+						if _is_literal_value((block.get("inputs") or {}).get("VALUE")):
+							literal_setters.add(owner)
 					elif block.get("opcode") == "data_changevariableby":
 						change_counts[owner] = change_counts.get(owner, 0) + 1
 			for value in (block.get("inputs") or {}).values():
@@ -1907,18 +1926,26 @@ def _find_constant_variables(project):
 
 	candidates = []
 	for owner, count in set_blocks.items():
-		if count != 1 or reporter_counts.get(owner, 0) <= 0:
+		# variable modified by `change variable by` is runtime-mutable -> not foldable.
+		if (
+			count != 1
+			or owner not in literal_setters
+			or reporter_counts.get(owner, 0) <= 0
+			or change_counts.get(owner, 0) > 0
+		):
 			continue
 		ti, vid = owner
 		entry = (targets[ti].get("variables") or {}).get(vid)
 		if not isinstance(entry, list) or len(entry) < 2:
 			continue
-		# Cloud variables are externally mutable and must never be folded.
+
+		# Cloud variables are externally mutable -> not foldable.
 		if len(entry) >= 3 and entry[2] is True:
 			continue
 		literal = _variable_literal(entry[1])
 		if literal is None:
 			continue
+		
 		old = [12, entry[0], vid]
 		per_use = _primitive_json_len(old) - _primitive_json_len(literal)
 		total = per_use * reporter_counts[owner]
@@ -1981,7 +2008,7 @@ def fold_constant_variables(project, selected, stats):
 
 
 def prompt_for_constant_variables(project, candidates) -> dict:
-	"""Interactively choose singleton-set variables whose reporter reads may be folded."""
+	"""Interactively choose constant-variable candidates whose reporter reads may be folded."""
 	if not candidates:
 		print(Ansi.muted("\nNo constant-variable candidates found."))
 		return {}
@@ -2728,12 +2755,22 @@ def _folded_input_equivalent(value, literals, project, target_index):
 			return copy.deepcopy(literals[owner])
 	return [_folded_input_equivalent(v, literals, project, target_index) if isinstance(v, (list, dict)) else v for v in value]
 
-def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=None, target_index=None):
+def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=None, target_index=None, _allow_folded=True):
 	if oi == mi:
 		return True
-	if opts.fold_constant_variables and getattr(opts, "folded_constant_variable_literals", None):
-		if target_index is not None and _folded_input_equivalent(oi, opts.folded_constant_variable_literals, getattr(opts, "_verify_project", None), target_index) == mi:
-			return True
+	if _allow_folded:
+		folded_literals = (
+			getattr(opts, "folded_constant_variable_literals", None)
+			or getattr(opts, "folded_constant_variables", None)
+		)
+		verify_project = getattr(opts, "_verify_project", None)
+		if folded_literals and target_index is not None and verify_project is not None:
+			folded = _folded_input_equivalent(oi, folded_literals, verify_project, target_index)
+			if folded != oi:
+				return _check_inputs_match(
+					folded, mi, opts, original_blocks, remaining_blocks,
+					target_index, _allow_folded=False,
+				)
 	if (
 		(opts.remove_unreachable or opts.remove_unused_procedures)
 		and remaining_blocks is not None
@@ -2744,7 +2781,10 @@ def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=Non
 		if expected is None:
 			return False
 		if expected != oi:
-			return expected == mi or _check_inputs_match(expected, mi, opts, None, None, target_index)
+			return expected == mi or _check_inputs_match(
+				expected, mi, opts, None, None, target_index,
+				_allow_folded=_allow_folded,
+			)
 	if not (isinstance(oi, list) and isinstance(mi, list) and len(oi) == len(mi)):
 		return False
 	if not oi or not mi or oi[0] != mi[0]:
