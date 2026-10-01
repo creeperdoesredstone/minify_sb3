@@ -1267,15 +1267,120 @@ def _collect_block_refs(value, blocks, out):
 			_collect_block_refs(v, blocks, out)
 
 
+def _repair_dangling_block_ref(value, blocks):
+	"""
+	Repair a serialized Scratch input whose block/shadow reference no longer
+	resolves.
+	Returns (replacement, changed).
+	`None` means the whole input should be removed because there is no safe value to preserve.
+	"""
+	if not isinstance(value, list) or not value:
+		return value, False
+
+	tag = value[0]
+	if tag in (1, 2):
+		if len(value) <= 1:
+			return value, False
+		ref = value[1]
+		if isinstance(ref, str):
+			if ref in blocks:
+				return value, False
+			return None, True
+		if isinstance(ref, (list, dict)):
+			fixed, changed = _repair_dangling_block_ref(ref, blocks)
+			if fixed is None:
+				return None, True
+			if changed:
+				value[1] = fixed
+			return value, changed
+		return value, False
+
+	if tag == 3:
+		changed = False
+		if len(value) > 1 and isinstance(value[1], str):
+			if value[1] not in blocks:
+				if len(value) > 2:
+					shadow = value[2]
+					if isinstance(shadow, str) and shadow not in blocks:
+						return None, True
+					# Preserve the shadow value when the covering block vanished.
+					return [1, shadow], True
+				return None, True
+
+		if len(value) > 2:
+			shadow = value[2]
+			if isinstance(shadow, str) and shadow not in blocks:
+				return [value[0], value[1]], True
+			if isinstance(shadow, (list, dict)):
+				fixed, shadow_changed = _repair_dangling_block_ref(shadow, blocks)
+				if fixed is None:
+					return [value[0], value[1]], True
+				if shadow_changed:
+					value[2] = fixed
+					changed = True
+		return value, changed
+
+	changed = False
+	for i in range(1, len(value)):
+		v = value[i]
+		if isinstance(v, (list, dict)):
+			fixed, sub_changed = _repair_dangling_block_ref(v, blocks)
+			if fixed is None:
+				continue
+			if sub_changed:
+				value[i] = fixed
+				changed = True
+	return value, changed
+
+
+def _repair_dangling_block_refs(target):
+	"""Remove/repair invalid block references."""
+	blocks = target.get("blocks", {})
+	fixed = 0
+
+	for block in blocks.values():
+		if not isinstance(block, dict):
+			continue
+
+		for key in ("next", "parent"):
+			ref = block.get(key)
+			if isinstance(ref, str) and ref not in blocks:
+				block[key] = None
+				fixed += 1
+
+		inputs = block.get("inputs")
+		if not isinstance(inputs, dict):
+			continue
+		for name in list(inputs):
+			fixed_value, changed = _repair_dangling_block_ref(inputs[name], blocks)
+			if not changed:
+				continue
+			if fixed_value is None:
+				del inputs[name]
+			else:
+				inputs[name] = fixed_value
+			fixed += 1
+
+	comments = target.get("comments") or {}
+	for cid in list(comments):
+		c = comments[cid]
+		if isinstance(c, dict) and c.get("blockId") is not None and c["blockId"] not in blocks:
+			del comments[cid]
+
+	return fixed
+
+
 def remove_unreachable_blocks(project, stats):
 	removed = 0
+	dangling_fixed = 0
 	for target in project.get("targets", []):
 		blocks = target.get("blocks", {})
 		roots = {
-			bid for bid, b in blocks.items()
-			if isinstance(b, list) or b.get("topLevel")
+			bid
+			for bid, b in blocks.items()
+			if isinstance(b, list) or (isinstance(b, dict) and b.get("topLevel"))
 		}
-		edges = _build_block_graph(target)  # build once per target
+		edges = _build_block_graph(target)
 		reachable = set()
 		stack = list(roots)
 
@@ -1285,17 +1390,16 @@ def remove_unreachable_blocks(project, stats):
 				continue
 			reachable.add(bid)
 			stack.extend(edges.get(bid, ()))
-		
+
 		for bid in list(blocks):
 			if bid not in reachable:
 				del blocks[bid]
 				removed += 1
-		comments = target.get("comments") or {}
-		for cid in list(comments):
-			c = comments[cid]
-			if isinstance(c, dict) and c.get("blockId") is not None and c["blockId"] not in blocks:
-				del comments[cid]
+
+		dangling_fixed += _repair_dangling_block_refs(target)
+
 	stats["blocks_removed"] += removed
+	stats["dangling_block_refs_fixed"] += dangling_fixed
 	return removed
 
 
@@ -1926,9 +2030,40 @@ def _input_val_eq(vo, vm, opts):
 	return False
 
 
-def _check_inputs_match(oi, mi, opts):
+def _input_has_dangling_block_ref(value, blocks):
+	if not isinstance(value, list) or not value:
+		return False
+	tag = value[0]
+	if tag in (1, 2):
+		if len(value) > 1 and isinstance(value[1], str):
+			return value[1] not in blocks
+		if len(value) > 1 and isinstance(value[1], (list, dict)):
+			return _input_has_dangling_block_ref(value[1], blocks)
+		return False
+	if tag == 3:
+		if len(value) > 1 and isinstance(value[1], str) and value[1] not in blocks:
+			return True
+		if len(value) > 2:
+			if isinstance(value[2], str):
+				return value[2] not in blocks
+			if isinstance(value[2], (list, dict)):
+				return _input_has_dangling_block_ref(value[2], blocks)
+	return False
+	for sub in value[1:]:
+		if isinstance(sub, (list, dict)) and _input_has_dangling_block_ref(sub, blocks):
+			return True
+	return False
+
+
+def _check_inputs_match(oi, mi, opts, original_blocks=None):
 	if oi == mi:
 		return True
+	if opts.remove_unreachable and original_blocks is not None and _input_has_dangling_block_ref(oi, original_blocks):
+		expected = copy.deepcopy(oi)
+		expected, _ = _repair_dangling_block_ref(expected, original_blocks)
+		if expected is None:
+			return False
+		return _check_inputs_match(expected, mi, opts, original_blocks=None)
 	if not (isinstance(oi, list) and isinstance(mi, list) and len(oi) == len(mi)):
 		return False
 	if not oi or not mi or oi[0] != mi[0]:
@@ -1957,7 +2092,7 @@ def _check_inputs_match(oi, mi, opts):
 	return False
 
 
-def _check_blocks(o, m, opts, where):
+def _check_blocks(o, m, opts, where, original_blocks=None):
 	if set(o) != set(m):
 		gone = set(o) - set(m)
 		extra = set(m) - set(o)
@@ -1970,11 +2105,20 @@ def _check_blocks(o, m, opts, where):
 			if not _num_eq(o[k], m[k]) and o[k] != m[k]:
 				return f"{where} (opcode: {o.get('opcode')}): coordinate {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
 		elif k == "inputs":
-			if set(o["inputs"]) != set(m["inputs"]):
+			gone_inputs = set(o["inputs"]) - set(m["inputs"])
+			extra_inputs = set(m["inputs"]) - set(o["inputs"])
+			allowed_gone = {
+				name
+				for name in gone_inputs
+				if opts.remove_unreachable
+				and original_blocks is not None
+				and _input_has_dangling_block_ref(o["inputs"][name], original_blocks)
+			}
+			if extra_inputs or gone_inputs - allowed_gone:
 				return f"{where} (opcode: {o.get('opcode')}): input names changed. Original inputs: {sorted(o['inputs'])}, minified inputs: {sorted(m['inputs'])}"
-			for name in o["inputs"]:
+			for name in set(o["inputs"]) & set(m["inputs"]):
 				oi, mi = o["inputs"][name], m["inputs"][name]
-				if not _check_inputs_match(oi, mi, opts):
+				if not _check_inputs_match(oi, mi, opts, original_blocks):
 					return f"{where} (opcode: {o.get('opcode')}): input {name!r} changed from original {oi!r} to minified {mi!r}"
 		elif o[k] != m[k]:
 			return f"{where} (opcode: {o.get('opcode')}): property {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
@@ -2168,7 +2312,7 @@ def verify(original_path, minified_path, opts):
 					if not (ok and (opts.positions or bo == bm)):
 						return False, f"Target {ti} ({name!r}), primitive block {bid!r} changed from {bo!r} to {bm!r}"
 					continue
-				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}")
+				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}", to["blocks"])
 				if err:
 					return False, err
 				if not isinstance(bm.get("inputs"), dict) or not isinstance(
@@ -2321,6 +2465,7 @@ STAT_ORDER = [
 	("list_items_cleared", "list items removed"),
 	("block_ids", "block IDs renamed"),
 	("dangling_refs_skipped", "sprites skipped (already-dangling refs)"),
+	("dangling_block_refs_fixed", "dangling block references repaired"),
 	("variable_ids", "variable IDs renamed"),
 	("list_ids", "list IDs renamed"),
 	("broadcast_ids", "broadcast IDs renamed"),
