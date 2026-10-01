@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1079,6 +1080,75 @@ def _replace_broadcast_ids_in_value(value, mapping):
 			_replace_broadcast_ids_in_value(v, mapping)
 
 
+def _collect_broadcast_references(project):
+	refs = {}
+
+	def add(bid, name=None, desc=None):
+		if not isinstance(bid, str) or not bid:
+			return
+		entry = refs.setdefault(bid, {"names": set(), "refs": []})
+		if isinstance(name, str) and name:
+			entry["names"].add(name)
+		if desc:
+			entry["refs"].append(desc)
+
+	for ti, target in enumerate(project.get("targets", [])):
+		tname = target.get("name", f"target_{ti}")
+		for bid, block in target.get("blocks", {}).items():
+			if not isinstance(block, dict):
+				continue
+			for field_name in ("BROADCAST_OPTION", "BROADCAST_INPUT"):
+				f = (block.get("fields") or {}).get(field_name)
+				if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str):
+					add(f[1], f[0] if isinstance(f[0], str) else None,
+						f"block {bid!r} ({block.get('opcode')}) in {tname!r}")
+			for value in (block.get("inputs") or {}).values():
+				_collect_broadcast_refs_in_value(value, add,
+						f"block {bid!r} ({block.get('opcode')}) in {tname!r}")
+	return refs
+
+
+def _collect_broadcast_refs_in_value(value, add, desc=None):
+	if not isinstance(value, list) or not value:
+		return
+	if len(value) > 2 and value[0] == 11 and isinstance(value[2], str):
+		name = value[1] if len(value) > 1 and isinstance(value[1], str) else None
+		add(value[2], name, desc)
+		return
+	for v in value:
+		_collect_broadcast_refs_in_value(v, add, desc)
+
+
+def _all_broadcast_ids(project):
+	ids = set()
+	for target in project.get("targets", []):
+		ids.update((target.get("broadcasts") or {}).keys())
+	return ids
+
+
+def _repair_dangling_broadcast_refs(project, stats):
+	"""Restore missing broadcast definitions from references using their serialized names."""
+	targets = project.get("targets", [])
+	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
+	if stage_index is None:
+		return set()
+
+	stage = targets[stage_index]
+	broadcasts = stage.setdefault("broadcasts", {})
+	defined = _all_broadcast_ids(project)
+	repaired = set()
+	for bid, info in _collect_broadcast_references(project).items():
+		if bid in defined:
+			continue
+		names = sorted(info["names"])
+		broadcasts[bid] = names[0] if names else "message"
+		defined.add(bid)
+		repaired.add(bid)
+	if repaired:
+		stats["broadcast_refs_repaired"] += len(repaired)
+	return repaired
+
+
 def rename_broadcast_ids(project, stats, existing_ids=(), frequency_order=False):
 	ids = set()
 	for target in project.get("targets", []):
@@ -1411,51 +1481,91 @@ def _procedure_key(block):
 
 
 def remove_unused_procedures(project, stats):
-	removed = 0
-	removable_total = 0
+	removed_blocks = 0
+	removed_procedures = 0
+
 	for target in project.get("targets", []):
 		blocks = target.get("blocks", {})
-		calls = set()
-		definitions = {}
-		for bid, b in blocks.items():
-			if not isinstance(b, dict):
-				continue
-			op = b.get("opcode")
-			if op == "procedures_definition":
-				proto_id = ((b.get("inputs") or {}).get("custom_block") or [None, None])
-				proto_id = proto_id[1] if len(proto_id) > 1 else None
-				proto = blocks.get(proto_id)
-				proc = _procedure_key(proto) if isinstance(proto, dict) else None
-				if proc is not None:
-					definitions.setdefault(proc, []).append(bid)
-			elif op == "procedures_call":
-				proc = _procedure_key(b)
-				if proc is not None:
-					calls.add(proc)
-
-		removable = {proc for proc in definitions if proc not in calls}
-		if not removable:
+		if not blocks:
 			continue
-		removable_total += len(removable)
 
-		edges = _build_block_graph(target)     # build ONCE per target
+		children = {}
+		for bid, block in blocks.items():
+			if not isinstance(block, dict):
+				continue
+			parent = block.get("parent")
+			if isinstance(parent, str) and parent in blocks:
+				children.setdefault(parent, set()).add(bid)
+
+		definition_blocks = {}  # (proccode, definition_id) -> complete definition closure
+		for bid, b in blocks.items():
+			if not isinstance(b, dict) or b.get("opcode") != "procedures_definition":
+				continue
+			custom = (b.get("inputs") or {}).get("custom_block") or [None, None]
+			proto_id = custom[1] if len(custom) > 1 and isinstance(custom[1], str) else None
+			proto = blocks.get(proto_id)
+			proc = _procedure_key(proto) if isinstance(proto, dict) else None
+			if proc is None:
+				continue
+
+			# In Scratch serialization, the procedure body is connected through
+			# parent links; definition.next is the next top-level stack, not the body.
+			todo, seen = [bid], set()
+			while todo:
+				x = todo.pop()
+				if x in seen or x not in blocks:
+					continue
+				seen.add(x)
+				todo.extend(children.get(x, ()))
+			definition_blocks[(proc, bid)] = seen
+
+		if not definition_blocks:
+			continue
+
+		owned = set().union(*definition_blocks.values())
+		live_procs = set()
+		queue = []
+
+		def seed_calls(ids):
+			for x in ids:
+				b = blocks.get(x)
+				if isinstance(b, dict) and b.get("opcode") == "procedures_call":
+					proc = _procedure_key(b)
+					if proc is not None and proc not in live_procs:
+						queue.append(proc)
+
+		# Calls outside procedure closures are the program's procedure entry points.
+		seed_calls(set(blocks) - owned)
+		while queue:
+			proc = queue.pop()
+			if proc in live_procs:
+				continue
+			live_procs.add(proc)
+			for (defined_proc, _definition_id), closure in definition_blocks.items():
+				if defined_proc == proc:
+					seed_calls(closure)
+
+		all_procs = {proc for proc, _ in definition_blocks}
+		dead_procs = all_procs - live_procs
+		if not dead_procs:
+			continue
+
 		to_delete = set()
-		for proc in removable:
-			for bid in definitions[proc]:
-				todo, seen = [bid], set()
-				while todo:
-					x = todo.pop()
-					if x in seen or x not in blocks:
-						continue
-					seen.add(x)
-					todo.extend(edges.get(x, ()))
-				to_delete |= seen
-		for x in to_delete:
-			del blocks[x]
-			removed += 1
-	stats["procedures_removed"] = removable_total
-	stats["blocks_removed"] += removed
-	return removable_total
+		for (proc, _definition_id), closure in definition_blocks.items():
+			if proc in dead_procs:
+				to_delete.update(closure)
+
+		for bid in to_delete:
+			if bid in blocks:
+				del blocks[bid]
+				removed_blocks += 1
+		removed_procedures += len(dead_procs)
+
+		stats["dangling_block_refs_fixed"] += _repair_dangling_block_refs(target)
+
+	stats["procedures_removed"] += removed_procedures
+	stats["blocks_removed"] += removed_blocks
+	return removed_procedures
 
 
 def normalize_numbers(project, stats, epsilon):
@@ -1464,7 +1574,9 @@ def normalize_numbers(project, stats, epsilon):
 		nonlocal changed
 		if isinstance(v, bool):
 			return v
-		if isinstance(v, float) and v not in (float("inf"), float("-inf")):
+		if isinstance(v, float):
+			if math.isnan(v) or math.isinf(v):
+				return v
 			if v.is_integer() and not (v == 0 and str(v).startswith("-")):
 				changed += 1
 				return int(v)
@@ -1521,33 +1633,48 @@ def convert_wav_sounds_to_mp3(project, assets, stats):
 		stats["wav_ffmpeg_unavailable"] += 1
 		return {}
 
-	conversions = {}   # old_filename -> new_filename, for the caller/verifier
+	conversions = {}
+	cache = {}  # source filename -> converted filename or None on failure
 	for target in project.get("targets", []):
 		for sound in target.get("sounds", []):
 			if not isinstance(sound, dict) or sound.get("dataFormat") != "wav":
 				continue
-			old_ext_name = sound.get("md5ext") or f"{sound.get('assetId')}.wav"
-			wav_bytes = assets.get(old_ext_name)
+			old_name = sound.get("md5ext") or f"{sound.get('assetId')}.wav"
+			if old_name in cache:
+				new_name = cache[old_name]
+				if new_name is None:
+					continue
+				sound["assetId"] = new_name.rsplit(".", 1)[0]
+				sound["dataFormat"] = "mp3"
+				sound["md5ext"] = new_name
+				stats["wav_converted"] += 1
+				continue
+
+			wav_bytes = assets.get(old_name)
 			if wav_bytes is None:
-				continue   # asset missing from the archive; nothing to convert
+				cache[old_name] = None
+				continue
 			mp3_bytes = _encode_wav_to_mp3(wav_bytes)
 			if mp3_bytes is None:
+				cache[old_name] = None
 				stats["wav_conversion_failed"] += 1
 				continue
 
-			new_asset_id = hashlib.md5(mp3_bytes).hexdigest()
-			new_ext_name = f"{new_asset_id}.mp3"
+			new_name = f"{hashlib.md5(mp3_bytes).hexdigest()}.mp3"
+			cache[old_name] = new_name
+			conversions[old_name] = new_name
+			assets[new_name] = mp3_bytes
 
-			assets[new_ext_name] = mp3_bytes
-			if old_ext_name in assets and old_ext_name != new_ext_name:
-				del assets[old_ext_name]
-
-			sound["assetId"] = new_asset_id
+			sound["assetId"] = new_name.rsplit(".", 1)[0]
 			sound["dataFormat"] = "mp3"
-			sound["md5ext"] = new_ext_name
-			conversions[old_ext_name] = new_ext_name
+			sound["md5ext"] = new_name
 			stats["wav_converted"] += 1
 			stats["wav_bytes_saved"] += len(wav_bytes) - len(mp3_bytes)
+
+	# The source may be shared by several sounds, so remove it only after the
+	# conversion mapping has been established for every reference.
+	for old_name in conversions:
+		assets.pop(old_name, None)
 
 	return conversions
 
@@ -1582,19 +1709,41 @@ def remove_empty_inputs(project, stats):
 	return count
 
 
-def remove_costume_metadata(project, stats):
+def remove_costume_metadata(project, stats, assets=None):
+	"""Remove only costume metadata that is provably redundant.
+
+		`md5ext` is removable only when it is exactly the canonical
+		`assetId.dataFormat` filename and that asset exists. This avoids
+		breaking projects which deliberately use a non-canonical extension.
+
+		`bitmapResolution=1` is removable only for SVG costumes; Scratch's
+		vector costume path treats the omitted value as the default.
+	"""
 	count = 0
 	for target in project.get("targets", []):
 		for costume in target.get("costumes", []):
-			if isinstance(costume, dict):
-				aid = costume.get("assetId")
-				fmt = costume.get("dataFormat")
-				if aid and fmt and costume.get("md5ext") == f"{aid}.{fmt}":
-					del costume["md5ext"]
-					count += 1
-				if fmt == "svg" and costume.get("bitmapResolution") == 1:
-					del costume["bitmapResolution"]
-					count += 1
+			if not isinstance(costume, dict):
+				continue
+			aid = costume.get("assetId")
+			fmt = costume.get("dataFormat")
+			canonical = f"{aid}.{fmt}" if isinstance(aid, str) and isinstance(fmt, str) else None
+
+			# Do not remove md5ext unless we can prove it is derivable and the
+			# referenced asset is actually present in the archive.
+			if (
+				canonical
+				and costume.get("md5ext") == canonical
+				and (assets is None or canonical in assets)
+			):
+				del costume["md5ext"]
+				count += 1
+
+			# SVGs use vector geometry directly; bitmapResolution=1 is the
+			# default and is safe to omit. Never do this for bitmap costumes.
+			if fmt == "svg" and costume.get("bitmapResolution") == 1:
+				del costume["bitmapResolution"]
+				count += 1
+
 	stats["costume_metadata_removed"] += count
 	return count
 
@@ -1718,7 +1867,7 @@ class Options:
 		self.remove_empty_containers = remove_empty_containers
 		self.remove_project_meta = remove_project_meta
 		self.compress_assets = compress_assets
-		self.convert_wav_to_mp3 = convert_wav_to_mp3 or compress_assets
+		self.convert_wav_to_mp3 = convert_wav_to_mp3
 		self.sort_keys = sort_keys
 		self.compression_level = compression_level
 		self.preserve_asset_compression = preserve_asset_compression
@@ -1731,6 +1880,7 @@ class Options:
 		self.renamed_broadcast_ids = {}
 		self.renamed_argument_ids = {}
 		self.wav_conversions = {}
+		self.repaired_broadcast_ids = set()
 		self.list_bytes, self.list_items = list_bytes, list_items
 		self.cleared_lists = frozenset()
 		self.normalize_epsilon = normalize_epsilon
@@ -1761,6 +1911,8 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_unused_data(
 			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
 		)
+	if opts.remove_unused_broadcasts or opts.rename_broadcast_ids:
+		opts.repaired_broadcast_ids = _repair_dangling_broadcast_refs(project, stats)
 	if opts.remove_unused_broadcasts:
 		remove_unused_broadcasts(project, stats)
 	used_data_ids = set()
@@ -1793,7 +1945,7 @@ def apply_transforms(project, opts: Options, assets=None):
 	if opts.remove_empty_inputs:
 		remove_empty_inputs(project, stats)
 	if opts.remove_costume_metadata:
-		remove_costume_metadata(project, stats)
+		remove_costume_metadata(project, stats, assets)
 	if opts.remove_empty_containers:
 		remove_empty_containers(project, stats)
 	if opts.remove_project_meta:
@@ -1971,9 +2123,32 @@ def _num_eq(a, b):
 	)
 
 
+
+def _check_broadcast_consistency(project):
+	"""Require every broadcast reference to resolve to one consistent message name."""
+	definitions = {}
+	for ti, target in enumerate(project.get("targets", [])):
+		for bid, name in (target.get("broadcasts") or {}).items():
+			if not isinstance(bid, str) or not bid:
+				return f"target {ti} ({target.get('name')!r}): invalid broadcast ID {bid!r}"
+			if not isinstance(name, str):
+				return f"target {ti} ({target.get('name')!r}), broadcast {bid!r}: name is not a string"
+			if bid in definitions and definitions[bid][0] != name:
+				return f"broadcast {bid!r} has conflicting definitions {definitions[bid][0]!r} and {name!r}"
+			definitions[bid] = (name, ti)
+
+	for bid, info in _collect_broadcast_references(project).items():
+		if bid not in definitions:
+			return f"broadcast reference {bid!r} has no matching definition"
+		defined_name = definitions[bid][0]
+		conflicts = sorted(n for n in info["names"] if n != defined_name)
+		if conflicts:
+			return f"broadcast {bid!r}: definition name {defined_name!r} conflicts with reference name(s) {conflicts}"
+	return None
+
+
 def _check_broadcast_ids_resolve(project):
-	stage = next((t for t in project.get("targets", []) if t.get("isStage")), None)
-	valid = set((stage or {}).get("broadcasts") or {})
+	valid = _all_broadcast_ids(project)
 	for target in project.get("targets", []):
 		for bid, b in target.get("blocks", {}).items():
 			if not isinstance(b, dict):
@@ -1986,7 +2161,7 @@ def _check_broadcast_ids_resolve(project):
 				bad = _find_dangling_broadcast(value, valid)
 				if bad is not None:
 					return f"{target.get('name')!r}/{bid!r}: broadcast id {bad!r} has no matching message"
-	return None
+	return _check_broadcast_consistency(project)
 
 
 def _find_dangling_broadcast(value, valid):
@@ -1998,6 +2173,23 @@ def _find_dangling_broadcast(value, valid):
 		bad = _find_dangling_broadcast(v, valid)
 		if bad is not None:
 			return bad
+	return None
+
+
+def _check_block_references_resolve(project):
+	for target in project.get("targets", []):
+		blocks = target.get("blocks", {})
+		for bid, block in blocks.items():
+			if not isinstance(block, dict):
+				continue
+			for key in ("next", "parent"):
+				ref = block.get(key)
+				if isinstance(ref, str) and ref not in blocks:
+					return f"{target.get('name')!r}/{bid!r}: {key} points to missing block {ref!r}"
+			for name, value in (block.get("inputs") or {}).items():
+				fixed, changed = _repair_dangling_block_ref(copy.deepcopy(value), blocks)
+				if changed and fixed != value:
+					return f"{target.get('name')!r}/{bid!r}: input {name!r} contains a missing block reference"
 	return None
 
 
@@ -2048,32 +2240,39 @@ def _input_has_dangling_block_ref(value, blocks):
 				return value[2] not in blocks
 			if isinstance(value[2], (list, dict)):
 				return _input_has_dangling_block_ref(value[2], blocks)
-	return False
 	for sub in value[1:]:
 		if isinstance(sub, (list, dict)) and _input_has_dangling_block_ref(sub, blocks):
 			return True
 	return False
 
 
-def _check_inputs_match(oi, mi, opts, original_blocks=None):
+def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=None):
 	if oi == mi:
 		return True
-	if opts.remove_unreachable and original_blocks is not None and _input_has_dangling_block_ref(oi, original_blocks):
+	if (
+		(opts.remove_unreachable or opts.remove_unused_procedures)
+		and remaining_blocks is not None
+		and _input_has_dangling_block_ref(oi, remaining_blocks)
+	):
 		expected = copy.deepcopy(oi)
-		expected, _ = _repair_dangling_block_ref(expected, original_blocks)
+		expected, _ = _repair_dangling_block_ref(expected, remaining_blocks)
 		if expected is None:
 			return False
-		return _check_inputs_match(expected, mi, opts, original_blocks=None)
+		if expected != oi:
+			return expected == mi or _check_inputs_match(expected, mi, opts, None, None)
 	if not (isinstance(oi, list) and isinstance(mi, list) and len(oi) == len(mi)):
 		return False
 	if not oi or not mi or oi[0] != mi[0]:
 		return False
 	if oi[0] in (1, 2):
-		if isinstance(oi[1], list) and isinstance(mi[1], list) and len(oi[1]) == len(mi[1]):
-			if oi[1][0] == mi[1][0] and oi[1][0] in _NUMERIC_TAGS:
-				return _input_val_eq(oi[1][1], mi[1][1], opts)
+		if len(oi) > 1 and len(mi) > 1:
+			if isinstance(oi[1], list) and isinstance(mi[1], list) and len(oi[1]) == len(mi[1]):
+				if oi[1][0] == mi[1][0] and oi[1][0] in _NUMERIC_TAGS:
+					return _input_val_eq(oi[1][1], mi[1][1], opts)
+				return oi[1] == mi[1]
+			return oi[1] == mi[1]
 	elif oi[0] == 3:
-		if oi[1] != mi[1]:
+		if len(oi) > 1 and len(mi) > 1 and oi[1] != mi[1]:
 			return False
 		if len(oi) > 2 and len(mi) > 2:
 			if (
@@ -2089,15 +2288,18 @@ def _check_inputs_match(oi, mi, opts, original_blocks=None):
 			if isinstance(oi[2], list) and isinstance(mi[2], list) and len(oi[2]) == len(mi[2]):
 				if oi[2][0] == mi[2][0] and oi[2][0] in _NUMERIC_TAGS:
 					return _input_val_eq(oi[2][1], mi[2][1], opts)
+				return oi[2] == mi[2]
 	return False
 
 
-def _check_blocks(o, m, opts, where, original_blocks=None):
+def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None):
+	remaining_blocks = remaining_blocks if remaining_blocks is not None else set(original_blocks or ())
 	if set(o) != set(m):
 		gone = set(o) - set(m)
 		extra = set(m) - set(o)
 		if extra or not (opts.comments and gone <= {"comment"}):
 			return f"{where} (opcode: {o.get('opcode')}): block keys changed. Missing keys: {sorted(gone)}, unexpected extra keys: {sorted(extra)}"
+	allow_repairs = opts.remove_unreachable or opts.remove_unused_procedures
 	for k in o:
 		if k not in m:
 			continue
@@ -2107,41 +2309,340 @@ def _check_blocks(o, m, opts, where, original_blocks=None):
 		elif k == "inputs":
 			gone_inputs = set(o["inputs"]) - set(m["inputs"])
 			extra_inputs = set(m["inputs"]) - set(o["inputs"])
-			allowed_gone = {
-				name
-				for name in gone_inputs
-				if opts.remove_unreachable
-				and original_blocks is not None
-				and _input_has_dangling_block_ref(o["inputs"][name], original_blocks)
-			}
+			allowed_gone = set()
+			if allow_repairs and remaining_blocks is not None:
+				for name in gone_inputs:
+					fixed, changed = _repair_dangling_block_ref(copy.deepcopy(o["inputs"][name]), remaining_blocks)
+					if changed and fixed is None:
+						allowed_gone.add(name)
 			if extra_inputs or gone_inputs - allowed_gone:
 				return f"{where} (opcode: {o.get('opcode')}): input names changed. Original inputs: {sorted(o['inputs'])}, minified inputs: {sorted(m['inputs'])}"
 			for name in set(o["inputs"]) & set(m["inputs"]):
 				oi, mi = o["inputs"][name], m["inputs"][name]
-				if not _check_inputs_match(oi, mi, opts, original_blocks):
+				if not _check_inputs_match(oi, mi, opts, original_blocks, remaining_blocks):
 					return f"{where} (opcode: {o.get('opcode')}): input {name!r} changed from original {oi!r} to minified {mi!r}"
-		elif o[k] != m[k]:
-			return f"{where} (opcode: {o.get('opcode')}): property {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
+		else:
+			if (
+				allow_repairs
+				and k in ("next", "parent")
+				and isinstance(o[k], str)
+				and remaining_blocks is not None
+				and o[k] not in remaining_blocks
+				and m[k] is None
+			):
+				continue
+			if o[k] != m[k]:
+				return f"{where} (opcode: {o.get('opcode')}): property {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
 	return None
 
 
+
+
+_ASSET_EXTENSIONS = {
+	"costume": {"png", "svg", "jpeg", "jpg", "bmp", "gif"},
+	"sound": {"wav", "wave", "mp3"},
+}
+
+
+def _zip_entry_names(zf):
+	"""Return archive entry names, rejecting duplicate/unsafe entries."""
+	infos = zf.infolist()
+	names = [info.filename for info in infos]
+	if len(names) != len(set(names)):
+		dupes = sorted(name for name, n in Counter(names).items() if n > 1)
+		return None, f"archive contains duplicate entry names: {dupes[:10]}"
+	for name in names:
+		if not isinstance(name, str) or not name or name.startswith("/"):
+			return None, f"archive contains an invalid absolute/empty entry name: {name!r}"
+		parts = name.replace("\\", "/").split("/")
+		if any(part in ("", ".", "..") for part in parts if name != "project.json"):
+			return None, f"archive contains an unsafe entry path: {name!r}"
+	return set(names), None
+
+
+def _valid_asset_id(value):
+	return isinstance(value, str) and len(value) == 32 and all(c in "0123456789abcdefABCDEF" for c in value)
+
+
+def _asset_filename(entry, kind):
+	if not isinstance(entry, dict):
+		return None
+	md5ext = entry.get("md5ext")
+	if isinstance(md5ext, str) and md5ext:
+		return md5ext
+	aid = entry.get("assetId")
+	fmt = entry.get("dataFormat")
+	if _valid_asset_id(aid) and isinstance(fmt, str) and fmt:
+		return f"{aid}.{fmt}"
+	return None
+
+
+def _validate_asset_entries(project, zf, label):
+	"""Validate every referenced costume/sound and its backing archive asset."""
+	try:
+		names, err = _zip_entry_names(zf)
+	except Exception as exc:
+		return f"{label}: unable to inspect archive entries: {exc}"
+	if err:
+		return f"{label}: {err}"
+
+	for ti, target in enumerate(project.get("targets", [])):
+		for kind, key in (("costume", "costumes"), ("sound", "sounds")):
+			for index, entry in enumerate(target.get(key, [])):
+				where = f"{label}, target {ti} ({target.get('name')!r}), {kind} {index}"
+				if not isinstance(entry, dict):
+					return f"{where}: entry is not an object"
+				if not _valid_asset_id(entry.get("assetId")):
+					return f"{where}: invalid assetId {entry.get('assetId')!r}"
+				if not isinstance(entry.get("name"), str):
+					return f"{where}: name is not a string"
+				fmt = entry.get("dataFormat")
+				if fmt not in _ASSET_EXTENSIONS[kind]:
+					return f"{where}: unsupported dataFormat {fmt!r}"
+				md5ext = entry.get("md5ext")
+				if md5ext is not None:
+					if not isinstance(md5ext, str) or "." not in md5ext:
+						return f"{where}: invalid md5ext {md5ext!r}"
+					stem, ext = md5ext.rsplit(".", 1)
+					if not _valid_asset_id(stem):
+						return f"{where}: md5ext stem does not match an asset ID: {md5ext!r}"
+					if stem.lower() != entry["assetId"].lower():
+						return f"{where}: md5ext {md5ext!r} disagrees with assetId {entry['assetId']!r}"
+					allowed_exts = _ASSET_EXTENSIONS[kind]
+					if ext.lower() not in allowed_exts:
+						return f"{where}: md5ext extension {ext!r} is invalid for {kind}"
+					filename = md5ext
+				else:
+					filename = _asset_filename(entry, kind)
+					if filename is None:
+						return f"{where}: cannot derive an asset filename"
+
+				if filename not in names:
+					return f"{where}: referenced asset {filename!r} is missing from archive"
+				payload = zf.read(filename)
+				actual_id = hashlib.md5(payload).hexdigest()
+				if actual_id.lower() != entry["assetId"].lower():
+					return (
+						f"{where}: asset {filename!r} has MD5 {actual_id}, "
+						f"but project declares {entry['assetId']}"
+					)
+
+				if kind == "costume":
+					if "bitmapResolution" in entry:
+						br = entry["bitmapResolution"]
+						if isinstance(br, bool) or not isinstance(br, int) or br <= 0:
+							return f"{where}: invalid bitmapResolution {br!r}"
+					for axis in ("rotationCenterX", "rotationCenterY"):
+						if axis in entry and (isinstance(entry[axis], bool) or not isinstance(entry[axis], (int, float))):
+							return f"{where}: invalid {axis} {entry[axis]!r}"
+				else:
+					for field in ("rate", "sampleCount"):
+						if field in entry and (isinstance(entry[field], bool) or not isinstance(entry[field], (int, float))):
+							return f"{where}: invalid {field} {entry[field]!r}"
+	return None
+
+
+def _serialized_input_refs(value, out):
+	"""Collect only positions in Scratch input tuples that are block IDs."""
+	if not isinstance(value, list) or not value:
+		return
+	tag = value[0]
+	if tag in (1, 2):
+		if len(value) > 1 and isinstance(value[1], str):
+			out.add(value[1])
+		elif len(value) > 1 and isinstance(value[1], (list, dict)):
+			_serialized_input_refs(value[1], out)
+		return
+	if tag == 3:
+		for item in value[1:3]:
+			if isinstance(item, str):
+				out.add(item)
+			elif isinstance(item, (list, dict)):
+				_serialized_input_refs(item, out)
+		return
+	for item in value[1:]:
+		if isinstance(item, (list, dict)):
+			_serialized_input_refs(item, out)
+
+
+def _validate_block_structure(project, label):
+	"""Strictly validate the block graph of the produced project."""
+	for ti, target in enumerate(project.get("targets", [])):
+		blocks = target.get("blocks", {})
+		if not isinstance(blocks, dict):
+			return f"{label}, target {ti} ({target.get('name')!r}): blocks is not an object"
+
+		input_parents = {}
+		for bid, block in blocks.items():
+			where = f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}"
+			if not isinstance(bid, str) or not bid:
+				return f"{where}: invalid block ID"
+			if isinstance(block, list):
+				if len(block) < 3 or block[0] not in (12, 13):
+					return f"{where}: malformed primitive block {block!r}"
+				continue
+			if not isinstance(block, dict):
+				return f"{where}: block is neither object nor variable/list primitive"
+			if not isinstance(block.get("opcode"), str) or not block.get("opcode"):
+				return f"{where}: missing/invalid opcode"
+			for key in ("next", "parent"):
+				ref = block.get(key)
+				if ref is not None and not isinstance(ref, str):
+					return f"{where}: {key} must be null or a string"
+				if isinstance(ref, str) and ref not in blocks:
+					return f"{where}: {key} points to missing block {ref!r}"
+			if not isinstance(block.get("inputs"), dict) or not isinstance(block.get("fields"), dict):
+				return f"{where}: inputs/fields must be objects"
+			if isinstance(block.get("topLevel"), bool) and block.get("topLevel") and block.get("parent") is not None:
+				return f"{where}: topLevel block has non-null parent {block['parent']!r}"
+			if isinstance(block.get("shadow"), bool) and block.get("shadow") and block.get("topLevel"):
+				return f"{where}: shadow block cannot be topLevel"
+			mut = block.get("mutation")
+			if mut is not None:
+				if not isinstance(mut, dict):
+					return f"{where}: mutation is not an object"
+				if "tagName" in mut and mut["tagName"] != "mutation":
+					return f"{where}: mutation.tagName is {mut['tagName']!r}, not 'mutation'"
+				if "children" in mut and not isinstance(mut["children"], list):
+					return f"{where}: mutation.children is not an array"
+
+			refs = set()
+			for name, value in block["inputs"].items():
+				_serialized_input_refs(value, refs)
+			for child in refs:
+				if child in blocks:
+					input_parents.setdefault(child, set()).add(bid)
+
+		# next must be reciprocated by parent.
+		for bid, block in blocks.items():
+			if not isinstance(block, dict):
+				continue
+			nxt = block.get("next")
+			if isinstance(nxt, str):
+				child = blocks.get(nxt)
+				if isinstance(child, dict) and child.get("parent") != bid:
+					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: next -> {nxt!r} but child.parent is {child.get('parent')!r}"
+			parent = block.get("parent")
+			if isinstance(parent, str):
+				pb = blocks.get(parent)
+				if not isinstance(pb, dict):
+					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent is not an object"
+				if pb.get("next") != bid and parent not in input_parents.get(bid, set()):
+					# The input-parent map is keyed by child; require this parent to
+					# actually be one of the serialized owners of the child.
+					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent {parent!r} does not reference this block"
+			for child in input_parents.get(bid, set()):
+				cb = blocks.get(bid)
+				if isinstance(cb, dict) and cb.get("parent") != child:
+					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: input owner {child!r} disagrees with parent {cb.get('parent')!r}"
+	return None
+
+
+def _check_costumes(original_target, minified_target, opts, zf):
+	original = original_target.get("costumes", [])
+	minified = minified_target.get("costumes", [])
+	if len(original) != len(minified):
+		return f"Target {original_target.get('name')!r}: costume count changed from {len(original)} to {len(minified)}"
+
+	allowed_keys = {"assetId", "name", "md5ext", "dataFormat", "bitmapResolution", "rotationCenterX", "rotationCenterY"}
+	for index, (co, cm) in enumerate(zip(original, minified)):
+		where = f"Target {original_target.get('name')!r}, costume {index}"
+		if not isinstance(co, dict) or not isinstance(cm, dict):
+			if co != cm:
+				return f"{where}: costume entry changed"
+			continue
+
+		extra = set(cm) - set(co)
+		if extra:
+			return f"{where}: unexpected attribute(s) appeared: {sorted(extra)}"
+
+		allowed_removed = set()
+		if (
+			opts.remove_costume_metadata
+			and co.get("md5ext") == f"{co.get('assetId')}.{co.get('dataFormat')}"
+		):
+			allowed_removed.add("md5ext")
+		if (
+			opts.remove_costume_metadata
+			and co.get("dataFormat") == "svg"
+			and co.get("bitmapResolution") == 1
+		):
+			allowed_removed.add("bitmapResolution")
+		missing = (set(co) - set(cm)) - allowed_removed
+		if missing:
+			return f"{where}: attribute(s) were removed unexpectedly: {sorted(missing)}"
+
+		for key in set(co) & set(cm):
+			ov, mv = co[key], cm[key]
+			if key in ("rotationCenterX", "rotationCenterY") and opts.positions:
+				if ov != mv and not _num_eq(ov, mv):
+					return f"{where}: {key!r} changed from {ov!r} to {mv!r}"
+			elif ov != mv:
+				return f"{where}: attribute {key!r} changed from {ov!r} to {mv!r}"
+
+	return None
+
 def verify(original_path, minified_path, opts):
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
+		if a.testzip() is not None:
+			return False, f"input zip '{original_path}' failed CRC test"
 		if b.testzip() is not None:
 			return False, f"output zip '{minified_path}' failed CRC test"
-		if set(a.namelist()) != set(b.namelist()):
-			diff_missing = sorted(set(a.namelist()) - set(b.namelist()))
-			diff_extra = sorted(set(b.namelist()) - set(a.namelist()))
+		for zf, zpath in ((a, original_path), (b, minified_path)):
+			names, err = _zip_entry_names(zf)
+			if err:
+				return False, f"archive '{zpath}': {err}"
+			if "project.json" not in names:
+				return False, f"archive '{zpath}' has no project.json"
+		orig_assets = {name for name in a.namelist() if name != "project.json"}
+		mini_assets = {name for name in b.namelist() if name != "project.json"}
+		conversions = getattr(opts, "wav_conversions", {}) or {}
+		expected_assets = (orig_assets - set(conversions)) | set(conversions.values())
+		if mini_assets != expected_assets:
+			diff_missing = sorted(expected_assets - mini_assets)
+			diff_extra = sorted(mini_assets - expected_assets)
 			return False, f"zip archive entries differ. Missing: {diff_missing[:10]}, unexpected extra: {diff_extra[:10]}"
-		for name in a.namelist():
-			if name != "project.json" and a.read(name) != b.read(name):
-				return False, f"asset byte-for-byte mismatch: {name!r} ({len(a.read(name))} bytes vs {len(b.read(name))} bytes)"
+		for name in orig_assets:
+			if name in conversions:
+				new_name = conversions[name]
+				new_bytes = b.read(new_name)
+				if hashlib.md5(new_bytes).hexdigest() != new_name.rsplit(".", 1)[0]:
+					return False, f"converted asset {new_name!r} does not match its MD5 asset ID"
+			else:
+				if a.read(name) != b.read(name):
+					return False, f"asset byte-for-byte mismatch: {name!r} ({len(a.read(name))} bytes vs {len(b.read(name))} bytes)"
 
-		orig = _reinflate(json.loads(a.read("project.json")))
-		mini = _reinflate(json.loads(b.read("project.json")))
+		try:
+			orig_raw = json.loads(a.read("project.json"))
+			mini_raw_project = json.loads(b.read("project.json"))
+		except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+			return False, f"project.json is not valid UTF-8 JSON: {exc}"
+		if not isinstance(orig_raw, dict) or not isinstance(mini_raw_project, dict):
+			return False, "project.json root must be an object"
+		if not isinstance(orig_raw.get("targets"), list) or not isinstance(mini_raw_project.get("targets"), list):
+			return False, "project.json targets must be arrays"
+		orig = _reinflate(orig_raw)
+		mini = _reinflate(mini_raw_project)
 
-		if opts.rename_broadcast_ids:
-			err = _check_broadcast_ids_resolve(json.loads(b.read("project.json")))
+		err = _validate_asset_entries(mini, b, "minified project")
+		if err:
+			return False, err
+		# The original is checked too, but referenced assets may legitimately be
+		# renamed by an explicitly requested WAV->MP3 conversion. Its asset bytes
+		# still have to be internally consistent.
+		err = _validate_asset_entries(orig, a, "original project")
+		if err:
+			return False, err
+		err = _validate_block_structure(mini, "minified project")
+		if err:
+			return False, err
+
+		if opts.rename_broadcast_ids or opts.remove_unused_broadcasts or getattr(opts, "repaired_broadcast_ids", None):
+			err = _check_broadcast_ids_resolve(mini_raw_project)
+			if err:
+				return False, err
+		if opts.remove_unreachable or opts.remove_unused_procedures:
+			err = _check_block_references_resolve(mini_raw_project)
 			if err:
 				return False, err
 
@@ -2192,8 +2693,10 @@ def verify(original_path, minified_path, opts):
 
 			to_bcasts = to.get("broadcasts", {})
 			tm_bcasts = tm.get("broadcasts", {})
-			if set(tm_bcasts) - set(to_bcasts):
-				return False, f"Target {ti} ({name!r}): unexpected new broadcast ID(s) appeared in minified project: {sorted(set(tm_bcasts) - set(to_bcasts))}"
+			unexpected_bcasts = set(tm_bcasts) - set(to_bcasts)
+			allowed_repaired = set(getattr(opts, "repaired_broadcast_ids", ()) or ())
+			if unexpected_bcasts - allowed_repaired:
+				return False, f"Target {ti} ({name!r}): unexpected new broadcast ID(s) appeared in minified project: {sorted(unexpected_bcasts - allowed_repaired)}"
 			missing_bcasts = set(to_bcasts) - set(tm_bcasts)
 			if missing_bcasts and not (opts.remove_unused_broadcasts or (opts.remove_empty_containers and not to.get("isStage") and not to_bcasts)):
 				return False, f"Target {ti} ({name!r}): {len(missing_bcasts)} broadcast(s) removed without --remove-unused-broadcasts: {sorted(missing_bcasts)}"
@@ -2312,7 +2815,7 @@ def verify(original_path, minified_path, opts):
 					if not (ok and (opts.positions or bo == bm)):
 						return False, f"Target {ti} ({name!r}), primitive block {bid!r} changed from {bo!r} to {bm!r}"
 					continue
-				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}", to["blocks"])
+				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}", to["blocks"], set(tm["blocks"]))
 				if err:
 					return False, err
 				if not isinstance(bm.get("inputs"), dict) or not isinstance(
@@ -2353,31 +2856,13 @@ def verify(original_path, minified_path, opts):
 				if dangling_comments:
 					return False, f"Target {ti} ({name!r}): dangling block.comment link in block(s): {dangling_comments[:10]}"
 
-			for snd in tm.get("sounds", []):
-				if "md5ext" not in snd:
-					return False, f"Target {ti} ({name!r}): sound {snd.get('name')!r} lost required md5ext attribute"
+			err = _check_sounds(to, tm, opts)
+			if err:
+				return False, err
 
-			to_costumes = to.get("costumes", [])
-			tm_costumes = tm.get("costumes", [])
-			if len(to_costumes) != len(tm_costumes):
-				return False, f"Target {ti} ({name!r}): costume count changed from {len(to_costumes)} to {len(tm_costumes)}"
-			for co, cm in zip(to_costumes, tm_costumes):
-				cname = co.get("name")
-				for key, value in cm.items():
-					if key in ("rotationCenterX", "rotationCenterY"):
-						continue
-					if value != co.get(key):
-						return False, f"Target {ti} ({name!r}), costume {cname!r}: attribute {key!r} changed from {co.get(key)!r} to {value!r}"
-				if opts.remove_costume_metadata:
-					diff = set(co) - set(cm)
-					for d in diff:
-						if d == "md5ext" and co.get("md5ext") == f"{co.get('assetId')}.{co.get('dataFormat')}":
-							continue
-						if d == "bitmapResolution" and co.get("dataFormat") == "svg" and co.get("bitmapResolution") == 1:
-							continue
-						return False, f"Target {ti} ({name!r}), costume {cname!r}: unexpected attribute {d!r} was removed by costume metadata cleanup"
-				elif set(co) != set(cm):
-					return False, f"Target {ti} ({name!r}), costume {cname!r}: costume attributes changed without --remove-costume-metadata"
+			err = _check_costumes(to, tm, opts, b)
+			if err:
+				return False, err
 
 			if _check_argument_id_consistency(to, name) is None:
 				err = _check_argument_id_consistency(tm, name)
@@ -2387,7 +2872,45 @@ def verify(original_path, minified_path, opts):
 		err = _check_monitors(orig, mini, opts)
 		if err:
 			return False, err
+		err = _validate_block_structure(mini, "minified project (final)")
+		if err:
+			return False, err
 	return True, "ok"
+
+
+def _check_sounds(original_target, minified_target, opts):
+	original = original_target.get("sounds", [])
+	minified = minified_target.get("sounds", [])
+	if len(original) != len(minified):
+		return f"Target {original_target.get('name')!r}: sound count changed from {len(original)} to {len(minified)}"
+	conversions = getattr(opts, "wav_conversions", {}) or {}
+	for index, (so, sm) in enumerate(zip(original, minified)):
+		if not isinstance(so, dict) or not isinstance(sm, dict):
+			if so != sm:
+				return f"Target {original_target.get('name')!r}, sound {index}: sound entry changed"
+			continue
+
+		expected = dict(so)
+		old_name = so.get("md5ext") or (f"{so.get('assetId')}.wav" if so.get("dataFormat") == "wav" else None)
+		if so.get("dataFormat") == "wav" and old_name in conversions:
+			new_name = conversions[old_name]
+			expected["assetId"] = new_name.rsplit(".", 1)[0]
+			expected["dataFormat"] = "mp3"
+			expected["md5ext"] = new_name
+
+		allowed_missing = set()
+		if not opts.keep_sound_metadata:
+			allowed_missing.update(("rate", "sampleCount"))
+		for key in set(sm) - set(expected):
+			return f"Target {original_target.get('name')!r}, sound {index}: unexpected attribute {key!r} appeared"
+		for key, value in expected.items():
+			if key not in sm:
+				if key in allowed_missing:
+					continue
+				return f"Target {original_target.get('name')!r}, sound {index}: required attribute {key!r} was removed"
+			if sm[key] != value:
+				return f"Target {original_target.get('name')!r}, sound {index}: attribute {key!r} changed from {value!r} to {sm[key]!r}"
+	return None
 
 
 def _check_monitors(orig, mini, opts):
@@ -2466,6 +2989,7 @@ STAT_ORDER = [
 	("block_ids", "block IDs renamed"),
 	("dangling_refs_skipped", "sprites skipped (already-dangling refs)"),
 	("dangling_block_refs_fixed", "dangling block references repaired"),
+	("broadcast_refs_repaired", "missing broadcast definitions restored"),
 	("variable_ids", "variable IDs renamed"),
 	("list_ids", "list IDs renamed"),
 	("broadcast_ids", "broadcast IDs renamed"),
@@ -2609,26 +3133,38 @@ if __name__ == "__main__":
 		"--order-data-ids-by-frequency",
 		"--compact-numeric-inputs",
 	}
-	valued = {"--list-bytes", "--list-items", "--compression-level"}
+	valued = {"--list-bytes", "--list-items", "--compression-level", "--normalize-epsilon"}
 	values, bad = {}, []
 	for f in flags:
 		key, eq, val = f.partition("=")
 		if key in toggles and not eq:
 			continue
-		if key in valued and eq and val.isdigit():
-			n = int(val)
-			if key == "--compression-level" and 0 <= n <= 9:
-				values[key] = n
-				continue
-			if key != "--compression-level" and n > 0:
-				values[key] = n
-				continue
+		if key in valued and eq:
+			if key == "--normalize-epsilon":
+				try:
+					n = float(val)
+				except ValueError:
+					n = 0.0
+				if math.isfinite(n) and n > 0:
+					values[key] = n
+					continue
+			else:
+				if not val.isdigit():
+					bad.append(f)
+					continue
+				n = int(val)
+				if key == "--compression-level" and 0 <= n <= 9:
+					values[key] = n
+					continue
+				if key != "--compression-level" and n > 0:
+					values[key] = n
+					continue
 		bad.append(f)
 	if bad:
 		print(Ansi.error(f"Unknown or malformed option(s): {bad}"))
 		print(
 			Ansi.muted(
-				f"Valid: {sorted(toggles)} and --list-bytes=N --list-items=N (positive), --compression-level=N (0-9)"
+				f"Valid: {sorted(toggles)} and --list-bytes=N --list-items=N (positive), --compression-level=N (0-9), --normalize-epsilon=N (positive)"
 			)
 		)
 		sys.exit(1)
@@ -2641,7 +3177,7 @@ if __name__ == "__main__":
 		positions=("--keep-positions" not in flags),
 		covered=("--keep-covered" not in flags),
 		monitors=("--keep-monitors" not in flags),
-		lists=False if ("--keep-lists" in flags or all_optimizations) else True,
+		lists=("--keep-lists" not in flags),
 		rename_block_ids=all_optimizations or "--rename-block-ids" in flags or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
 		rename_variable_ids=all_optimizations or "--rename-variable-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
 		rename_list_ids=all_optimizations or "--rename-list-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
@@ -2662,12 +3198,13 @@ if __name__ == "__main__":
 		frequency_block_ids=all_optimizations or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
 		frequency_data_ids=all_optimizations or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
 		compact_numeric_inputs=all_optimizations or "--compact-numeric-inputs" in flags,
-		compress_assets=all_optimizations or "--compress-assets" in flags or "--convert-wav-to-mp3" in flags,
+		compress_assets=all_optimizations or "--compress-assets" in flags,
+		convert_wav_to_mp3=all_optimizations or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
 		compression_level=values.get("--compression-level", 9),
 		list_bytes=values.get("--list-bytes", DEFAULT_LIST_BYTES),
 		list_items=values.get("--list-items", DEFAULT_LIST_ITEMS),
-		normalize_epsilon=values.get("--normalize_epsilon", DEFAULT_EPSILON),
+		normalize_epsilon=values.get("--normalize-epsilon", DEFAULT_EPSILON),
 		keep_sound_metadata=("--keep-sound-metadata" in flags),
 	)
 	dst = args[1] if len(args) > 1 else os.path.splitext(args[0])[0] + "_minified.sb3"
