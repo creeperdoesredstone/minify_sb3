@@ -2090,7 +2090,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 		else:
 			if right_value == 0:
 				return None
-			result = math.fmod(left_value, right_value)
+			result = left_value % right_value
 	except (OverflowError, ValueError, ZeroDivisionError):
 		return None
 	if not math.isfinite(result):
