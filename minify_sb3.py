@@ -1445,7 +1445,7 @@ def _iter_input_block_refs(value):
 
 
 def _repair_dangling_block_refs(target):
-	"""Repair block links in both directions without making ambiguous edges."""
+	"""Repair block links in both directions without inventing ambiguous edges."""
 	blocks = target.get("blocks", {})
 	fixed = 0
 
@@ -1760,6 +1760,62 @@ def remove_sound_metadata(project):
 				sound.pop("sampleCount", None)
 
 
+def compact_redundant_field_ids(project, stats):
+	"""Remove the optional null field-ID slot from serialized Scratch fields.
+
+	Scratch field tuples are commonly serialized as [value, null] when a field
+	has no associated variable/list/broadcast ID. The ID slot is optional, so
+	[value] is an equivalent and smaller representation. Only an explicit null
+	slot is removed; empty-string and non-null IDs are preserved.
+	"""
+	count = 0
+	for target in project.get("targets", []):
+		for block in target.get("blocks", {}).values():
+			if not isinstance(block, dict):
+				continue
+			for value in (block.get("fields") or {}).values():
+				if isinstance(value, list) and len(value) == 2 and value[1] is None:
+					del value[1]
+					count += 1
+	stats["field_ids_compacted"] += count
+	return count
+
+
+def compact_experimental_mutation_metadata(project, stats):
+	"""Losslessly compact JSON-encoded custom-block mutation arrays.
+
+	TurboWarp's editor expects mutation.tagName and mutation.children to exist
+	when it converts blocks back to XML, so those properties must not be removed.
+	This experimental pass instead canonicalizes the JSON strings used by
+	argumentids, argumentnames, and argumentdefaults without changing their
+	decoded values.
+	"""
+	count = 0
+	for target in project.get("targets", []):
+		for block in target.get("blocks", {}).values():
+			if not isinstance(block, dict):
+				continue
+			mut = block.get("mutation")
+			if not isinstance(mut, dict):
+				continue
+			for key in ("argumentids", "argumentnames", "argumentdefaults"):
+				value = mut.get(key)
+				if not isinstance(value, str):
+					continue
+				try:
+					decoded = json.loads(value)
+				except (TypeError, ValueError):
+					continue
+				if not isinstance(decoded, list):
+					continue
+				compact = json.dumps(decoded, separators=(",", ":"), ensure_ascii=False)
+				if compact != value:
+					mut[key] = compact
+					count += 1
+	stats["mutation_metadata_compacted"] += count
+	return count
+
+
 def remove_empty_fields(project, stats):
 	count = 0
 	for target in project.get("targets", []):
@@ -1786,7 +1842,8 @@ def remove_costume_metadata(project, stats, assets=None):
 	"""Remove only costume metadata that is provably redundant.
 
 		`md5ext` is removable only when it is exactly the canonical
-		`assetId.dataFormat` filename and that asset exists.
+		`assetId.dataFormat` filename and that asset exists. This avoids
+		breaking projects which deliberately use a non-canonical extension.
 
 		`bitmapResolution=1` is removable only for SVG costumes; Scratch's
 		vector costume path treats the omitted value as the default.
@@ -1914,6 +1971,8 @@ class Options:
 		frequency_block_ids=False,
 		frequency_data_ids=False,
 		compact_numeric_inputs=False,
+		compact_field_ids=False,
+		compact_mutation_metadata=False,
 	):
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
@@ -1946,6 +2005,8 @@ class Options:
 		self.frequency_block_ids = frequency_block_ids
 		self.frequency_data_ids = frequency_data_ids
 		self.compact_numeric_inputs = compact_numeric_inputs
+		self.compact_field_ids = compact_field_ids
+		self.experimental_mutation_metadata = compact_mutation_metadata
 		self.renamed_block_ids = {}
 		self.renamed_variable_ids = {}
 		self.renamed_list_ids = {}
@@ -2008,6 +2069,10 @@ def apply_transforms(project, opts: Options, assets=None):
 		)
 	if opts.compact_numeric_inputs:
 		compact_numeric_inputs(project, stats)
+	if opts.compact_field_ids:
+		compact_redundant_field_ids(project, stats)
+	if opts.experimental_mutation_metadata:
+		compact_experimental_mutation_metadata(project, stats)
 	if opts.normalize_numbers:
 		normalize_numbers(project, stats, opts.normalize_epsilon)
 	if not opts.keep_sound_metadata:
@@ -2370,6 +2435,51 @@ def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=Non
 	return False
 
 
+def _check_fields_match(original_fields, minified_fields, opts):
+	if original_fields == minified_fields:
+		return True
+	if not (opts.compact_field_ids and isinstance(original_fields, dict) and isinstance(minified_fields, dict)):
+		return False
+	if set(original_fields) != set(minified_fields):
+		return False
+	for name, ov in original_fields.items():
+		mv = minified_fields[name]
+		if ov == mv:
+			continue
+		if (
+			isinstance(ov, list)
+			and len(ov) == 2
+			and ov[1] is None
+			and isinstance(mv, list)
+			and len(mv) == 1
+			and ov[0] == mv[0]
+		):
+			continue
+		return False
+	return True
+
+
+def _check_mutation_match(original_mutation, minified_mutation, opts):
+	if original_mutation == minified_mutation:
+		return True
+	if not (opts.experimental_mutation_metadata and isinstance(original_mutation, dict) and isinstance(minified_mutation, dict)):
+		return False
+	if set(original_mutation) != set(minified_mutation):
+		return False
+	for key, ov in original_mutation.items():
+		mv = minified_mutation[key]
+		if ov == mv:
+			continue
+		if key in ("argumentids", "argumentnames", "argumentdefaults") and isinstance(ov, str) and isinstance(mv, str):
+			try:
+				if json.loads(ov) == json.loads(mv):
+					continue
+			except (TypeError, ValueError):
+				pass
+		return False
+	return True
+
+
 def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None):
 	remaining_blocks = remaining_blocks if remaining_blocks is not None else set(original_blocks or ())
 	if set(o) != set(m):
@@ -2381,7 +2491,13 @@ def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None
 	for k in o:
 		if k not in m:
 			continue
-		if k in ("x", "y") and opts.positions:
+		if k == "fields":
+			if not _check_fields_match(o[k], m[k], opts):
+				return f"{where} (opcode: {o.get('opcode')}): fields changed from original {o[k]!r} to minified {m[k]!r}"
+		elif k == "mutation":
+			if not _check_mutation_match(o[k], m[k], opts):
+				return f"{where} (opcode: {o.get('opcode')}): mutation changed from original {o[k]!r} to minified {m[k]!r}"
+		elif k in ("x", "y") and opts.positions:
 			if not _num_eq(o[k], m[k]) and o[k] != m[k]:
 				return f"{where} (opcode: {o.get('opcode')}): coordinate {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
 		elif k == "inputs":
@@ -3006,8 +3122,11 @@ def verify(original_path, minified_path, opts):
 				if "next" not in bm or "parent" not in bm:
 					return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute"
 				mu = bm.get("mutation")
-				if mu is not None and ("tagName" not in mu or "children" not in mu):
-					return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children"
+				if mu is not None:
+					if not isinstance(mu, dict):
+						return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): mutation is not an object"
+					if not opts.experimental_mutation_metadata and ("tagName" not in mu or "children" not in mu):
+						return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children"
 
 			co, cm = to["comments"], tm["comments"]
 			if not isinstance(cm, dict):
@@ -3191,6 +3310,8 @@ STAT_ORDER = [
 	("empty_containers_removed", "empty target containers removed"),
 	("project_meta_cleaned", "project meta fields cleaned"),
 	("numeric_inputs_compacted", "numeric string inputs compacted"),
+	("field_ids_compacted", "redundant null field IDs removed"),
+	("mutation_metadata_compacted", "experimental mutation JSON compacted"),
 ]
 
 
@@ -3317,6 +3438,8 @@ if __name__ == "__main__":
 		"--frequency-data-ids",
 		"--order-data-ids-by-frequency",
 		"--compact-numeric-inputs",
+		"--compact-field-ids",
+		"--compact-mutation-metadata",
 	}
 	valued = {"--list-bytes", "--list-items", "--compression-level", "--normalize-epsilon"}
 	values, bad = {}, []
@@ -3383,6 +3506,8 @@ if __name__ == "__main__":
 		frequency_block_ids=all_optimizations or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
 		frequency_data_ids=all_optimizations or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
 		compact_numeric_inputs=all_optimizations or "--compact-numeric-inputs" in flags,
+		compact_field_ids=all_optimizations or "--compact-field-ids" in flags,
+		compact_mutation_metadata="--compact-mutation-metadata" in flags,
 		compress_assets=all_optimizations or "--compress-assets" in flags,
 		convert_wav_to_mp3=all_optimizations or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
