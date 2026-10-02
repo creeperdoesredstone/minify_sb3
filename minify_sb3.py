@@ -2407,7 +2407,6 @@ def _create_scratch_id():
 
 
 def _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
-	"""A fold deletes its intermediate blocks; never delete one a comment points at."""
 	return any(
 		bid in commented_ids
 		or (isinstance(blocks.get(bid), dict) and "comment" in blocks[bid])
@@ -2430,8 +2429,6 @@ def fold_constant_expressions(project, stats, opts):
 			if isinstance(c, dict) and c.get("blockId") is not None
 		}
 
-		# Pass 1: evaluate only. Nothing is mutated, so every plan sees the
-		# original block graph.
 		plans = []
 		for block_id, block in blocks.items():
 			if not isinstance(block, dict):
@@ -2442,21 +2439,15 @@ def fold_constant_expressions(project, stats, opts):
 					continue
 				val, folded_ids = res
 				if not folded_ids:
-					continue  # bare literal: no block was collapsed, leave it alone
+					continue
 				if _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
 					continue
 				plans.append((block_id, input_name, val, folded_ids))
 
-		# A plan whose owning block is itself folded away by an enclosing plan
-		# must not run: the owner is about to be deleted, so anything attached
-		# to it (e.g. the <not> built for a true result) would be left with a
-		# dangling parent. An enclosing plan always covers the enclosed one's
-		# blocks, so skipping loses nothing.
 		doomed = set()
 		for _, _, _, folded_ids in plans:
 			doomed |= folded_ids
 
-		# Pass 2: apply, and delete the intermediates of *this* target.
 		for block_id, input_name, val, folded_ids in plans:
 			if block_id in doomed:
 				continue
