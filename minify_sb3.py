@@ -7290,66 +7290,12 @@ def minify_sb3(src, dst, opts=None):
 
 
 if __name__ == "__main__":
+	from minify_flags import toggles, valued
+
 	flags = [a for a in sys.argv[1:] if a.startswith("--")]
 	args = [a for a in sys.argv[1:] if not a.startswith("--")]
-	toggles = {
-		"--all-optimizations",
-		"--all-flags",
-		"--keep-comments",
-		"--keep-positions",
-		"--keep-covered",
-		"--keep-monitors",
-		"--clear-large-lists",
-		"--rename-block-ids",
-		"--rename-variable-ids",
-		"--rename-list-ids",
-		"--rename-broadcast-ids",
-		"--rename-argument-ids",
-		"--rename-identifiers",
-		"--rename-variable-names",
-		"--rename-list-names",
-		"--rename-broadcast-names",
-		"--rename-argument-names",
-		"--rename-procedure-names",
-		"--remove-unused-variables",
-		"--remove-unused-lists",
-		"--remove-unused-broadcasts",
-		"--remove-unreachable",
-		"--remove-unused-procedures",
-		"--normalize-numbers",
-		"--remove-empty-fields",
-		"--remove-empty-inputs",
-		"--remove-costume-metadata",
-		"--remove-default-target-properties",
-		"--remove-empty-containers",
-		"--remove-project-meta",
-		"--sort-keys",
-		"--keep-sound-metadata",
-		"--preserve-asset-compression",
-		"--compress-assets",
-		"--convert-wav-to-mp3",
-		"--frequency-block-ids",
-		"--order-block-ids-by-frequency",
-		"--frequency-data-ids",
-		"--order-data-ids-by-frequency",
-		"--compact-numeric-inputs",
-		"--compact-field-ids",
-		"--compact-mutation-hasnext",
-		"--compact-mutation-metadata",
-		"--fold-constant-variables",
-		"--fold-constant-expressions",
-		"--simplify-blocks",
-		"--group-similar-sequences",
-		"--remove-empty-target-containers",
-	}
-	valued = {
-		"--list-bytes",
-		"--list-items",
-		"--compression-level",
-		"--normalize-epsilon",
-		"--sequence-threshold",
-	}
 	values, bad = {}, []
+
 	for f in flags:
 		key, eq, val = f.partition("=")
 		if key in toggles and not eq:
@@ -7384,8 +7330,10 @@ if __name__ == "__main__":
 		)
 		sys.exit(1)
 	if not args:
-		print(__doc__)
+		print(Ansi.error("Path and flags are not specified."))
+		print(Ansi.error("Usage: ") + Ansi.warning("python minify_sb3.py path/to/project.sb3 --flags"))
 		sys.exit(1)
+	
 	all_optimizations = "--all-optimizations" in flags or "--all-flags" in flags
 	opts = Options(
 		comments=("--keep-comments" not in flags),
