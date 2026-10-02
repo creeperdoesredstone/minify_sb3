@@ -4305,6 +4305,226 @@ def _reparent_serialized_input(value, blocks, parent_id):
 			block["parent"] = parent_id
 
 
+def _sequence_primary_input_block_id(value, blocks):
+	"""Return the primary block referenced by a serialized Scratch input."""
+	if not (isinstance(value, list) and value):
+		return None
+	if len(value) > 1:
+		ref = value[1]
+		if isinstance(ref, str) and ref in blocks:
+			return ref
+		if isinstance(ref, (list, dict)):
+			return _sequence_primary_input_block_id(ref, blocks)
+	return None
+
+
+def _variable_reporter_id(value, blocks):
+	"""Return the variable ID represented by a serialized variable reporter input."""
+	if not isinstance(value, list) or not value:
+		return None
+
+	if value[0] == 12 and len(value) > 2 and isinstance(value[2], str):
+		return value[2]
+
+	block_id = _sequence_primary_input_block_id(value, blocks)
+	if block_id is None:
+		return None
+	block = blocks.get(block_id)
+	if not isinstance(block, dict) or block.get("opcode") != "data_variable":
+		return None
+	field = (block.get("fields") or {}).get("VARIABLE")
+	if isinstance(field, list) and len(field) > 1 and isinstance(field[1], str):
+		return field[1]
+	return None
+
+
+def _block_has_external_owner(block_id, blocks, owner_id):
+	"""Whether an input/next edge outside owner_id references block_id."""
+	for other_id, other in blocks.items():
+		if other_id in (block_id, owner_id) or not isinstance(other, dict):
+			continue
+		if other.get("next") == block_id:
+			return True
+		for value in (other.get("inputs") or {}).values():
+			if block_id in _input_block_ids(value, blocks):
+				return True
+	return False
+
+
+def _simplify_setter_rhs_blocks(project, stats, opts):
+	"""
+	Rewrite:
+	  set [x] to ([x] + a) -> change [x] by a
+	  set [x] to ([x] - a) -> change [x] by -a              (literal a)
+	  set [x] to ([x] - a) -> change [x] by (0 - a)         (non-literal a)
+
+	The transformation is conservative around shared/commented reporter blocks.
+	"""
+	targets = project.get("targets", [])
+	opts.simplified_block_removed_blocks = [set() for _ in targets]
+	opts.simplified_block_link_edits = {}
+	opts.simplified_block_input_edits = {}
+	opts.simplified_block_opcode_edits = {}
+
+	total = add_count = subtract_count = removed_count = 0
+
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		comments = target.get("comments") or {}
+		commented_ids = {
+			c.get("blockId")
+			for c in comments.values()
+			if isinstance(c, dict) and isinstance(c.get("blockId"), str)
+		}
+		commented_ids.update(
+			bid
+			for bid, block in blocks.items()
+			if isinstance(block, dict) and "comment" in block
+		)
+
+		for set_id, set_block in list(blocks.items()):
+			if not isinstance(set_block, dict):
+				continue
+			if set_block.get("opcode") != "data_setvariableto":
+				continue
+
+			fields = set_block.get("fields") or {}
+			var_field = fields.get("VARIABLE")
+			if not (
+				isinstance(var_field, list)
+				and len(var_field) > 1
+				and isinstance(var_field[1], str)
+			):
+				continue
+			var_id = var_field[1]
+
+			inputs = set_block.get("inputs") or {}
+			rhs_value = inputs.get("VALUE")
+			rhs_id = _sequence_primary_input_block_id(rhs_value, blocks)
+			if rhs_id is None or rhs_id == set_id:
+				continue
+
+			rhs = blocks.get(rhs_id)
+			if not isinstance(rhs, dict):
+				continue
+			operator = rhs.get("opcode")
+			if operator not in ("operator_add", "operator_subtract"):
+				continue
+			if rhs.get("next") is not None:
+				continue
+			rhs_inputs = rhs.get("inputs") or {}
+			left_raw = rhs_inputs.get("NUM1")
+			right_raw = rhs_inputs.get("NUM2")
+			if left_raw is None or right_raw is None:
+				continue
+			if _variable_reporter_id(left_raw, blocks) != var_id:
+				continue
+
+			if rhs_id in commented_ids:
+				continue
+
+			rhs_closure = _exclusive_input_block_subtree(rhs_value, blocks, set_id)
+			if rhs_closure is None or rhs_id not in rhs_closure:
+				continue
+
+			left_closure = _exclusive_input_block_subtree(
+				left_raw, blocks, rhs_id
+			)
+			if left_closure is None:
+				continue
+
+			right_closure = _exclusive_input_block_subtree(
+				right_raw, blocks, rhs_id
+			)
+			if right_closure is None:
+				continue
+
+			left_to_remove = left_closure - right_closure
+			if any(bid in commented_ids for bid in left_to_remove):
+				continue
+
+			if operator == "operator_add":
+				new_value = copy.deepcopy(right_raw)
+				for child_id in _input_block_ids(new_value, blocks):
+					child = blocks.get(child_id)
+					if isinstance(child, dict):
+						opts.simplified_block_link_edits[(ti, child_id, "parent")] = set_id
+						child["parent"] = set_id
+				_reparent_serialized_input(new_value, blocks, set_id)
+
+				removed = {rhs_id} | left_to_remove
+				set_block["opcode"] = "data_changevariableby"
+				opts.simplified_block_opcode_edits[(ti, set_id)] = "data_changevariableby"
+				inputs["VALUE"] = new_value
+				opts.simplified_block_input_edits[(ti, set_id, "VALUE")] = (
+					copy.deepcopy(new_value)
+				)
+
+				for bid in removed:
+					blocks.pop(bid, None)
+				opts.simplified_block_removed_blocks[ti].update(removed)
+
+				total += 1
+				add_count += 1
+				removed_count += len(removed)
+				continue
+
+			# operator_subtract
+			if _is_literal_value(right_raw):
+				raw_literal = right_raw[1]
+				number = _to_scratch_number(raw_literal[1])
+				if not math.isfinite(number):
+					continue
+				number = -number
+				if number == 0:
+					number = 0
+				else:
+					number = int(number) if float(number).is_integer() else number
+
+				new_value = [1, [4, number]]
+				removed = {rhs_id} | left_to_remove
+				set_block["opcode"] = "data_changevariableby"
+				opts.simplified_block_opcode_edits[(ti, set_id)] = "data_changevariableby"
+				inputs["VALUE"] = new_value
+				opts.simplified_block_input_edits[(ti, set_id, "VALUE")] = (
+					copy.deepcopy(new_value)
+				)
+
+				for bid in removed:
+					blocks.pop(bid, None)
+				opts.simplified_block_removed_blocks[ti].update(removed)
+
+				total += 1
+				subtract_count += 1
+				removed_count += len(removed)
+				continue
+
+			# set x to (x - a) -> change x by (0 - a).
+			new_left = [1, [4, 0]]
+			rhs_inputs["NUM1"] = new_left
+			opts.simplified_block_input_edits[(ti, rhs_id, "NUM1")] = copy.deepcopy(
+				new_left
+			)
+
+			removed = left_to_remove
+			set_block["opcode"] = "data_changevariableby"
+			opts.simplified_block_opcode_edits[(ti, set_id)] = "data_changevariableby"
+			if removed:
+				for bid in removed:
+					blocks.pop(bid, None)
+				opts.simplified_block_removed_blocks[ti].update(removed)
+
+			total += 1
+			subtract_count += 1
+			removed_count += len(removed)
+
+	stats["blocks_simplified"] += total
+	stats["set_to_change_add"] += add_count
+	stats["set_to_change_subtract"] += subtract_count
+	stats["simplify_blocks_removed"] += removed_count
+	return total
+
+
 def _simplify_boolean_identity_input(value, blocks, parent_id=None):
 	"""
 	Simplify AND/OR inputs when one operand is a compile-time boolean.
@@ -4889,6 +5109,7 @@ class Options:
 		compact_mutation_metadata=False,
 		fold_constant_variables=False,
 		fold_constant_expressions=False,
+		simplify_blocks=False,
 		group_similar_sequences=False,
 		sequence_threshold=3,
 	):
@@ -4944,9 +5165,14 @@ class Options:
 		self.compact_mutation_metadata = compact_mutation_metadata
 		self.fold_constant_variables = fold_constant_variables
 		self.fold_constant_expressions = fold_constant_expressions
+		self.simplify_blocks = simplify_blocks
 		self.group_similar_sequences = group_similar_sequences
 		self.sequence_threshold = max(1, int(sequence_threshold))
 
+		self.simplified_block_removed_blocks = []
+		self.simplified_block_link_edits = {}
+		self.simplified_block_input_edits = {}
+		self.simplified_block_opcode_edits = {}
 		self.renamed_block_ids = {}
 		self.renamed_variable_ids = {}
 		self.renamed_list_ids = {}
@@ -5010,6 +5236,8 @@ def apply_transforms(project, opts: Options, assets=None):
 		)
 	if opts.fold_constant_expressions:
 		fold_constant_expressions(project, stats, opts)
+	if opts.simplify_blocks:
+		_simplify_setter_rhs_blocks(project, stats, opts)
 	if opts.group_similar_sequences:
 		group_similar_sequences(project, stats, opts.sequence_threshold, opts)
 	if opts.remove_unused_variables or opts.remove_unused_lists:
@@ -5630,7 +5858,14 @@ def _check_blocks(
 	for k in o:
 		if k not in m:
 			continue
-		if k == "fields":
+		if k == "opcode":
+			simplified_opcodes = getattr(opts, "simplified_block_opcode_edits", {}) or {}
+			expected_opcode = simplified_opcodes.get((target_index, block_id))
+			if expected_opcode is not None and m[k] == expected_opcode:
+				continue
+			if o[k] != m[k]:
+				return f"{where} (opcode: {o.get('opcode')}): property {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
+		elif k == "fields":
 			if not _check_fields_match(o[k], m[k], opts):
 				return f"{where} (opcode: {o.get('opcode')}): fields changed from original {o[k]!r} to minified {m[k]!r}"
 		elif k == "mutation":
@@ -5696,6 +5931,20 @@ def _check_blocks(
 					)
 				):
 					continue
+				simplified_inputs = getattr(opts, "simplified_block_input_edits", {}) or {}
+				simplified_input = simplified_inputs.get((target_index, block_id, name))
+				if simplified_input is not None and (
+					simplified_input == mi
+					or _check_inputs_match(
+						simplified_input,
+						mi,
+						opts,
+						original_blocks,
+						remaining_blocks,
+						target_index,
+					)
+				):
+					continue
 				if not _check_inputs_match(
 					oi, mi, opts, original_blocks, remaining_blocks, target_index
 				):
@@ -5704,6 +5953,7 @@ def _check_blocks(
 			link_edits = getattr(opts, "variable_setter_link_edits", None) or {}
 			fold_link_edits = getattr(opts, "folded_constant_expression_link_edits", None) or {}
 			group_link_edits = getattr(opts, "grouped_sequence_link_edits", None) or {}
+			simplified_link_edits = getattr(opts, "simplified_block_link_edits", None) or {}
 			if k in ("next", "parent"):
 				link_key = (target_index, block_id, k)
 				expected_link = link_edits.get(link_key)
@@ -5711,6 +5961,8 @@ def _check_blocks(
 					expected_link = fold_link_edits.get(link_key)
 				if expected_link is None:
 					expected_link = group_link_edits.get(link_key)
+				if expected_link is None:
+					expected_link = simplified_link_edits.get(link_key)
 				if expected_link is not None and m[k] == expected_link:
 					continue
 			if (
@@ -6106,6 +6358,9 @@ def _expected_removed_blocks(project, opts):
 		setter_blocks = getattr(opts, "removed_variable_setter_blocks", ())
 		if ti < len(setter_blocks):
 			ids.update(setter_blocks[ti])
+		simplified_removed = getattr(opts, "simplified_block_removed_blocks", ())
+		if ti < len(simplified_removed):
+			ids.update(simplified_removed[ti])
 		grouped_removed = getattr(opts, "grouped_sequence_removed_blocks", ())
 		if ti < len(grouped_removed):
 			ids.update(grouped_removed[ti])
@@ -6743,7 +6998,7 @@ STAT_GROUPS = [
 	),
 	(
 		"2.",
-		"WAV → MP3 conversion",
+		"WAV -> MP3 conversion",
 		[
 			("wav_converted", "sounds converted"),
 			("wav_bytes_saved", "asset bytes saved"),
@@ -6899,19 +7154,29 @@ def _print_transform_stats(stats, opts):
 		print(Ansi.subheading(f"  {number} {title}"))
 		for key, label in entries:
 			print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
-		if number == "12." and opts.group_similar_sequences:
-			print(Ansi.subheading("  12a. Group similar sequences (optional)"))
-			for key, label in (
-				("sequence_groups_created", "similar sequence groups created"),
-				("sequences_grouped", "sequence instances grouped"),
-				("sequence_procedures_created", "sequence procedures created"),
-				("sequence_parameters", "sequence parameters created"),
-				("sequence_blocks_removed", "sequence blocks removed"),
-				("sequence_blocks_added", "sequence procedure blocks added"),
-				("sequence_bytes_saved", "sequence grouping JSON bytes saved"),
-				("sequence_groups_rejected_size", "candidate groups rejected for size"),
-			):
-				print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+		if number == "12.":
+			if opts.simplify_blocks:
+				print(Ansi.subheading("  12a. Simplify set-variable arithmetic"))
+				for key, label in (
+					("blocks_simplified", "set blocks simplified"),
+					("set_to_change_add", "addition forms simplified"),
+					("set_to_change_subtract", "subtraction forms simplified"),
+					("simplify_blocks_removed", "redundant reporter blocks removed"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.group_similar_sequences:
+				print(Ansi.subheading("  12b. Group similar sequences (optional)"))
+				for key, label in (
+					("sequence_groups_created", "similar sequence groups created"),
+					("sequences_grouped", "sequence instances grouped"),
+					("sequence_procedures_created", "sequence procedures created"),
+					("sequence_parameters", "sequence parameters created"),
+					("sequence_blocks_removed", "sequence blocks removed"),
+					("sequence_blocks_added", "sequence procedure blocks added"),
+					("sequence_bytes_saved", "sequence grouping JSON bytes saved"),
+					("sequence_groups_rejected_size", "candidate groups rejected for size"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 
 
 
@@ -7078,6 +7343,7 @@ if __name__ == "__main__":
 		"--compact-mutation-metadata",
 		"--fold-constant-variables",
 		"--fold-constant-expressions",
+		"--simplify-blocks",
 		"--group-similar-sequences",
 		"--remove-empty-target-containers",
 	}
@@ -7190,6 +7456,7 @@ if __name__ == "__main__":
 		fold_constant_variables="--fold-constant-variables" in flags,
 		fold_constant_expressions=all_optimizations
 		or "--fold-constant-expressions" in flags,
+		simplify_blocks=all_optimizations or "--simplify-blocks" in flags,
 		group_similar_sequences="--group-similar-sequences" in flags,
 		sequence_threshold=values.get("--sequence-threshold", 3),
 		compress_assets=all_optimizations or "--compress-assets" in flags,
