@@ -70,6 +70,16 @@ Flags starting with `--` may appear anywhere. Anything not starting with `--` is
 | --- | --- |
 | `--clear-large-lists` | Scan for large lists and prompt for optional clearing. Off by default and skipped by `--all-optimizations`. |
 
+### Name shortening
+
+| Flag | Effect |
+| --- | --- |
+| `--rename-identifiers` | Shorten variable, list, broadcast, and custom-block argument names; equivalent to enabling all four category flags below. IDs are unchanged. |
+| `--rename-variable-names` | Shorten variable names only. |
+| `--rename-list-names` | Shorten list names only. |
+| `--rename-broadcast-names` | Shorten broadcast message names only. |
+| `--rename-argument-names` | Shorten custom-block argument names only. |
+
 ### ID renaming
 
 | Flag | Effect |
@@ -133,7 +143,7 @@ Flags starting with `--` may appear anywhere. Anything not starting with `--` is
 | `--list-bytes=N` | A list is "large" if its JSON size is at least `N` bytes. Positive integer, default `4096`. |
 | `--list-items=N` | A list is "large" if it has at least `N` items. Positive integer, default `1000`. |
 
-A list qualifies if it is non-empty and meets **either** threshold.
+A list qualifies if it is non-empty and meets either threshold.
 
 ### Batch flag
 
@@ -217,7 +227,7 @@ Floats become integers (`int(round(v))`, which uses Python's round-half-to-even)
 - comment `x`, `y`, `width`, and `height`;
 - costume `rotationCenterX` and `rotationCenterY`.
 
-`NaN`, infinities, booleans, and values that are already integers are left alone. Sprite `x`/`y` (the sprite's position on stage) are **not** touched.
+`NaN`, infinities, booleans, and values that are already integers are left alone. Sprite `x`/`y` (the sprite's position on stage) are untouched.
 
 Disable with `--keep-positions`.
 
@@ -279,11 +289,11 @@ Responses:
 
 After a selection the script reports how many bytes it expects to save. If any selected list is marked `!`, it lists them and requires you to type `yes` to proceed; anything else returns you to the prompt.
 
-Clearing a list **only empties its contents** (`[]`). The list stays defined, so block references and monitors keep resolving.
+Clearing a list only empties its contents (`[]`). The list stays defined, so block references and monitors keep resolving.
 
 ### Constant variables (`--fold-constant-variables`)
 
-Candidates are variables that satisfy **all** of these:
+Candidates are variables that satisfy all of these:
 
 - exactly one `set variable to` block in the whole project, and its value input is a literal (numeric tags 4 to 8 or text tag 10);
 - at least one reporter use in an input;
@@ -303,7 +313,7 @@ The table shows scope, name, reporter-use count, and an estimated byte change pe
 | `a`, `all` | Fold every candidate. |
 | `1,3,5-7` | Fold those numbers. |
 
-Selecting any `LOSS` candidate requires typing `yes` to confirm. `--all-optimizations` does **not** enable this transform.
+Selecting any `LOSS` candidate requires typing `yes` to confirm. `--all-optimizations` does not enable this transform.
 
 ## Optional transforms
 
@@ -319,6 +329,10 @@ All renaming uses the same compact 85-character alphabet (`!@#$%^*()+_-={}|[]:;?
 - **`--frequency-data-ids`**: the same idea for variables, lists, and broadcasts.
 
 Renamed projects are harder to compare by eye. The verifier reverses every mapping before comparing against the original.
+
+### Identifier name shortening
+
+`--rename-identifiers` enables `--rename-variable-names`, `--rename-list-names`, `--rename-broadcast-names`, and `--rename-argument-names`. Each category flag can also be used independently. Renaming updates variable/list reporter labels, broadcast definitions and references, procedure mutation `argumentnames`, and `argument_reporter` labels together. These flags do not change variable, list, broadcast, block, or argument IDs; use the `--rename-*-ids` flags for IDs.
 
 ### Removing dead data
 
@@ -357,14 +371,14 @@ These can change behavior if a project relies on data or scripts that are only r
 
 | Group | Enabled |
 | --- | --- |
-| ID renaming | block, variable, list, broadcast, and argument IDs, ordered by frequency (equivalent to also passing `--frequency-block-ids` and `--frequency-data-ids`) |
+| Identifier renaming | Shortened variable, list, broadcast, and argument names, plus block, variable, list, broadcast, and argument IDs ordered by frequency |
 | Dead data | unused variables, lists, and broadcasts; unreachable blocks; unused procedures |
 | Compaction | `--compact-numeric-inputs`, `--compact-field-ids`, `--compact-mutation-hasnext`, `--fold-constant-expressions`, `--normalize-numbers` |
 | Trimming | `--remove-empty-fields`, `--remove-empty-inputs`, `--remove-costume-metadata`, `--remove-default-target-properties`, `--remove-empty-containers`, `--remove-project-meta` |
 | Archive | `--convert-wav-to-mp3`, `--preserve-asset-compression` (and the no-op `--compress-assets`) |
 | Prompts | neither interactive prompt runs; large lists are not scanned or cleared |
 
-It does **not** enable:
+It does not enable:
 
 - `--clear-large-lists` (not part of the batch; lists are not scanned or cleared)
 - `--fold-constant-variables` (needs your selection)
@@ -475,6 +489,7 @@ Counters appear in this order:
 - mutation JSON
 - constant variable reporters and bytes saved
 - constant-variable setters removed/kept
+- shortened identifier names
 - constant expressions folded
 
 Each prints even when it is zero. The sizes shown are for `project.json` and for the whole archive.
@@ -492,7 +507,7 @@ Each prints even when it is zero. The sizes shown are for `project.json` and for
 
 | Risk | Flags |
 | --- | --- |
-| Cosmetic only (editor/layout metadata, redundant encoding) | default transforms; `--compact-field-ids`, `--compact-mutation-hasnext`, `--compact-mutation-metadata`, `--remove-empty-fields`, `--remove-empty-inputs`, `--remove-costume-metadata`, `--remove-empty-containers`, `--remove-project-meta`, `--sort-keys`, all `--rename-*` and `--frequency-*` flags |
+| Cosmetic or label changes | default transforms; `--compact-field-ids`, `--compact-mutation-hasnext`, `--compact-mutation-metadata`, `--remove-empty-fields`, `--remove-empty-inputs`, `--remove-costume-metadata`, `--remove-empty-containers`, `--remove-project-meta`, `--sort-keys`, all ID-renaming flags, `--rename-identifiers` |
 | Low risk, depends on project contents | `--compact-numeric-inputs`, `--remove-default-target-properties`, `--fold-constant-expressions`, `--remove-unused-variables`, `--remove-unused-lists`, `--remove-unused-broadcasts` |
 | Can change behavior | clearing lists with `--clear-large-lists`, `--remove-unreachable`, `--remove-unused-procedures`, `--normalize-numbers` (near-integer snapping), `--fold-constant-variables`, `--fold-constant-expressions` (constant-evaluation semantics), `--convert-wav-to-mp3` (lossy audio) |
 
@@ -532,8 +547,8 @@ Notes:
 
 - `Options` defaults differ from CLI list behavior: `comments`, `positions`, `covered`, `monitors`, and `lists` are `True` on a directly constructed `Options()` object, so programmatic use scans/prompts for large lists unless `lists=False`. The CLI enables this scan only with `--clear-large-lists`; its ordinary default and `--all-optimizations` do not scan lists. Other defaults include `compression_level=9`, `list_bytes=4096`, `list_items=1000`, and `normalize_epsilon=1e-8`.
 - `fold_constant_variables=True` always prompts interactively.
-- Available keyword arguments: `comments`, `positions`, `covered`, `monitors`, `lists`, `rename_block_ids`, `rename_variable_ids`, `rename_list_ids`, `rename_broadcast_ids`, `rename_argument_ids`, `remove_unused_variables`, `remove_unused_lists`, `remove_unused_broadcasts`, `remove_unreachable`, `remove_unused_procedures`, `normalize_numbers`, `remove_empty_fields`, `remove_empty_inputs`, `remove_costume_metadata`, `remove_default_target_properties`, `remove_empty_containers` (or `remove_empty_target_containers`), `remove_project_meta`, `convert_wav_to_mp3`, `compress_assets`, `sort_keys`, `compression_level`, `list_bytes`, `list_items`, `normalize_epsilon`, `keep_sound_metadata`, `preserve_asset_compression`, `frequency_block_ids`, `frequency_data_ids`, `compact_numeric_inputs`, `compact_field_ids`, `compact_mutation_hasnext`, `compact_mutation_metadata`, `fold_constant_variables`, `fold_constant_expressions`.
-- Frequency ordering is selected by `frequency_block_ids`/`frequency_data_ids` **together with** the corresponding `rename_*` flag; on the CLI the `--frequency-*` flags set both for you.
+- Available keyword arguments: `comments`, `positions`, `covered`, `monitors`, `lists`, `rename_identifiers`, `rename_variable_names`, `rename_list_names`, `rename_broadcast_names`, `rename_argument_names`, `rename_block_ids`, `rename_variable_ids`, `rename_list_ids`, `rename_broadcast_ids`, `rename_argument_ids`, `remove_unused_variables`, `remove_unused_lists`, `remove_unused_broadcasts`, `remove_unreachable`, `remove_unused_procedures`, `normalize_numbers`, `remove_empty_fields`, `remove_empty_inputs`, `remove_costume_metadata`, `remove_default_target_properties`, `remove_empty_containers` (or `remove_empty_target_containers`), `remove_project_meta`, `convert_wav_to_mp3`, `compress_assets`, `sort_keys`, `compression_level`, `list_bytes`, `list_items`, `normalize_epsilon`, `keep_sound_metadata`, `preserve_asset_compression`, `frequency_block_ids`, `frequency_data_ids`, `compact_numeric_inputs`, `compact_field_ids`, `compact_mutation_hasnext`, `compact_mutation_metadata`, `fold_constant_variables`, `fold_constant_expressions`, `group_similar_sequences`.
+- Frequency ordering is selected by `frequency_block_ids`/`frequency_data_ids` together with the corresponding `rename_*` flag; on the CLI the `--frequency-*` flags set both for you.
 - An `Options` instance accumulates run state (rename maps, cleared lists, conversion maps) that the verifier reads, so create a fresh one for each call.
 - Lower-level helpers such as `find_large_lists`, `apply_transforms`, and `verify` are importable too, but they are internal and may change.
 

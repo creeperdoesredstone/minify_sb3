@@ -1341,6 +1341,783 @@ def rename_argument_ids(project, stats):
 	return mapping
 
 
+def rename_identifiers(
+	project,
+	stats,
+	rename_variable_names=True,
+	rename_list_names=True,
+	rename_broadcast_names=True,
+	rename_argument_names=True,
+):
+	targets = project.get("targets", [])
+	stage_index = next(
+		(i for i, target in enumerate(targets) if target.get("isStage")), None
+	)
+	variable_names = {}
+	list_names = {}
+	broadcast_names = {}
+	argument_names = {}
+	argument_metadata = {}
+	changed = 0
+
+	variable_new_names = {}
+	list_new_names = {}
+
+	stage_variable_names = set()
+	stage_list_names = set()
+
+	# rename the Stage first so its post-rename names can be reserved to avoid name collisions
+	if stage_index is not None:
+		stage = targets[stage_index]
+		variables = stage.get("variables") or {}
+		lists = stage.get("lists") or {}
+		valid_variables = {
+			vid: entry
+			for vid, entry in variables.items()
+			if isinstance(entry, list) and entry and isinstance(entry[0], str)
+		}
+		valid_lists = {
+			lid: entry
+			for lid, entry in lists.items()
+			if isinstance(entry, list) and entry and isinstance(entry[0], str)
+		}
+
+		reserved_variables = {
+			entry[0]
+			for vid, entry in variables.items()
+			if (
+				vid not in valid_variables
+				or not rename_variable_names
+			)
+			and isinstance(entry, list)
+			and entry
+			and isinstance(entry[0], str)
+		}
+		reserved_lists = {
+			entry[0]
+			for lid, entry in lists.items()
+			if (
+				lid not in valid_lists
+				or not rename_list_names
+			)
+			and isinstance(entry, list)
+			and entry
+			and isinstance(entry[0], str)
+		}
+
+		stage_var_map = (
+			_rename_id_map(sorted(valid_variables), reserved_variables)
+			if rename_variable_names
+			else {}
+		)
+		stage_list_map = (
+			_rename_id_map(sorted(valid_lists), reserved_lists)
+			if rename_list_names
+			else {}
+		)
+
+		if rename_variable_names:
+			variable_new_names.update(
+				{
+					(stage_index, vid): stage_var_map[vid]
+					for vid in valid_variables
+				}
+			)
+		for vid, entry in valid_variables.items():
+			new_name = variable_new_names.get((stage_index, vid), entry[0])
+			stage_variable_names.add(new_name)
+			if rename_variable_names and entry[0] != new_name:
+				variable_names[(stage_index, vid)] = entry[0]
+				entry[0] = new_name
+				changed += 1
+
+		if rename_list_names:
+			list_new_names.update(
+				{
+					(stage_index, lid): stage_list_map[lid]
+					for lid in valid_lists
+				}
+			)
+		for lid, entry in valid_lists.items():
+			new_name = list_new_names.get((stage_index, lid), entry[0])
+			stage_list_names.add(new_name)
+			if rename_list_names and entry[0] != new_name:
+				list_names[(stage_index, lid)] = entry[0]
+				entry[0] = new_name
+				changed += 1
+
+	for ti, target in enumerate(targets):
+		if ti == stage_index:
+			continue
+		variables = target.get("variables") or {}
+		lists = target.get("lists") or {}
+		valid_variables = {
+			vid: entry
+			for vid, entry in variables.items()
+			if isinstance(entry, list) and entry and isinstance(entry[0], str)
+		}
+		valid_lists = {
+			lid: entry
+			for lid, entry in lists.items()
+			if isinstance(entry, list) and entry and isinstance(entry[0], str)
+		}
+
+		reserved_variables = set(stage_variable_names)
+		reserved_variables.update(
+			entry[0]
+			for vid, entry in variables.items()
+			if (
+				vid not in valid_variables
+				or not rename_variable_names
+			)
+			and isinstance(entry, list)
+			and entry
+			and isinstance(entry[0], str)
+		)
+		reserved_lists = set(stage_list_names)
+		reserved_lists.update(
+			entry[0]
+			for lid, entry in lists.items()
+			if (
+				lid not in valid_lists
+				or not rename_list_names
+			)
+			and isinstance(entry, list)
+			and entry
+			and isinstance(entry[0], str)
+		)
+
+		var_map = (
+			_rename_id_map(sorted(valid_variables), reserved_variables)
+			if rename_variable_names
+			else {}
+		)
+		list_map = (
+			_rename_id_map(sorted(valid_lists), reserved_lists)
+			if rename_list_names
+			else {}
+		)
+
+		if rename_variable_names:
+			variable_new_names.update(
+				{
+					(ti, vid): var_map[vid]
+					for vid in valid_variables
+				}
+			)
+		for vid, entry in valid_variables.items():
+			new_name = variable_new_names.get((ti, vid), entry[0])
+			if rename_variable_names and entry[0] != new_name:
+				variable_names[(ti, vid)] = entry[0]
+				entry[0] = new_name
+				changed += 1
+
+		if rename_list_names:
+			list_new_names.update(
+				{
+					(ti, lid): list_map[lid]
+					for lid in valid_lists
+				}
+			)
+		for lid, entry in valid_lists.items():
+			new_name = list_new_names.get((ti, lid), entry[0])
+			if rename_list_names and entry[0] != new_name:
+				list_names[(ti, lid)] = entry[0]
+				entry[0] = new_name
+				changed += 1
+
+		if rename_variable_names:
+			variable_new_names.update(
+				{
+					(ti, vid): var_map[vid]
+					for vid in valid_variables
+				}
+			)
+		for vid, entry in valid_variables.items():
+			if rename_variable_names and entry[0] != variable_new_names[(ti, vid)]:
+				variable_names[(ti, vid)] = entry[0]
+				entry[0] = variable_new_names[(ti, vid)]
+				changed += 1
+
+		if rename_list_names:
+			list_new_names.update(
+				{
+					(ti, lid): list_map[lid]
+					for lid in valid_lists
+				}
+			)
+		for lid, entry in valid_lists.items():
+			if rename_list_names and entry[0] != list_new_names[(ti, lid)]:
+				list_names[(ti, lid)] = entry[0]
+				entry[0] = list_new_names[(ti, lid)]
+				changed += 1
+
+	stage_broadcast_names = {}
+	conflicting_broadcast_ids = set()
+	for target in targets:
+		for bid, name in (target.get("broadcasts") or {}).items():
+			if not isinstance(bid, str) or not isinstance(name, str):
+				continue
+			previous = stage_broadcast_names.get(bid)
+			if previous is not None and previous != name:
+				conflicting_broadcast_ids.add(bid)
+			else:
+				stage_broadcast_names[bid] = name
+	valid_broadcast_ids = (
+		sorted(set(stage_broadcast_names) - conflicting_broadcast_ids)
+		if rename_broadcast_names
+		else []
+	)
+	reserved_broadcast_names = {
+		name
+		for bid, name in stage_broadcast_names.items()
+		if bid in conflicting_broadcast_ids
+	}
+	broadcast_new_names = _rename_id_map(valid_broadcast_ids, reserved_broadcast_names)
+	for bid, new_name in broadcast_new_names.items():
+		old_name = stage_broadcast_names[bid]
+		if old_name != new_name:
+			broadcast_names[bid] = old_name
+			changed += 1
+
+	argument_new_names = {}
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		old_argument_names = set()
+		for block in blocks.values() if rename_argument_names else ():
+			if not isinstance(block, dict):
+				continue
+			mutation = block.get("mutation")
+			if isinstance(mutation, dict) and isinstance(
+				mutation.get("argumentnames"), str
+			):
+				try:
+					decoded = json.loads(mutation["argumentnames"])
+				except (TypeError, ValueError):
+					decoded = None
+				if isinstance(decoded, list) and all(
+					isinstance(name, str) for name in decoded
+				):
+					old_argument_names.update(decoded)
+			if block.get("opcode", "").startswith("argument_reporter_"):
+				field = (block.get("fields") or {}).get("VALUE")
+				if isinstance(field, list) and field and isinstance(field[0], str):
+					old_argument_names.add(field[0])
+		new_names = _rename_id_map(sorted(old_argument_names))
+		argument_new_names[ti] = new_names
+		argument_names.update(
+			{(ti, new): old for old, new in new_names.items() if old != new}
+		)
+
+	def variable_owner(ti, variable_id):
+		if variable_id in (targets[ti].get("variables") or {}):
+			return (ti, variable_id)
+		if stage_index is not None and variable_id in (
+			targets[stage_index].get("variables") or {}
+		):
+			return (stage_index, variable_id)
+		return None
+
+	def list_owner(ti, list_id):
+		if list_id in (targets[ti].get("lists") or {}):
+			return (ti, list_id)
+		if stage_index is not None and list_id in (
+			targets[stage_index].get("lists") or {}
+		):
+			return (stage_index, list_id)
+		return None
+
+	def rename_nested_names(ti, value):
+		nonlocal changed
+		if isinstance(value, list):
+			if len(value) > 2 and value[0] == 12 and isinstance(value[2], str):
+				owner = variable_owner(ti, value[2])
+				if (
+					owner in variable_new_names
+					and value[1] != variable_new_names[owner]
+				):
+					value[1] = variable_new_names[owner]
+					changed += 1
+				return
+			if len(value) > 2 and value[0] == 13 and isinstance(value[2], str):
+				owner = list_owner(ti, value[2])
+				if owner in list_new_names and value[1] != list_new_names[owner]:
+					value[1] = list_new_names[owner]
+					changed += 1
+				return
+			if len(value) > 2 and value[0] == 11 and value[2] in broadcast_new_names:
+				if value[1] != broadcast_new_names[value[2]]:
+					value[1] = broadcast_new_names[value[2]]
+					changed += 1
+				return
+			for child in value:
+				if isinstance(child, (list, dict)):
+					rename_nested_names(ti, child)
+		elif isinstance(value, dict):
+			for child in value.values():
+				if isinstance(child, (list, dict)):
+					rename_nested_names(ti, child)
+
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		broadcasts = target.get("broadcasts") or {}
+		for bid, name in list(broadcasts.items()):
+			if bid in broadcast_new_names:
+				broadcasts[bid] = broadcast_new_names[bid]
+		for block_id, block in blocks.items():
+			if isinstance(block, list):
+				rename_nested_names(ti, block)
+				continue
+			if not isinstance(block, dict):
+				continue
+			fields = block.get("fields") or {}
+			for field_name, owner_fn, new_names in (
+				("VARIABLE", variable_owner, variable_new_names),
+				("LIST", list_owner, list_new_names),
+			):
+				field = fields.get(field_name)
+				if (
+					isinstance(field, list)
+					and len(field) > 1
+					and isinstance(field[1], str)
+				):
+					owner = owner_fn(ti, field[1])
+					if owner in new_names and field[0] != new_names[owner]:
+						field[0] = new_names[owner]
+						changed += 1
+			for field_name in ("BROADCAST_OPTION", "BROADCAST_INPUT"):
+				field = fields.get(field_name)
+				if (
+					isinstance(field, list)
+					and len(field) > 1
+					and field[1] in broadcast_new_names
+				):
+					if field[0] != broadcast_new_names[field[1]]:
+						field[0] = broadcast_new_names[field[1]]
+						changed += 1
+			# sensing_of stores the variable/list *name* in PROPERTY, not the id.
+			if block.get("opcode") in (
+				"sensing_of",
+				"sensing_of_property_menu",
+			):
+				field = fields.get("PROPERTY")
+				if (
+					isinstance(field, list)
+					and field
+					and isinstance(field[0], str)
+				):
+					property_ti = _resolve_sensing_of_target(
+						project, ti, block, stage_index
+					)
+					new_prop = _resolve_renamed_property_name(
+						ti,
+						field[0],
+						variable_names,
+						list_names,
+						variable_new_names,
+						list_new_names,
+						stage_index,
+						property_ti,
+					)
+					if new_prop is not None and field[0] != new_prop:
+						field[0] = new_prop
+						changed += 1
+			if block.get("opcode", "").startswith("argument_reporter_"):
+				field = fields.get("VALUE")
+				new_names = argument_new_names.get(ti, {})
+				if isinstance(field, list) and field and field[0] in new_names:
+					if field[0] != new_names[field[0]]:
+						old_name = field[0]
+						field[0] = new_names[old_name]
+						changed += 1
+			mutation = block.get("mutation")
+			if isinstance(mutation, dict) and isinstance(
+				mutation.get("argumentnames"), str
+			):
+				raw_names = mutation["argumentnames"]
+				try:
+					decoded = json.loads(raw_names)
+				except (TypeError, ValueError):
+					decoded = None
+				if isinstance(decoded, list) and all(
+					isinstance(name, str) for name in decoded
+				):
+					new_names = argument_new_names.get(ti, {})
+					renamed = [new_names.get(name, name) for name in decoded]
+					if renamed != decoded:
+						argument_metadata[(ti, block_id)] = raw_names
+						mutation["argumentnames"] = json.dumps(
+							renamed, separators=(",", ":"), ensure_ascii=False
+						)
+						changed += sum(a != b for a, b in zip(decoded, renamed))
+			for value in (block.get("inputs") or {}).values():
+				rename_nested_names(ti, value)
+
+	name_to_index = {
+		t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")
+	}
+	for mon in project.get("monitors", []):
+		if not isinstance(mon, dict):
+			continue
+		op = mon.get("opcode")
+		mid = mon.get("id")
+		if not isinstance(mid, str):
+			continue
+		sprite = mon.get("spriteName")
+		mon_ti = name_to_index.get(sprite, stage_index) if sprite else stage_index
+		if mon_ti is None:
+			continue
+		params = mon.get("params")
+		if not isinstance(params, dict):
+			continue
+		if op == "data_variable":
+			owner = (
+				(mon_ti, mid)
+				if mid in (targets[mon_ti].get("variables") or {})
+				else (
+					(stage_index, mid)
+					if stage_index is not None
+					and mid in (targets[stage_index].get("variables") or {})
+					else None
+				)
+			)
+			if owner is not None and owner in variable_new_names:
+				new_name = variable_new_names[owner]
+				if params.get("VARIABLE") != new_name:
+					params["VARIABLE"] = new_name
+					changed += 1
+		elif op == "data_listcontents":
+			owner = (
+				(mon_ti, mid)
+				if mid in (targets[mon_ti].get("lists") or {})
+				else (
+					(stage_index, mid)
+					if stage_index is not None
+					and mid in (targets[stage_index].get("lists") or {})
+					else None
+				)
+			)
+			if owner is not None and owner in list_new_names:
+				new_name = list_new_names[owner]
+				if params.get("LIST") != new_name:
+					params["LIST"] = new_name
+					changed += 1
+
+	stats["identifier_names"] += changed
+	return {
+		"variables": variable_names,
+		"lists": list_names,
+		"broadcasts": broadcast_names,
+		"arguments": argument_names,
+		"argument_metadata": argument_metadata,
+		# new display name -> original, per target, for sensing_of / monitor restore
+		"variable_name_rev": {
+			(ti, variable_new_names[(ti, vid)]): old
+			for (ti, vid), old in variable_names.items()
+		},
+		"list_name_rev": {
+			(ti, list_new_names[(ti, lid)]): old
+			for (ti, lid), old in list_names.items()
+		},
+	}
+
+
+def _target_index_for_object_name(targets, object_name, stage_index):
+	if not isinstance(object_name, str):
+		return None
+	if object_name == "_stage_":
+		return stage_index
+	for target_index, target in enumerate(targets):
+		if target.get("name") == object_name:
+			return target_index
+	return None
+
+
+def _resolve_sensing_of_target(project, ti, block, stage_index):
+	targets = project.get("targets", [])
+	if not isinstance(block, dict):
+		return ti
+
+	blocks = targets[ti].get("blocks", {}) if 0 <= ti < len(targets) else {}
+	object_block = block
+	if block.get("opcode") == "sensing_of_property_menu":
+		parent_id = block.get("parent")
+		parent = blocks.get(parent_id) if isinstance(parent_id, str) else None
+		if isinstance(parent, dict) and parent.get("opcode") == "sensing_of":
+			object_block = parent
+	inputs = object_block.get("inputs") or {}
+	value = inputs.get("OBJECT")
+
+	seen = set()
+
+	def resolve(value):
+		if isinstance(value, list):
+			if len(value) > 1:
+				ref = value[1]
+				if isinstance(ref, str):
+					if ref in blocks and ref not in seen:
+						seen.add(ref)
+						menu = blocks[ref]
+						if isinstance(menu, dict):
+							fields = menu.get("fields") or {}
+							field = fields.get("OBJECT")
+							if isinstance(field, list) and field:
+								index = _target_index_for_object_name(
+									targets, field[0], stage_index
+								)
+								if index is not None:
+									return index
+						index = _target_index_for_object_name(
+							targets, ref, stage_index
+						)
+						if index is not None:
+							return index
+				else:
+					index = resolve(ref)
+					if index is not None:
+						return index
+
+			if value[0] == 10 and isinstance(value[1], str):
+				index = _target_index_for_object_name(
+					targets, value[1], stage_index
+				)
+				if index is not None:
+					return index
+
+			for child in value[2:] if len(value) > 2 else ():
+				if isinstance(child, (list, dict)):
+					index = resolve(child)
+					if index is not None:
+						return index
+		elif isinstance(value, dict):
+			fields = value.get("fields") or {}
+			field = fields.get("OBJECT")
+			if isinstance(field, list) and field:
+				index = _target_index_for_object_name(
+					targets, field[0], stage_index
+				)
+				if index is not None:
+					return index
+			for child in value.values():
+				if isinstance(child, (list, dict)):
+					index = resolve(child)
+					if index is not None:
+						return index
+		return None
+
+	selected = resolve(value)
+	return selected if selected is not None else ti
+
+
+def _resolve_renamed_property_name(
+	ti,
+	old_name,
+	variable_names,
+	list_names,
+	variable_new_names,
+	list_new_names,
+	stage_index,
+	object_ti=None,
+):
+	search_order = []
+	if object_ti is not None:
+		search_order.append(object_ti)
+	else:
+		if ti is not None:
+			search_order.append(ti)
+		if stage_index is not None and stage_index not in search_order:
+			search_order.append(stage_index)
+
+	for owner_ti in search_order:
+		for (oti, vid), oname in variable_names.items():
+			if oti == owner_ti and oname == old_name:
+				return variable_new_names.get((oti, vid))
+		for (oti, lid), oname in list_names.items():
+			if oti == owner_ti and oname == old_name:
+				return list_new_names.get((oti, lid))
+	return None
+
+
+def _restore_identifier_names(project, renamed_names):
+	if not renamed_names:
+		return
+	targets = project.get("targets", [])
+	variable_names = renamed_names.get("variables", {})
+	list_names = renamed_names.get("lists", {})
+	broadcast_names = renamed_names.get("broadcasts", {})
+	argument_names = renamed_names.get("arguments", {})
+	argument_metadata = renamed_names.get("argument_metadata", {})
+	variable_name_rev = renamed_names.get("variable_name_rev", {})
+	list_name_rev = renamed_names.get("list_name_rev", {})
+	stage_index = next(
+		(i for i, target in enumerate(targets) if target.get("isStage")), None
+	)
+
+	def restore_variable_owner(ti, variable_id):
+		if variable_id in (targets[ti].get("variables") or {}):
+			return (ti, variable_id)
+		if stage_index is not None and variable_id in (
+			targets[stage_index].get("variables") or {}
+		):
+			return (stage_index, variable_id)
+		return None
+
+	def restore_list_owner(ti, list_id):
+		if list_id in (targets[ti].get("lists") or {}):
+			return (ti, list_id)
+		if stage_index is not None and list_id in (
+			targets[stage_index].get("lists") or {}
+		):
+			return (stage_index, list_id)
+		return None
+
+	def restore_nested_names(ti, value):
+		if isinstance(value, list):
+			if len(value) > 2 and value[0] == 12 and isinstance(value[2], str):
+				owner = restore_variable_owner(ti, value[2])
+				if owner in variable_names:
+					value[1] = variable_names[owner]
+				return
+			if len(value) > 2 and value[0] == 13 and isinstance(value[2], str):
+				owner = restore_list_owner(ti, value[2])
+				if owner in list_names:
+					value[1] = list_names[owner]
+				return
+			if len(value) > 2 and value[0] == 11 and value[2] in broadcast_names:
+				value[1] = broadcast_names[value[2]]
+				return
+			for child in value:
+				if isinstance(child, (list, dict)):
+					restore_nested_names(ti, child)
+		elif isinstance(value, dict):
+			for child in value.values():
+				if isinstance(child, (list, dict)):
+					restore_nested_names(ti, child)
+
+	for ti, target in enumerate(targets):
+		for variable_id, original_name in variable_names.items():
+			if variable_id[0] == ti:
+				entry = (target.get("variables") or {}).get(variable_id[1])
+				if isinstance(entry, list) and entry:
+					entry[0] = original_name
+		for list_id, original_name in list_names.items():
+			if list_id[0] == ti:
+				entry = (target.get("lists") or {}).get(list_id[1])
+				if isinstance(entry, list) and entry:
+					entry[0] = original_name
+		broadcasts = target.get("broadcasts") or {}
+		for broadcast_id, original_name in broadcast_names.items():
+			if broadcast_id in broadcasts:
+				broadcasts[broadcast_id] = original_name
+		blocks = target.get("blocks") or {}
+		for block_id, block in blocks.items():
+			original_argument_names = argument_metadata.get((ti, block_id))
+			mutation = block.get("mutation") if isinstance(block, dict) else None
+			if original_argument_names is not None and isinstance(mutation, dict):
+				mutation["argumentnames"] = original_argument_names
+			if isinstance(block, list):
+				restore_nested_names(ti, block)
+				continue
+			if not isinstance(block, dict):
+				continue
+			fields = block.get("fields") or {}
+			for field_name, owner_fn, old_names in (
+				("VARIABLE", restore_variable_owner, variable_names),
+				("LIST", restore_list_owner, list_names),
+			):
+				field = fields.get(field_name)
+				if (
+					isinstance(field, list)
+					and len(field) > 1
+					and isinstance(field[1], str)
+				):
+					owner = owner_fn(ti, field[1])
+					if owner in old_names:
+						field[0] = old_names[owner]
+			for field_name in ("BROADCAST_OPTION", "BROADCAST_INPUT"):
+				field = fields.get(field_name)
+				if (
+					isinstance(field, list)
+					and len(field) > 1
+					and field[1] in broadcast_names
+				):
+					field[0] = broadcast_names[field[1]]
+			if block.get("opcode") in (
+				"sensing_of",
+				"sensing_of_property_menu",
+			):
+				field = fields.get("PROPERTY")
+				if (
+					isinstance(field, list)
+					and field
+					and isinstance(field[0], str)
+				):
+					property_ti = _resolve_sensing_of_target(
+						project, ti, block, stage_index
+					)
+					restored = _resolve_original_property_name(
+						ti, field[0], variable_name_rev, list_name_rev, stage_index,
+						property_ti,
+					)
+					if restored is not None:
+						field[0] = restored
+			if block.get("opcode", "").startswith("argument_reporter_"):
+				field = fields.get("VALUE")
+				if isinstance(field, list) and field:
+					original_name = argument_names.get((ti, field[0]))
+					if original_name is not None:
+						field[0] = original_name
+			for value in (block.get("inputs") or {}).values():
+				restore_nested_names(ti, value)
+
+	name_to_index = {
+		t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")
+	}
+	for mon in project.get("monitors", []):
+		if not isinstance(mon, dict):
+			continue
+		op = mon.get("opcode")
+		mid = mon.get("id")
+		if not isinstance(mid, str):
+			continue
+		sprite = mon.get("spriteName")
+		mon_ti = name_to_index.get(sprite, stage_index) if sprite else stage_index
+		if mon_ti is None:
+			continue
+		params = mon.get("params")
+		if not isinstance(params, dict):
+			continue
+		if op == "data_variable":
+			owner = restore_variable_owner(mon_ti, mid)
+			if owner in variable_names:
+				params["VARIABLE"] = variable_names[owner]
+		elif op == "data_listcontents":
+			owner = restore_list_owner(mon_ti, mid)
+			if owner in list_names:
+				params["LIST"] = list_names[owner]
+
+
+def _resolve_original_property_name(
+	ti, current_name, variable_name_rev, list_name_rev, stage_index,
+	object_ti=None,
+):
+	search_order = []
+	if object_ti is not None:
+		search_order.append(object_ti)
+	else:
+		if ti is not None:
+			search_order.append(ti)
+		if stage_index is not None and stage_index not in search_order:
+			search_order.append(stage_index)
+	for owner_ti in search_order:
+		key = (owner_ti, current_name)
+		if key in variable_name_rev:
+			return variable_name_rev[key]
+		if key in list_name_rev:
+			return list_name_rev[key]
+	return None
+
+
 def _all_referenced_ids(project):
 	vars_, lists_, broadcasts = _collect_data_ids(project)
 	return vars_, lists_, broadcasts
@@ -2044,7 +2821,7 @@ def _find_constant_variables(project):
 		if not isinstance(entry, list) or len(entry) < 2:
 			continue
 
-		# Cloud variables are externally mutable -> not foldable.
+		# cloud variables are externally mutable -> not foldable.
 		if len(entry) >= 3 and entry[2] is True:
 			continue
 		literal = _variable_literal(entry[1])
@@ -2125,7 +2902,6 @@ def fold_constant_variables(project, selected, stats):
 
 
 def _literal_key(value):
-	"""Comparable form of a Scratch literal: numbers compare numerically ("5" == 5)."""
 	if isinstance(value, bool):
 		return None
 	if isinstance(value, (int, float)):
@@ -2142,7 +2918,6 @@ def _literal_key(value):
 
 
 def _setter_matches_initial(block, initial):
-	"""True if `set variable to <literal>` stores exactly the variable's initial value."""
 	value = (block.get("inputs") or {}).get("VALUE")
 	if not _is_literal_value(value):
 		return False
@@ -2153,7 +2928,7 @@ def _setter_matches_initial(block, initial):
 def remove_constant_variable_setters(project, setters, stats, opts):
 	targets = project.get("targets", [])
 	opts.removed_variable_setter_blocks = [set() for _ in targets]
-	opts.variable_setter_link_edits = {}   # (ti, block, "next"|"parent") -> new value
+	opts.variable_setter_link_edits = {}  # (ti, block, "next"|"parent") -> new value
 	opts.variable_setter_input_edits = {}  # (ti, block, input name) -> new value
 	removed = kept = 0
 
@@ -2447,8 +3222,14 @@ def _constant_expression_block(block_id, blocks, visiting):
 		b_right = _to_scratch_bool(right[0][1]) if right is not None else None
 
 		if left is not None and right is not None:
-			res_bool = (b_left and b_right) if operation == "operator_and" else (b_left or b_right)
-			return [10, "true" if res_bool else "false"], left[1] | right[1] | {block_id}
+			res_bool = (
+				(b_left and b_right)
+				if operation == "operator_and"
+				else (b_left or b_right)
+			)
+			return [10, "true" if res_bool else "false"], left[1] | right[1] | {
+				block_id
+			}
 
 		return None
 
@@ -2937,6 +3718,11 @@ class Options:
 		rename_list_ids=False,
 		rename_broadcast_ids=False,
 		rename_argument_ids=False,
+		rename_identifiers=False,
+		rename_variable_names=False,
+		rename_list_names=False,
+		rename_broadcast_names=False,
+		rename_argument_names=False,
 		remove_unused_variables=False,
 		remove_unused_lists=False,
 		remove_unused_broadcasts=False,
@@ -2967,6 +3753,7 @@ class Options:
 		compact_mutation_metadata=False,
 		fold_constant_variables=False,
 		fold_constant_expressions=False,
+		group_similar_sequences=False,
 	):
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
@@ -2975,25 +3762,35 @@ class Options:
 			monitors,
 		)
 		self.lists = lists
+
 		self.rename_block_ids = rename_block_ids
 		self.rename_variable_ids = rename_variable_ids
 		self.rename_list_ids = rename_list_ids
 		self.rename_broadcast_ids = rename_broadcast_ids
 		self.rename_argument_ids = rename_argument_ids
+		self.rename_identifiers = rename_identifiers
+		self.rename_variable_names = rename_variable_names
+		self.rename_list_names = rename_list_names
+		self.rename_broadcast_names = rename_broadcast_names
+		self.rename_argument_names = rename_argument_names
+
 		self.remove_unused_variables = remove_unused_variables
 		self.remove_unused_lists = remove_unused_lists
 		self.remove_unused_broadcasts = remove_unused_broadcasts
 		self.remove_unreachable = remove_unreachable
 		self.remove_unused_procedures = remove_unused_procedures
+
 		self.normalize_numbers = normalize_numbers
 		self.remove_empty_fields = remove_empty_fields
 		self.remove_empty_inputs = remove_empty_inputs
+
 		self.remove_costume_metadata = remove_costume_metadata
 		self.remove_default_target_properties = remove_default_target_properties
 		if remove_empty_target_containers is None:
 			remove_empty_target_containers = remove_empty_containers
 		self.remove_empty_target_containers = remove_empty_target_containers
 		self.remove_empty_containers = remove_empty_target_containers
+
 		self.remove_project_meta = remove_project_meta
 		self.compress_assets = compress_assets
 		self.convert_wav_to_mp3 = convert_wav_to_mp3
@@ -3002,30 +3799,39 @@ class Options:
 		self.preserve_asset_compression = preserve_asset_compression
 		self.frequency_block_ids = frequency_block_ids
 		self.frequency_data_ids = frequency_data_ids
+
 		self.compact_numeric_inputs = compact_numeric_inputs
 		self.compact_field_ids = compact_field_ids
 		self.compact_mutation_hasnext = compact_mutation_hasnext
 		self.compact_mutation_metadata = compact_mutation_metadata
 		self.fold_constant_variables = fold_constant_variables
 		self.fold_constant_expressions = fold_constant_expressions
+		self.group_similar_sequences = group_similar_sequences
+
 		self.renamed_block_ids = {}
 		self.renamed_variable_ids = {}
 		self.renamed_list_ids = {}
 		self.renamed_broadcast_ids = {}
 		self.renamed_argument_ids = {}
+		self.renamed_identifiers = {}
+
 		self.wav_conversions = {}
+
 		self.repaired_broadcast_ids = set()
 		self.broadcast_repair_conflicts = {}
 		self.list_bytes, self.list_items = list_bytes, list_items
 		self.cleared_lists = frozenset()
+
 		self.normalize_epsilon = normalize_epsilon
 		self.keep_sound_metadata = keep_sound_metadata
+
 		self.folded_constant_variables = {}
 		self.folded_constant_variable_literals = {}
 		self.folded_constant_variable_setters = {}
 		self.removed_variable_setter_blocks = []
 		self.variable_setter_link_edits = {}
 		self.variable_setter_input_edits = {}
+
 		self.folded_constant_expression_inputs = {}
 		self.folded_constant_expression_blocks = []
 		self.folded_constant_expression_new_blocks = []
@@ -3067,6 +3873,21 @@ def apply_transforms(project, opts: Options, assets=None):
 	)
 	if opts.remove_unused_broadcasts:
 		remove_unused_broadcasts(project, stats)
+	if (
+		opts.rename_identifiers
+		or opts.rename_variable_names
+		or opts.rename_list_names
+		or opts.rename_broadcast_names
+		or opts.rename_argument_names
+	):
+		opts.renamed_identifiers = rename_identifiers(
+			project,
+			stats,
+		rename_variable_names=(opts.rename_identifiers or opts.rename_variable_names),
+		rename_list_names=(opts.rename_identifiers or opts.rename_list_names),
+		rename_broadcast_names=(opts.rename_identifiers or opts.rename_broadcast_names),
+		rename_argument_names=(opts.rename_identifiers or opts.rename_argument_names),
+		)
 	used_data_ids = set()
 	if opts.rename_variable_ids or opts.rename_list_ids:
 		opts.renamed_variable_ids, opts.renamed_list_ids = rename_variable_list_ids(
@@ -3688,7 +4509,12 @@ def _check_blocks(
 				if setter_input is not None and (
 					setter_input == mi
 					or _check_inputs_match(
-						setter_input, mi, opts, original_blocks, remaining_blocks, target_index
+						setter_input,
+						mi,
+						opts,
+						original_blocks,
+						remaining_blocks,
+						target_index,
 					)
 				):
 					continue
@@ -4221,6 +5047,14 @@ def verify(original_path, minified_path, opts):
 			_restore_broadcast_ids(mini, opts.renamed_broadcast_ids)
 		if opts.rename_argument_ids:
 			_restore_argument_ids(mini, opts.renamed_argument_ids)
+		if (
+			opts.rename_identifiers
+			or opts.rename_variable_names
+			or opts.rename_list_names
+			or opts.rename_broadcast_names
+			or opts.rename_argument_names
+		):
+			_restore_identifier_names(mini, opts.renamed_identifiers)
 
 		for key in set(orig) | set(mini):
 			if key not in ("targets", "monitors") and orig.get(key) != mini.get(key):
@@ -4790,10 +5624,10 @@ def minify_sb3(src, dst, opts=None):
 			opts.folded_constant_variables = picked
 			opts.folded_constant_variable_literals = dict(picked)
 			opts.folded_constant_variable_setters = {
-					(c["ti"], c["id"]): (c["setter_ti"], c["setter"])
-					for c in candidates
-					if (c["ti"], c["id"]) in picked
-				}
+				(c["ti"], c["id"]): (c["setter_ti"], c["setter"])
+				for c in candidates
+				if (c["ti"], c["id"]) in picked
+			}
 
 		asset_infos = {
 			item.filename: item
@@ -4894,6 +5728,11 @@ if __name__ == "__main__":
 		"--rename-list-ids",
 		"--rename-broadcast-ids",
 		"--rename-argument-ids",
+		"--rename-identifiers",
+		"--rename-variable-names",
+		"--rename-list-names",
+		"--rename-broadcast-names",
+		"--rename-argument-names",
 		"--remove-unused-variables",
 		"--remove-unused-lists",
 		"--remove-unused-broadcasts",
@@ -4921,6 +5760,7 @@ if __name__ == "__main__":
 		"--compact-mutation-metadata",
 		"--fold-constant-variables",
 		"--fold-constant-expressions",
+		"--group-similar-sequences",
 		"--remove-empty-target-containers",
 	}
 	valued = {
@@ -4989,6 +5829,11 @@ if __name__ == "__main__":
 		or "--rename-broadcast-ids" in flags
 		or "--frequency-data-ids" in flags
 		or "--order-data-ids-by-frequency" in flags,
+		rename_identifiers="--rename-identifiers" in flags,
+		rename_variable_names="--rename-variable-names" in flags,
+		rename_list_names="--rename-list-names" in flags,
+		rename_broadcast_names="--rename-broadcast-names" in flags,
+		rename_argument_names="--rename-argument-names" in flags,
 		rename_argument_ids=all_optimizations or "--rename-argument-ids" in flags,
 		remove_unused_variables=all_optimizations
 		or "--remove-unused-variables" in flags,
@@ -5025,6 +5870,7 @@ if __name__ == "__main__":
 		fold_constant_variables="--fold-constant-variables" in flags,
 		fold_constant_expressions=all_optimizations
 		or "--fold-constant-expressions" in flags,
+		group_similar_sequences="--group-similar-sequences" in flags,
 		compress_assets=all_optimizations or "--compress-assets" in flags,
 		convert_wav_to_mp3=all_optimizations or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
