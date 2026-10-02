@@ -6911,7 +6911,7 @@ def _print_transform_stats(stats, opts):
 				("sequence_bytes_saved", "sequence grouping JSON bytes saved"),
 				("sequence_groups_rejected_size", "candidate groups rejected for size"),
 			):
-				print(Ansi.muted(f"    {label:50} {stats[key]:>5,}"))
+				print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 
 
 
