@@ -4319,12 +4319,14 @@ def _sequence_primary_input_block_id(value, blocks):
 
 
 def _variable_reporter_id(value, blocks):
-	"""Return the variable ID represented by a serialized variable reporter input."""
 	if not isinstance(value, list) or not value:
 		return None
 
 	if value[0] == 12 and len(value) > 2 and isinstance(value[2], str):
 		return value[2]
+
+	if isinstance(value[1], list) and value[1][0] == 12 and isinstance(value[1][2], str):
+		return value[1][2]
 
 	block_id = _sequence_primary_input_block_id(value, blocks)
 	if block_id is None:
@@ -4336,19 +4338,6 @@ def _variable_reporter_id(value, blocks):
 	if isinstance(field, list) and len(field) > 1 and isinstance(field[1], str):
 		return field[1]
 	return None
-
-
-def _block_has_external_owner(block_id, blocks, owner_id):
-	"""Whether an input/next edge outside owner_id references block_id."""
-	for other_id, other in blocks.items():
-		if other_id in (block_id, owner_id) or not isinstance(other, dict):
-			continue
-		if other.get("next") == block_id:
-			return True
-		for value in (other.get("inputs") or {}).values():
-			if block_id in _input_block_ids(value, blocks):
-				return True
-	return False
 
 
 def _simplify_setter_rhs_blocks(project, stats, opts):
