@@ -20,6 +20,7 @@ class Ansi:
 	RED = "\033[31m"
 	GREEN = "\033[32m"
 	YELLOW = "\033[33m"
+	PURPLE = "\033[35m"
 	CYAN = "\033[36m"
 
 	def __init__(self, enabled=None):
@@ -32,6 +33,9 @@ class Ansi:
 
 	def heading(self, text):
 		return self.paint(text, self.BOLD, self.CYAN)
+
+	def subheading(self, text):
+		return self.paint(text, self.PURPLE)
 
 	def success(self, text):
 		return self.paint(text, self.GREEN)
@@ -2462,7 +2466,7 @@ def _repair_dangling_block_refs(target):
 	return fixed
 
 
-def remove_unreachable_blocks(project, stats):
+def remove_unreachable_blocks(project, stats, stat_key="unreachable_blocks_removed"):
 	removed = 0
 	dangling_fixed = 0
 	for target in project.get("targets", []):
@@ -2488,7 +2492,7 @@ def remove_unreachable_blocks(project, stats):
 				del blocks[bid]
 				removed += 1
 
-	stats["blocks_removed"] += removed
+	stats[stat_key] += removed
 	return removed
 
 
@@ -3315,10 +3319,10 @@ def remove_unused_procedures(project, stats):
 				removed_blocks += 1
 		removed_procedures += len(dead_procs)
 
-		stats["dangling_block_refs_fixed"] += _repair_dangling_block_refs(target)
+		stats["procedure_dangling_block_refs_fixed"] += _repair_dangling_block_refs(target)
 
 	stats["procedures_removed"] += removed_procedures
-	stats["blocks_removed"] += removed_blocks
+	stats["procedure_blocks_removed"] += removed_blocks
 	return removed_procedures
 
 
@@ -3449,12 +3453,18 @@ def convert_wav_sounds_to_mp3(project, assets, stats):
 	return conversions
 
 
-def remove_sound_metadata(project):
+def remove_sound_metadata(project, stats):
+	removed = 0
 	for target in project.get("targets", []):
 		for sound in target.get("sounds", []):
-			if isinstance(sound, dict):
-				sound.pop("rate", None)
-				sound.pop("sampleCount", None)
+			if not isinstance(sound, dict):
+				continue
+			for key in ("rate", "sampleCount"):
+				if key in sound:
+					del sound[key]
+					removed += 1
+	stats["sound_metadata_removed"] += removed
+	return removed
 
 
 def compact_redundant_field_ids(project, stats):
@@ -4988,11 +4998,11 @@ def apply_transforms(project, opts: Options, assets=None):
 	if opts.cleared_lists:
 		clear_large_lists(project, opts.cleared_lists, stats)
 	if opts.remove_unreachable:
-		remove_unreachable_blocks(project, stats)
+		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_first")
 	if opts.remove_unused_procedures:
 		remove_unused_procedures(project, stats)
-	if opts.remove_unreachable:
-		remove_unreachable_blocks(project, stats)
+	if opts.remove_unreachable or opts.remove_unused_procedures:
+		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_second")
 	if opts.folded_constant_variables:
 		fold_constant_variables(project, opts.folded_constant_variables, stats)
 		remove_constant_variable_setters(
@@ -5063,7 +5073,7 @@ def apply_transforms(project, opts: Options, assets=None):
 	if opts.normalize_numbers:
 		normalize_numbers(project, stats, opts.normalize_epsilon)
 	if not opts.keep_sound_metadata:
-		remove_sound_metadata(project)
+		remove_sound_metadata(project, stats)
 	if opts.remove_empty_fields:
 		remove_empty_fields(project, stats)
 	if opts.remove_empty_inputs:
@@ -6721,59 +6731,188 @@ def humanize(n):
 	return f"{n/1048576:.4f} MiB" if n >= 1048576 else f"{n/1024:.4f} KiB"
 
 
-STAT_ORDER = [
-	("topLevel", "topLevel:false dropped"),
-	("shadow", "shadow:false dropped"),
-	("warp", "warp string -> boolean"),
-	("comments", "sprite comments removed"),
-	("comment_links", "block comment links removed"),
-	("rounded", "position values rounded"),
-	("covered", "covered values reset"),
-	("monitors_orphan", "orphaned monitors removed"),
-	("monitors_unused", "unused monitors removed"),
-	("monitor_params", "list-monitor params cleared"),
-	("monitor_value", "monitor values normalized"),
-	("lists_cleared", "large lists cleared"),
-	("list_items_cleared", "list items removed"),
-	("block_ids", "block IDs renamed"),
-	("dangling_refs_skipped", "sprites skipped (already-dangling refs)"),
-	("dangling_block_refs_fixed", "dangling block references repaired"),
-	("broadcast_refs_repaired", "missing broadcast definitions restored"),
-	("broadcast_ref_conflicts", "conflicting broadcast references"),
-	("variable_ids", "variable IDs renamed"),
-	("list_ids", "list IDs renamed"),
-	("broadcast_ids", "broadcast IDs renamed"),
-	("argument_ids", "argument IDs renamed"),
-	("sequence_groups_created", "similar sequence groups created"),
-	("sequence_groups_rejected_size", "sequence groups rejected"),
-	("sequences_grouped", "sequence instances grouped"),
-	("sequence_procedures_created", "sequence procedures created"),
-	("sequence_parameters", "sequence parameters created"),
-	("sequence_blocks_removed", "sequence blocks removed"),
-	("sequence_blocks_added", "sequence procedure blocks added"),
-	("sequence_bytes_saved", "sequence grouping byte delta"),
-	("variables_removed", "unused variables removed"),
-	("lists_removed", "unused lists removed"),
-	("broadcasts_removed", "unused broadcasts removed"),
-	("blocks_removed", "unreachable/procedure blocks removed"),
-	("procedures_removed", "unused procedures removed"),
-	("numbers_normalized", "integral numbers normalized"),
-	("empty_fields_removed", "empty block fields removed"),
-	("empty_inputs_removed", "empty block inputs removed"),
-	("costume_metadata_removed", "redundant costume metadata removed"),
-	("default_target_properties_removed", "default target properties removed"),
-	("empty_containers_removed", "empty target containers removed"),
-	("project_meta_cleaned", "project meta fields cleaned"),
-	("numeric_inputs_compacted", "numeric string inputs compacted"),
-	("field_ids_compacted", "redundant null field IDs removed"),
-	("mutation_hasnext_compacted", "mutation hasnext=false removed"),
-	("mutation_metadata_compacted", "mutation JSON compacted"),
-	("constant_variable_reporters", "constant variable reporters folded"),
-	("constant_variable_bytes_saved", "constant-variable JSON bytes saved"),
-	("constant_variable_setters_removed", "constant-variable set blocks removed"),
-	("constant_variable_setters_kept", "constant-variable set blocks kept"),
-	("constant_expressions_folded", "constant numeric expressions folded"),
+STAT_GROUPS = [
+	(
+		"1.",
+		"Drop topLevel:false / shadow:false; normalize mutation.warp",
+		[
+			("topLevel", "topLevel:false dropped"),
+			("shadow", "shadow:false dropped"),
+			("warp", "mutation.warp normalized to boolean"),
+		],
+	),
+	(
+		"2.",
+		"WAV → MP3 conversion",
+		[
+			("wav_converted", "sounds converted"),
+			("wav_bytes_saved", "asset bytes saved"),
+			("wav_conversion_failed", "conversions failed"),
+			("wav_ffmpeg_unavailable", "ffmpeg unavailable"),
+		],
+	),
+	(
+		"3.",
+		"Strip sprite comments",
+		[
+			("comments", "sprite comments removed"),
+			("comment_links", "block comment links removed"),
+		],
+	),
+	(
+		"4.",
+		"Round positions",
+		[("rounded", "position values rounded")],
+	),
+	(
+		"5.",
+		"Reset covered shadow values",
+		[("covered", "covered values reset")],
+	),
+	(
+		"6.",
+		"Clean monitors",
+		[
+			("monitors_orphan", "orphaned monitors removed"),
+			("monitors_unused", "unused monitors removed"),
+			("monitor_params", "list-monitor params cleared"),
+			("monitor_value", "monitor values normalized"),
+		],
+	),
+	(
+		"7.",
+		"Clear lists selected at the prompt",
+		[
+			("lists_cleared", "lists cleared"),
+			("list_items_cleared", "list items removed"),
+		],
+	),
+	(
+		"8.",
+		"Remove unreachable blocks (1st pass)",
+		[("unreachable_blocks_removed_first", "blocks removed")],
+	),
+	(
+		"9.",
+		"Remove unused procedures",
+		[
+			("procedures_removed", "procedures removed"),
+			("procedure_blocks_removed", "procedure blocks removed"),
+			("procedure_dangling_block_refs_fixed", "block references repaired"),
+		],
+	),
+	(
+		"10.",
+		"Remove unreachable blocks (2nd pass)",
+		[("unreachable_blocks_removed_second", "blocks removed")],
+	),
+	(
+		"11.",
+		"Fold selected constant variable reporters",
+		[
+			("constant_variable_reporters", "constant variable reporters folded"),
+			("constant_variable_bytes_saved", "variable-reporter JSON bytes saved"),
+			("constant_variable_setters_removed", "safe matching setters removed"),
+			("constant_variable_setters_kept", "setters kept"),
+		],
+	),
+	(
+		"12.",
+		"Fold constant expressions",
+		[("constant_expressions_folded", "constant expressions folded")],
+	),
+	(
+		"13.",
+		"Remove unused variables and lists",
+		[
+			("variables_removed", "unused variables removed"),
+			("lists_removed", "unused lists removed"),
+		],
+	),
+	(
+		"14.",
+		"Repair dangling broadcast references",
+		[
+			("broadcast_refs_repaired", "missing broadcast definitions restored"),
+			("broadcast_ref_conflicts", "conflicting broadcast references"),
+		],
+	),
+	(
+		"15.",
+		"Remove unused broadcasts",
+		[("broadcasts_removed", "unused broadcasts removed")],
+	),
+	(
+		"16.",
+		"Rename IDs",
+		[
+			("variable_ids", "variable IDs renamed"),
+			("list_ids", "list IDs renamed"),
+			("broadcast_ids", "broadcast IDs renamed"),
+			("argument_ids", "argument IDs renamed"),
+			("block_ids", "block IDs renamed"),
+		],
+	),
+	(
+		"17.",
+		"Compact numeric inputs, field IDs, mutation hasnext/metadata",
+		[
+			("numeric_inputs_compacted", "numeric string inputs compacted"),
+			("field_ids_compacted", "redundant null field IDs removed"),
+			("mutation_hasnext_compacted", "mutation hasnext=false removed"),
+			("mutation_metadata_compacted", "mutation metadata JSON compacted"),
+		],
+	),
+	(
+		"18.",
+		"Normalize numbers",
+		[("numbers_normalized", "integral numbers normalized")],
+	),
+	(
+		"19.",
+		"Remove sound rate/sampleCount",
+		[("sound_metadata_removed", "sound metadata fields removed")],
+	),
+	(
+		"20.",
+		"Remove empty fields/inputs, costume metadata, default properties, empty containers, project meta",
+		[
+			("empty_fields_removed", "empty block fields removed"),
+			("empty_inputs_removed", "empty block inputs removed"),
+			("costume_metadata_removed", "redundant costume metadata removed"),
+			("default_target_properties_removed", "default target properties removed"),
+			("empty_containers_removed", "empty target containers removed"),
+			("project_meta_cleaned", "project meta fields cleaned"),
+		],
+	),
+	(
+		"21.",
+		"Repair dangling block links",
+		[("dangling_block_refs_fixed", "dangling block references repaired")],
+	),
 ]
+
+
+def _print_transform_stats(stats, opts):
+	print(Ansi.heading("Transforms applied:"))
+	for number, title, entries in STAT_GROUPS:
+		print(Ansi.subheading(f"  {number} {title}"))
+		for key, label in entries:
+			print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+		if number == "12." and opts.group_similar_sequences:
+			print(Ansi.subheading("  12a. Group similar sequences (optional)"))
+			for key, label in (
+				("sequence_groups_created", "similar sequence groups created"),
+				("sequences_grouped", "sequence instances grouped"),
+				("sequence_procedures_created", "sequence procedures created"),
+				("sequence_parameters", "sequence parameters created"),
+				("sequence_blocks_removed", "sequence blocks removed"),
+				("sequence_blocks_added", "sequence procedure blocks added"),
+				("sequence_bytes_saved", "sequence grouping JSON bytes saved"),
+				("sequence_groups_rejected_size", "candidate groups rejected for size"),
+			):
+				print(Ansi.muted(f"    {label:50} {stats[key]:>5,}"))
+
 
 
 def minify_sb3(src, dst, opts=None):
@@ -6869,9 +7008,8 @@ def minify_sb3(src, dst, opts=None):
 						compresslevel=opts.compression_level,
 					)
 
-	print(f'Input : "{src}"\nOutput: "{dst}"\n\n' + Ansi.heading("Transforms applied:"))
-	for k, label in STAT_ORDER:
-		print(Ansi.muted(f"  {label:40} {stats[k]:>8,}"))
+	print(f'Input : "{src}"\nOutput: "{dst}"\n')
+	_print_transform_stats(stats, opts)
 	b, a = len(raw), len(out_json)
 	print(
 		f"\n{Ansi.heading('project.json')} : {humanize(b)} -> {humanize(a)}  (-{humanize(b-a)}, {(b-a)/b*100:.1f}%)"
