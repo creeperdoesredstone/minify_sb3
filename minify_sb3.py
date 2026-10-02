@@ -10,7 +10,7 @@ import zlib
 import uuid
 from collections import Counter
 
-BLOCK_ID_ALPHABET = " !@#$%^*()+_-={}|[]:;?,./~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+BLOCK_ID_ALPHABET = "!@#$%^*()+_-={}|[]:;?,./~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
 class AnsiPrint:
@@ -297,6 +297,52 @@ def round_positions(project, stats):
 					if n != costume[k] or type(n) is not type(costume[k]):
 						costume[k] = n
 						stats["rounded"] += 1
+
+
+_BOOLEAN_INPUTS = {
+	"operator_and": ("OPERAND1", "OPERAND2"),
+	"operator_or": ("OPERAND1", "OPERAND2"),
+	"operator_not": ("OPERAND",),
+	"control_if": ("CONDITION",),
+	"control_if_else": ("CONDITION",),
+	"control_repeat_until": ("CONDITION",),
+	"control_wait_until": ("CONDITION",),
+	"control_while": ("CONDITION",),
+}
+
+
+def _boolean_input_names(block):
+	if not isinstance(block, dict):
+		return frozenset()
+	op = block.get("opcode")
+	names = set(_BOOLEAN_INPUTS.get(op, ()))
+	if op == "procedures_call":
+		mut = block.get("mutation")
+		if isinstance(mut, dict):
+			try:
+				ids = json.loads(mut.get("argumentids") or "[]")
+			except (TypeError, ValueError):
+				ids = []
+			proccode = mut.get("proccode")
+			if isinstance(ids, list) and isinstance(proccode, str):
+				kinds = [t for t in proccode.split(" ") if t in ("%s", "%b")]
+				if len(kinds) == len(ids):
+					names.update(
+						i for i, k in zip(ids, kinds) if k == "%b" and isinstance(i, str)
+					)
+	return frozenset(names)
+
+
+def _is_boolean_slot(block, input_name):
+	return input_name in _boolean_input_names(block)
+
+
+def _is_bare_literal_input(value):
+	if not (isinstance(value, list) and len(value) > 1):
+		return False
+	if value[0] in (1, 3):
+		return isinstance(value[1], list)
+	return False
 
 
 _NUMERIC_TAGS = (4, 5, 6, 7, 8)  # number, positive, whole, integer, angle
@@ -1760,7 +1806,7 @@ def rename_identifiers(
 					if field[0] != broadcast_new_names[field[1]]:
 						field[0] = broadcast_new_names[field[1]]
 						changed += 1
-			# sensing_of stores the variable/list *name* in PROPERTY, not the id.
+			# sensing_of stores the variable/list name in PROPERTY
 			if block.get("opcode") in (
 				"sensing_of",
 				"sensing_of_property_menu",
@@ -2618,7 +2664,7 @@ def _sequence_block_signature(block, blocks):
 	inputs_sig = []
 	for name in sorted((block.get("inputs") or {}).keys()):
 		value = block["inputs"][name]
-		if _sequence_input_parameterizable(value, blocks):
+		if not _is_boolean_slot(block, name) and _sequence_input_parameterizable(value, blocks):
 			inputs_sig.append((name, "PARAM"))
 		else:
 			inputs_sig.append((name, "FIXED", dumps_compact(value)))
@@ -2696,7 +2742,7 @@ def _sequence_compare(base, other, blocks):
 			a_value, b_value = a_inputs[name], b_inputs[name]
 			if a_value == b_value:
 				continue
-			if not (
+			if _is_boolean_slot(a, name) or not (
 				_sequence_input_parameterizable(a_value, blocks)
 				and _sequence_input_parameterizable(b_value, blocks)
 			):
@@ -2758,7 +2804,7 @@ def _sequence_replace_direct_ref(value, old_id, new_id):
 				return True
 			return False
 		if tag == 3:
-			# [3, primary, shadow] may reference either block directly.
+			# [3, primary, shadow] may reference either block directly
 			for i in (1, 2):
 				if len(node) > i and node[i] == old_id:
 					node[i] = new_id
@@ -2951,7 +2997,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 					]
 					if len({dumps_compact(v) for v in values}) <= 1:
 						continue
-					if not all(
+					if _is_boolean_slot(base_block, input_name) or not all(
 						_sequence_input_parameterizable(v, blocks) for v in values
 					):
 						param_slots = None
@@ -3625,8 +3671,8 @@ def _find_constant_variables(project):
 
 	candidates = []
 	for owner, count in set_blocks.items():
-		# DON'T FOLD a variable whose runtime value can differ from its initial value.
-		# Ex: a `set variable to 5` on an initially-0 variable is not constant.
+		# DON'T FOLD a variable whose runtime value can differ from its initial value
+		# Ex: a `set variable to 5` on an initially-0 variable is not constant
 		if (
 			count != 1
 			or owner not in literal_setters
@@ -3642,7 +3688,7 @@ def _find_constant_variables(project):
 		if not isinstance(entry, list) or len(entry) < 2:
 			continue
 
-		# cloud variables are externally mutable -> not foldable.
+		# cloud variables are externally mutable -> not foldable
 		if len(entry) >= 3 and entry[2] is True:
 			continue
 		if not _literal_storage_equal(setter_values[0], entry[1]):
@@ -3717,7 +3763,9 @@ def fold_constant_variables(project, selected, stats):
 		for block in (target.get("blocks") or {}).values():
 			if not isinstance(block, dict):
 				continue
-			for value in (block.get("inputs") or {}).values():
+			for input_name, value in (block.get("inputs") or {}).items():
+				if _is_boolean_slot(block, input_name):
+					continue  # would leave a literal in a boolean slot
 				changed += _replace_constant_variable_reporters(
 					value, ti, selected_map, project, stats
 				)
@@ -3990,7 +4038,7 @@ def _scratch_round(n):
 		return None
 	result = math.floor(n + 0.5)
 	# JavaScript Math.round(-0.x) returns -0; JSON/Scratch serialization does
-	# not preserve that distinction -> 0 is sufficient here.
+	# not preserve that distinction -> 0 is sufficient here
 	return float(result)
 
 
@@ -4013,14 +4061,15 @@ def _folded_literal_input(value):
 		return None
 	child = value[1]
 	if value[0] == 3 and isinstance(child, str):
-		# block ref
+		# block reference
 		return None
 	if isinstance(child, list) and len(child) == 2:
 		tag, raw = child
 		if tag in _NUMERIC_TAGS and isinstance(raw, (int, float, str)) and not isinstance(raw, bool):
 			num = _to_scratch_number(raw)
-			if isinstance(raw, str) and raw.strip() == "" and tag not in _TEXT_TAG:
-				return _constant("number", num)
+			if isinstance(raw, str) and _scratch_string(num) != raw:
+				# Scratch keeps the raw text, so compare/join must see the string
+				return _constant("string", raw)
 			return _constant("number", num)
 		if tag == _TEXT_TAG and isinstance(raw, str):
 			return _constant("string", raw)
@@ -4281,7 +4330,7 @@ def _exclusive_input_block_subtree(value, blocks, owner_id):
 		for value2 in (block.get("inputs") or {}).values():
 			stack.extend(_input_block_ids(value2, blocks))
 
-	# any input/next edge from outside -> the blocks are shared.
+	# any input/next edge from outside -> the blocks are shared
 	for bid, block in blocks.items():
 		if bid in candidate or bid == owner_id or not isinstance(block, dict):
 			continue
@@ -4296,14 +4345,13 @@ def _exclusive_input_block_subtree(value, blocks, owner_id):
 
 
 def _reparent_serialized_input(value, blocks, parent_id):
-	for bid in _input_block_ids(value, blocks):
+	for bid in _direct_input_block_refs(value, blocks):
 		block = blocks.get(bid)
 		if isinstance(block, dict):
 			block["parent"] = parent_id
 
 
 def _sequence_primary_input_block_id(value, blocks):
-	"""Return the primary block referenced by a serialized Scratch input."""
 	if not (isinstance(value, list) and value):
 		return None
 	if len(value) > 1:
@@ -4491,7 +4539,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				removed_count += len(removed)
 				continue
 
-			# set x to (x - a) -> change x by (0 - a).
+			# set x to (x - a) -> change x by (0 - a)
 			new_left = [1, [4, 0]]
 			rhs_inputs["NUM1"] = new_left
 			opts.simplified_block_input_edits[(ti, rhs_id, "NUM1")] = copy.deepcopy(
@@ -4517,13 +4565,53 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 	return total
 
 
+def _subtree_block_ids(raw, blocks):
+	out = set()
+	stack = list(_input_block_ids(raw, blocks))
+	while stack:
+		bid = stack.pop()
+		if bid in out:
+			continue
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		out.add(bid)
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in blocks:
+			stack.append(nxt)
+		for v in (block.get("inputs") or {}).values():
+			stack.extend(_input_block_ids(v, blocks))
+	return out
+
+
+def _expand_removed_closure(ids, blocks, keep=frozenset()):
+	out = set(ids)
+	stack = list(out)
+	while stack:
+		bid = stack.pop()
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		children = []
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in blocks:
+			children.append(nxt)
+		for v in (block.get("inputs") or {}).values():
+			children.extend(_input_block_ids(v, blocks))
+		for child in children:
+			if child in out or child in keep:
+				continue
+			out.add(child)
+			stack.append(child)
+	return out
+
+
 def _simplify_boolean_identity_input(value, blocks, parent_id=None):
 	"""
 	Simplify AND/OR inputs when one operand is a compile-time boolean.
 
-	The other operand may be an irreducible reporter expression.  If that
-	operand is preserved as an alias, its block(s) are re-parented to the new
-	owner.
+	The other operand may be an irreducible reporter expression.
+	If that operand is preserved as an alias, its block(s) are re-parented to the new owner.
 	If the operand is discarded, its exclusively-owned subtree is
 	removed as well, so no surviving block is left with a dangling parent.
 
@@ -4562,13 +4650,17 @@ def _simplify_boolean_identity_input(value, blocks, parent_id=None):
 		replacement, _ = _constant_to_scratch_input(
 			_constant("bool", constant_result), blocks, parent_id or block_id
 		)
-		return replacement, removed_base | constant_ids | dead_ids
+		return replacement, _expand_removed_closure(
+			removed_base | constant_ids | dead_ids, blocks
+		)
 
 	def preserve(raw, constant_ids):
 		owned_ids = _exclusive_input_block_subtree(raw, blocks, block_id)
 		if owned_ids is None:
 			return None
-		return copy.deepcopy(raw), removed_base | constant_ids
+		return copy.deepcopy(raw), _expand_removed_closure(
+			removed_base | constant_ids, blocks, keep=_subtree_block_ids(raw, blocks)
+		)
 
 	if operator == "operator_and":
 		if left is not None and left_bool is False:
@@ -4601,400 +4693,408 @@ def _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
 
 
 def _direct_input_block_refs(value, blocks):
-    """Return block IDs directly stored as primary/shadow refs in one input."""
-    if not isinstance(value, list) or not value:
-        return ()
-    refs = []
-    if value[0] in (2, 3) and len(value) > 1:
-        ref = value[1]
-        if isinstance(ref, str) and ref in blocks:
-            refs.append(ref)
-    if value[0] == 3 and len(value) > 2:
-        ref = value[2]
-        if isinstance(ref, str) and ref in blocks:
-            refs.append(ref)
-    return tuple(refs)
+	if not isinstance(value, list) or not value:
+		return ()
+	refs = []
+	if value[0] in (2, 3) and len(value) > 1:
+		ref = value[1]
+		if isinstance(ref, str) and ref in blocks:
+			refs.append(ref)
+	if value[0] == 3 and len(value) > 2:
+		ref = value[2]
+		if isinstance(ref, str) and ref in blocks:
+			refs.append(ref)
+	return tuple(refs)
 
 
 def _incoming_block_ref_counts(target):
-    """Count serialized input/next references to each block once per target."""
-    blocks = target.get("blocks") or {}
-    refs = Counter()
-    for block in blocks.values():
-        if not isinstance(block, dict):
-            continue
-        nxt = block.get("next")
-        if isinstance(nxt, str) and nxt in blocks:
-            refs[nxt] += 1
-        for value in (block.get("inputs") or {}).values():
-            for bid in _input_block_ids(value, blocks):
-                refs[bid] += 1
-    return refs
+	blocks = target.get("blocks") or {}
+	refs = Counter()
+	for block in blocks.values():
+		if not isinstance(block, dict):
+			continue
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in blocks:
+			refs[nxt] += 1
+		for value in (block.get("inputs") or {}).values():
+			for bid in _input_block_ids(value, blocks):
+				refs[bid] += 1
+	return refs
 
 
 def _exclusive_input_block_subtree_fast(value, blocks, owner_id, incoming_refs):
-    """Find an exclusively owned input subtree without scanning all blocks."""
-    roots = _direct_input_block_refs(value, blocks)
-    if not roots:
-        return set()
+	roots = _direct_input_block_refs(value, blocks)
+	if not roots:
+		return set()
 
-    candidate = set()
-    stack = list(roots)
-    while stack:
-        bid = stack.pop()
-        if bid in candidate:
-            continue
-        block = blocks.get(bid)
-        if not isinstance(block, dict) or block.get("topLevel") is True:
-            return None
-        if incoming_refs.get(bid, 0) != 1:
-            return None
-        candidate.add(bid)
-        nxt = block.get("next")
-        if isinstance(nxt, str) and nxt in blocks:
-            stack.append(nxt)
-        for value2 in (block.get("inputs") or {}).values():
-            stack.extend(_input_block_ids(value2, blocks))
+	candidate = set()
+	stack = list(roots)
+	while stack:
+		bid = stack.pop()
+		if bid in candidate:
+			continue
+		block = blocks.get(bid)
+		if not isinstance(block, dict) or block.get("topLevel") is True:
+			return None
+		if incoming_refs.get(bid, 0) != 1:
+			return None
+		candidate.add(bid)
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in blocks:
+			stack.append(nxt)
+		for value2 in (block.get("inputs") or {}).values():
+			stack.extend(_input_block_ids(value2, blocks))
 
-    roots_set = set(roots)
-    for bid in candidate:
-        block = blocks.get(bid)
-        parent = block.get("parent") if isinstance(block, dict) else None
-        if bid in roots_set:
-            if parent != owner_id:
-                return None
-        elif parent not in candidate:
-            return None
-    return candidate
+	roots_set = set(roots)
+	for bid in candidate:
+		block = blocks.get(bid)
+		parent = block.get("parent") if isinstance(block, dict) else None
+		if bid in roots_set:
+			if parent != owner_id:
+				return None
+		elif parent not in candidate:
+			return None
+	return candidate
 
 
 def _constant_to_scratch_input(constant, blocks, parent_id):
-    kind, value = constant
-    if kind == "number":
-        number = int(value) if isinstance(value, float) and value.is_integer() else value
-        return [1, [4, number]], set()
-    if kind == "string":
-        return [1, [10, value]], set()
-    if kind == "bool":
-        return [1, [10, "true" if value else "false"]], set()
-    return None, set()
+	kind, value = constant
+	if kind == "number":
+		number = int(value) if isinstance(value, float) and value.is_integer() else value
+		return [1, [4, number]], set()
+	if kind == "string":
+		return [1, [10, value]], set()
+	if kind == "bool":
+		return [1, [10, "true" if value else "false"]], set()
+	return None, set()
 
 
 def _fold_ids_have_external_refs(folded_ids, blocks, owner_id):
-    folded_ids = set(folded_ids)
-    for bid, block in blocks.items():
-        if bid in folded_ids or bid == owner_id or not isinstance(block, dict):
-            continue
-        nxt = block.get("next")
-        if isinstance(nxt, str) and nxt in folded_ids:
-            return True
-        for value in (block.get("inputs") or {}).values():
-            if _input_block_ids(value, blocks) & folded_ids:
-                return True
-    return False
+	folded_ids = set(folded_ids)
+	for bid, block in blocks.items():
+		if bid in folded_ids or bid == owner_id or not isinstance(block, dict):
+			continue
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in folded_ids:
+			return True
+		for value in (block.get("inputs") or {}).values():
+			if _input_block_ids(value, blocks) & folded_ids:
+				return True
+	return False
 
 
 def _demorgan_boolean_input(value, blocks, owner_id=None, incoming_refs=None):
-    """
-    Apply De Morgan's law in exactly one direction:
+	"""
+	Apply De Morgan's law in exactly one direction:
 
-        (not a) and (not b) -> not (a or b)
-        (not a) or  (not b) -> not (a and b)
+		(not a) and (not b) -> not (a or b)
+		(not a) or  (not b) -> not (a and b)
 
-    The reverse direction is deliberately never attempted.
-    """
-    if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
-        return None
+	The reverse direction is deliberately never attempted.
+	"""
+	if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
+		return None
 
-    logic_id = value[1]
-    if not isinstance(logic_id, str) or logic_id not in blocks:
-        return None
-    logic = blocks[logic_id]
-    if not isinstance(logic, dict) or logic.get("opcode") not in ("operator_and", "operator_or"):
-        return None
+	logic_id = value[1]
+	if not isinstance(logic_id, str) or logic_id not in blocks:
+		return None
+	logic = blocks[logic_id]
+	if not isinstance(logic, dict) or logic.get("opcode") not in ("operator_and", "operator_or"):
+		return None
 
-    if owner_id is None or incoming_refs is None:
-        return None
-    if owner_id == logic_id or logic.get("parent") != owner_id:
-        return None
-    if incoming_refs.get(logic_id, 0) != 1:
-        return None
+	if owner_id is None or incoming_refs is None:
+		return None
+	if owner_id == logic_id or logic.get("parent") != owner_id:
+		return None
+	if incoming_refs.get(logic_id, 0) != 1:
+		return None
 
-    inputs = logic.get("inputs") or {}
-    left_raw = inputs.get("OPERAND1")
-    right_raw = inputs.get("OPERAND2")
-    for raw in (left_raw, right_raw):
-        if not (
-            isinstance(raw, list)
-            and len(raw) > 1
-            and raw[0] in (2, 3)
-            and isinstance(raw[1], str)
-        ):
-            return None
+	inputs = logic.get("inputs") or {}
+	left_raw = inputs.get("OPERAND1")
+	right_raw = inputs.get("OPERAND2")
+	for raw in (left_raw, right_raw):
+		if not (
+			isinstance(raw, list)
+			and len(raw) > 1
+			and raw[0] in (2, 3)
+			and isinstance(raw[1], str)
+		):
+			return None
 
-    left_not_id = left_raw[1]
-    right_not_id = right_raw[1]
-    if (
-        left_not_id == right_not_id
-        or left_not_id in (logic_id, owner_id)
-        or right_not_id in (logic_id, owner_id)
-    ):
-        return None
-    if incoming_refs.get(left_not_id, 0) != 1 or incoming_refs.get(right_not_id, 0) != 1:
-        return None
+	left_not_id = left_raw[1]
+	right_not_id = right_raw[1]
+	if (
+		left_not_id == right_not_id
+		or left_not_id in (logic_id, owner_id)
+		or right_not_id in (logic_id, owner_id)
+	):
+		return None
+	if incoming_refs.get(left_not_id, 0) != 1 or incoming_refs.get(right_not_id, 0) != 1:
+		return None
 
-    left_not = blocks.get(left_not_id)
-    right_not = blocks.get(right_not_id)
-    if not (
-        isinstance(left_not, dict)
-        and isinstance(right_not, dict)
-        and left_not.get("opcode") == "operator_not"
-        and right_not.get("opcode") == "operator_not"
-    ):
-        return None
-    if (
-        logic.get("next") is not None
-        or left_not.get("next") is not None
-        or right_not.get("next") is not None
-    ):
-        return None
-    if left_not.get("parent") != logic_id or right_not.get("parent") != logic_id:
-        return None
+	left_not = blocks.get(left_not_id)
+	right_not = blocks.get(right_not_id)
+	if not (
+		isinstance(left_not, dict)
+		and isinstance(right_not, dict)
+		and left_not.get("opcode") == "operator_not"
+		and right_not.get("opcode") == "operator_not"
+	):
+		return None
+	if (
+		logic.get("next") is not None
+		or left_not.get("next") is not None
+		or right_not.get("next") is not None
+	):
+		return None
+	if left_not.get("parent") != logic_id or right_not.get("parent") != logic_id:
+		return None
 
-    left_operand = (left_not.get("inputs") or {}).get("OPERAND")
-    right_operand = (right_not.get("inputs") or {}).get("OPERAND")
-    if not (
-        isinstance(left_operand, list)
-        and len(left_operand) > 1
-        and isinstance(right_operand, list)
-        and len(right_operand) > 1
-    ):
-        return None
+	left_operand = (left_not.get("inputs") or {}).get("OPERAND")
+	right_operand = (right_not.get("inputs") or {}).get("OPERAND")
+	if not (
+		isinstance(left_operand, list)
+		and len(left_operand) > 1
+		and isinstance(right_operand, list)
+		and len(right_operand) > 1
+	):
+		return None
 
-    left_owned = _exclusive_input_block_subtree_fast(
-        left_operand, blocks, left_not_id, incoming_refs
-    )
-    right_owned = _exclusive_input_block_subtree_fast(
-        right_operand, blocks, right_not_id, incoming_refs
-    )
-    if left_owned is None or right_owned is None:
-        return None
+	left_owned = _exclusive_input_block_subtree_fast(
+		left_operand, blocks, left_not_id, incoming_refs
+	)
+	right_owned = _exclusive_input_block_subtree_fast(
+		right_operand, blocks, right_not_id, incoming_refs
+	)
+	if left_owned is None or right_owned is None:
+		return None
 
-    left_root = left_operand[1] if isinstance(left_operand[1], str) else None
-    right_root = right_operand[1] if isinstance(right_operand[1], str) else None
-    if left_root and left_root == right_root:
-        return None
-    for root in (left_root, right_root):
-        if root in (logic_id, left_not_id, right_not_id, owner_id):
-            return None
+	left_root = left_operand[1] if isinstance(left_operand[1], str) else None
+	right_root = right_operand[1] if isinstance(right_operand[1], str) else None
+	if left_root and left_root == right_root:
+		return None
+	for root in (left_root, right_root):
+		if root in (logic_id, left_not_id, right_not_id, owner_id):
+			return None
 
-    new_owner_input = copy.deepcopy(value)
-    new_owner_input[1] = left_not_id
-    new_outer_input = [2, logic_id]
+	new_owner_input = [2, left_not_id]
+	new_outer_input = [2, logic_id]
 
-    return {
-        "logic_id": logic_id,
-        "left_not_id": left_not_id,
-        "right_not_id": right_not_id,
-        "old_logic_parent": logic.get("parent"),
-        "new_owner_input": new_owner_input,
-        "new_outer_input": new_outer_input,
-        "new_inner_left": copy.deepcopy(left_operand),
-        "new_inner_right": copy.deepcopy(right_operand),
-        "new_inner_opcode": (
-            "operator_or"
-            if logic.get("opcode") == "operator_and"
-            else "operator_and"
-        ),
-        "changed_ids": {logic_id, left_not_id, right_not_id} | left_owned | right_owned,
-    }
+	return {
+		"logic_id": logic_id,
+		"left_not_id": left_not_id,
+		"right_not_id": right_not_id,
+		"old_logic_parent": logic.get("parent"),
+		"new_owner_input": new_owner_input,
+		"new_outer_input": new_outer_input,
+		"new_inner_left": copy.deepcopy(left_operand),
+		"new_inner_right": copy.deepcopy(right_operand),
+		"new_inner_opcode": (
+			"operator_or"
+			if logic.get("opcode") == "operator_and"
+			else "operator_and"
+		),
+		"changed_ids": {logic_id, left_not_id, right_not_id} | left_owned | right_owned,
+	}
 
 
 def fold_constant_expressions(project, stats, opts):
-    targets = project.get("targets", [])
-    opts.folded_constant_expression_link_edits = {}
-    opts.folded_constant_expression_inputs = {}
-    opts.folded_constant_expression_opcode_edits = {}
-    opts.folded_constant_expression_blocks = [set() for _ in targets]
-    opts.folded_constant_expression_new_blocks = [set() for _ in targets]
-    folded = 0
+	targets = project.get("targets", [])
+	opts.folded_constant_expression_link_edits = {}
+	opts.folded_constant_expression_inputs = {}
+	opts.folded_constant_expression_opcode_edits = {}
+	opts.folded_constant_expression_blocks = [set() for _ in targets]
+	opts.folded_constant_expression_new_blocks = [set() for _ in targets]
+	folded = 0
 
-    for ti, target in enumerate(targets):
-        blocks = target.get("blocks") or {}
-        incoming_refs = _incoming_block_ref_counts(target)
-        commented_ids = {
-            c.get("blockId")
-            for c in (target.get("comments") or {}).values()
-            if isinstance(c, dict) and c.get("blockId") is not None
-        }
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		incoming_refs = _incoming_block_ref_counts(target)
+		commented_ids = {
+			c.get("blockId")
+			for c in (target.get("comments") or {}).values()
+			if isinstance(c, dict) and c.get("blockId") is not None
+		}
 
-        while True:
-            changed = False
-            for block_id, block in list(blocks.items()):
-                if not isinstance(block, dict) or block_id not in blocks:
-                    continue
+		while True:
+			changed = False
+			for block_id, block in list(blocks.items()):
+				if not isinstance(block, dict) or block_id not in blocks:
+					continue
 
-                for input_name, input_val in list((block.get("inputs") or {}).items()):
-                    demorgan = _demorgan_boolean_input(
-                        input_val,
-                        blocks,
-                        owner_id=block_id,
-                        incoming_refs=incoming_refs,
-                    )
-                    if demorgan is not None and not _fold_blocked_by_comment(
-                        demorgan["changed_ids"], blocks, commented_ids
-                    ):
-                        logic_id = demorgan["logic_id"]
-                        left_not_id = demorgan["left_not_id"]
-                        right_not_id = demorgan["right_not_id"]
-                        logic = blocks[logic_id]
-                        left_not = blocks[left_not_id]
+				for input_name, input_val in list((block.get("inputs") or {}).items()):
+					demorgan = _demorgan_boolean_input(
+						input_val,
+						blocks,
+						owner_id=block_id,
+						incoming_refs=incoming_refs,
+					)
+					if demorgan is not None and not _fold_blocked_by_comment(
+						demorgan["changed_ids"], blocks, commented_ids
+					):
+						logic_id = demorgan["logic_id"]
+						left_not_id = demorgan["left_not_id"]
+						right_not_id = demorgan["right_not_id"]
+						logic = blocks[logic_id]
+						left_not = blocks[left_not_id]
 
-                        logic["opcode"] = demorgan["new_inner_opcode"]
-                        logic_inputs = logic.get("inputs") or {}
-                        logic_inputs["OPERAND1"] = demorgan["new_inner_left"]
-                        logic_inputs["OPERAND2"] = demorgan["new_inner_right"]
-                        logic["inputs"] = logic_inputs
+						logic["opcode"] = demorgan["new_inner_opcode"]
+						logic_inputs = logic.get("inputs") or {}
+						logic_inputs["OPERAND1"] = demorgan["new_inner_left"]
+						logic_inputs["OPERAND2"] = demorgan["new_inner_right"]
+						logic["inputs"] = logic_inputs
 
-                        left_not_inputs = left_not.get("inputs") or {}
-                        left_not_inputs["OPERAND"] = demorgan["new_outer_input"]
-                        left_not["inputs"] = left_not_inputs
-                        left_not["parent"] = demorgan["old_logic_parent"]
-                        logic["parent"] = left_not_id
+						left_not_inputs = left_not.get("inputs") or {}
+						left_not_inputs["OPERAND"] = demorgan["new_outer_input"]
+						left_not["inputs"] = left_not_inputs
+						left_not["parent"] = demorgan["old_logic_parent"]
+						logic["parent"] = left_not_id
 
-                        block_inputs = block.get("inputs") or {}
-                        block_inputs[input_name] = copy.deepcopy(
-                            demorgan["new_owner_input"]
-                        )
-                        block["inputs"] = block_inputs
+						block_inputs = block.get("inputs") or {}
+						block_inputs[input_name] = copy.deepcopy(
+							demorgan["new_owner_input"]
+						)
+						block["inputs"] = block_inputs
 
-                        for raw, old_parent in (
-                            (demorgan["new_inner_left"], left_not_id),
-                            (demorgan["new_inner_right"], right_not_id),
-                        ):
-                            for ref in _direct_input_block_refs(raw, blocks):
-                                blocks[ref]["parent"] = logic_id
-                                opts.folded_constant_expression_link_edits[(
-                                    ti, ref, "parent"
-                                )] = logic_id
+						for raw, old_parent in (
+							(demorgan["new_inner_left"], left_not_id),
+							(demorgan["new_inner_right"], right_not_id),
+						):
+							for ref in _direct_input_block_refs(raw, blocks):
+								blocks[ref]["parent"] = logic_id
+								opts.folded_constant_expression_link_edits[(
+									ti, ref, "parent"
+								)] = logic_id
 
-                        opts.folded_constant_expression_link_edits[(
-                            ti, left_not_id, "parent"
-                        )] = demorgan["old_logic_parent"]
-                        opts.folded_constant_expression_link_edits[(
-                            ti, logic_id, "parent"
-                        )] = left_not_id
-                        opts.folded_constant_expression_opcode_edits[(
-                            ti, logic_id
-                        )] = demorgan["new_inner_opcode"]
-                        opts.folded_constant_expression_inputs[(
-                            ti, block_id, input_name
-                        )] = copy.deepcopy(demorgan["new_owner_input"])
-                        opts.folded_constant_expression_inputs[(
-                            ti, logic_id, "OPERAND1"
-                        )] = copy.deepcopy(demorgan["new_inner_left"])
-                        opts.folded_constant_expression_inputs[(
-                            ti, logic_id, "OPERAND2"
-                        )] = copy.deepcopy(demorgan["new_inner_right"])
-                        opts.folded_constant_expression_inputs[(
-                            ti, left_not_id, "OPERAND"
-                        )] = copy.deepcopy(demorgan["new_outer_input"])
-                        opts.folded_constant_expression_blocks[ti].add(right_not_id)
-                        blocks.pop(right_not_id, None)
-                        incoming_refs.pop(right_not_id, None)
-                        changed = True
-                        stats["demorgan_rewrites"] += 1
-                        break
+						opts.folded_constant_expression_link_edits[(
+							ti, left_not_id, "parent"
+						)] = demorgan["old_logic_parent"]
+						opts.folded_constant_expression_link_edits[(
+							ti, logic_id, "parent"
+						)] = left_not_id
+						opts.folded_constant_expression_opcode_edits[(
+							ti, logic_id
+						)] = demorgan["new_inner_opcode"]
+						opts.folded_constant_expression_inputs[(
+							ti, block_id, input_name
+						)] = copy.deepcopy(demorgan["new_owner_input"])
+						opts.folded_constant_expression_inputs[(
+							ti, logic_id, "OPERAND1"
+						)] = copy.deepcopy(demorgan["new_inner_left"])
+						opts.folded_constant_expression_inputs[(
+							ti, logic_id, "OPERAND2"
+						)] = copy.deepcopy(demorgan["new_inner_right"])
+						opts.folded_constant_expression_inputs[(
+							ti, left_not_id, "OPERAND"
+						)] = copy.deepcopy(demorgan["new_outer_input"])
+						opts.folded_constant_expression_blocks[ti].add(right_not_id)
+						blocks.pop(right_not_id, None)
+						incoming_refs = _incoming_block_ref_counts(target)
+						changed = True
+						stats["demorgan_rewrites"] += 1
+						break
 
-                    if changed:
-                        break
+					if changed:
+						break
 
-                    identity = _simplify_boolean_identity_input(
-                        input_val, blocks, parent_id=block_id
-                    )
-                    if identity is not None:
-                        replacement, folded_ids = identity
-                        if _fold_blocked_by_comment(
-                            folded_ids, blocks, commented_ids
-                        ) or _fold_ids_have_external_refs(
-                            folded_ids, blocks, block_id
-                        ):
-                            continue
-                        if block_id not in blocks:
-                            continue
-                        inputs = blocks[block_id].get("inputs") or {}
-                        if input_name not in inputs:
-                            continue
-                        if isinstance(replacement, list):
-                            new_input = copy.deepcopy(replacement)
-                            new_ids = set()
-                        else:
-                            new_input, new_ids = _constant_to_scratch_input(
-                                replacement, blocks, block_id
-                            )
-                        if new_input is None:
-                            continue
-                        if isinstance(replacement, list):
-                            for child_id in _input_block_ids(new_input, blocks):
-                                child = blocks.get(child_id)
-                                if isinstance(child, dict) and child.get("parent") != block_id:
-                                    opts.folded_constant_expression_link_edits[(
-                                        ti, child_id, "parent"
-                                    )] = block_id
-                            _reparent_serialized_input(new_input, blocks, block_id)
-                        inputs[input_name] = new_input
-                        opts.folded_constant_expression_inputs[(
-                            ti, block_id, input_name
-                        )] = copy.deepcopy(new_input)
-                        opts.folded_constant_expression_blocks[ti].update(folded_ids)
-                        opts.folded_constant_expression_new_blocks[ti].update(new_ids)
-                        for remove_id in folded_ids:
-                            blocks.pop(remove_id, None)
-                        folded += 1
-                        changed = True
-                        break
+					identity = _simplify_boolean_identity_input(
+						input_val, blocks, parent_id=block_id
+					)
+					if identity is not None:
+						replacement, folded_ids = identity
+						if _fold_blocked_by_comment(
+							folded_ids, blocks, commented_ids
+						) or _fold_ids_have_external_refs(
+							folded_ids, blocks, block_id
+						):
+							continue
+						if block_id not in blocks:
+							continue
+						inputs = blocks[block_id].get("inputs") or {}
+						if input_name not in inputs:
+							continue
+						if isinstance(replacement, list):
+							new_input = copy.deepcopy(replacement)
+							new_ids = set()
+						else:
+							new_input, new_ids = _constant_to_scratch_input(
+								replacement, blocks, block_id
+							)
+						if new_input is None:
+							continue
+						if _is_boolean_slot(block, input_name) and _is_bare_literal_input(new_input):
+							continue  # a literal can't live in a boolean slot
+						if isinstance(replacement, list):
+							for child_id in _input_block_ids(new_input, blocks):
+								child = blocks.get(child_id)
+								if isinstance(child, dict) and child.get("parent") != block_id:
+									opts.folded_constant_expression_link_edits[(
+										ti, child_id, "parent"
+									)] = block_id
+							_reparent_serialized_input(new_input, blocks, block_id)
+						inputs[input_name] = new_input
+						opts.folded_constant_expression_inputs[(
+							ti, block_id, input_name
+						)] = copy.deepcopy(new_input)
+						opts.folded_constant_expression_blocks[ti].update(folded_ids)
+						opts.folded_constant_expression_new_blocks[ti].update(new_ids)
+						for remove_id in folded_ids:
+							blocks.pop(remove_id, None)
+						incoming_refs = _incoming_block_ref_counts(target)
+						folded += 1
+						changed = True
+						break
 
-                    res = _constant_expression_from_input(input_val, blocks)
-                    if res is None:
-                        continue
-                    constant, folded_ids = res
-                    if not folded_ids:
-                        continue
-                    if _fold_blocked_by_comment(
-                        folded_ids, blocks, commented_ids
-                    ) or _fold_ids_have_external_refs(
-                        folded_ids, blocks, block_id
-                    ):
-                        continue
-                    if block_id not in blocks:
-                        continue
-                    inputs = blocks[block_id].get("inputs") or {}
-                    if input_name not in inputs:
-                        continue
-                    new_input, new_ids = _constant_to_scratch_input(
-                        constant, blocks, block_id
-                    )
-                    if new_input is None:
-                        continue
-                    inputs[input_name] = new_input
-                    opts.folded_constant_expression_inputs[(
-                        ti, block_id, input_name
-                    )] = copy.deepcopy(new_input)
-                    opts.folded_constant_expression_blocks[ti].update(folded_ids)
-                    opts.folded_constant_expression_new_blocks[ti].update(new_ids)
-                    for remove_id in folded_ids:
-                        blocks.pop(remove_id, None)
-                    folded += 1
-                    changed = True
-                    break
+					res = _constant_expression_from_input(input_val, blocks)
+					if res is None:
+						continue
+					constant, folded_ids = res
+					if not folded_ids:
+						continue
 
-                if changed:
-                    break
+					owned_ids = _exclusive_input_block_subtree_fast(
+						input_val, blocks, block_id, incoming_refs
+					)
+					if owned_ids is None or not folded_ids <= owned_ids:
+						continue
+					if _fold_blocked_by_comment(
+						owned_ids, blocks, commented_ids
+					) or _fold_ids_have_external_refs(
+						owned_ids, blocks, block_id
+					):
+						continue
+					if block_id not in blocks:
+						continue
+					inputs = blocks[block_id].get("inputs") or {}
+					if input_name not in inputs:
+						continue
+					new_input, new_ids = _constant_to_scratch_input(
+						constant, blocks, block_id
+					)
+					if new_input is None:
+						continue
+					if _is_boolean_slot(block, input_name) and _is_bare_literal_input(new_input):
+						continue  # a literal can't live in a boolean slot
+					inputs[input_name] = new_input
+					opts.folded_constant_expression_inputs[(
+						ti, block_id, input_name
+					)] = copy.deepcopy(new_input)
+					opts.folded_constant_expression_blocks[ti].update(owned_ids)
+					opts.folded_constant_expression_new_blocks[ti].update(new_ids)
+					for remove_id in owned_ids:
+						blocks.pop(remove_id, None)
+					incoming_refs = _incoming_block_ref_counts(target)
+					folded += 1
+					changed = True
+					break
 
-            if not changed:
-                break
+				if changed:
+					break
 
-    stats["constant_expressions_folded"] += folded
+			if not changed:
+				break
+
+	stats["constant_expressions_folded"] += folded
 
 
 def prompt_for_constant_variables(project, candidates) -> dict:
@@ -5225,7 +5325,7 @@ def remove_costume_metadata(project, stats, assets=None):
 			)
 
 			# DON'T remove md5ext unless we can prove it is derivable and the
-			# referenced asset is actually present in the archive.
+			# referenced asset is actually present in the archive
 			if (
 				canonical
 				and costume.get("md5ext") == canonical
@@ -5234,7 +5334,7 @@ def remove_costume_metadata(project, stats, assets=None):
 				del costume["md5ext"]
 				count += 1
 
-			# SVGs use vector geometry directly; bitmapResolution=1 is the default and is safe to omit.
+			# SVGs use vector geometry directly; bitmapResolution=1 is the default and is safe to omit
 			if fmt == "svg" and costume.get("bitmapResolution") == 1:
 				del costume["bitmapResolution"]
 				count += 1
@@ -6076,7 +6176,10 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 		if ov == mv:
 			continue
 		if (
-			opts.compact_mutation_metadata
+			(
+				opts.compact_mutation_metadata
+				or (opts.rename_argument_ids and key == "argumentids")
+			)
 			and key in ("argumentids", "argumentnames", "argumentdefaults")
 			and isinstance(ov, str)
 			and isinstance(mv, str)
@@ -6790,6 +6893,13 @@ def verify(original_path, minified_path, opts):
 					for k in missing_target_keys
 					if k in ("lists", "broadcasts", "comments") and to.get(k) == {}
 				)
+			if (
+				opts.remove_empty_target_containers
+				and (opts.remove_unreachable or opts.remove_unused_procedures)
+				and "comments" in missing_target_keys
+			):
+				# comments attached to removed blocks are dropped, leaving {} to prune
+				allowed_container_keys.add("comments")
 			if opts.remove_unused_lists and "lists" in missing_target_keys:
 				allowed_container_keys.add("lists")
 			if opts.remove_unused_broadcasts and "broadcasts" in missing_target_keys:
@@ -7085,6 +7195,24 @@ def verify(original_path, minified_path, opts):
 						f"Target {ti} ({name!r}): comments remain ({len(cm)} comments) despite comment stripping enabled",
 					)
 			else:
+				_mini_blocks = tm.get("blocks") or {}
+				_missing_cids = set(co) - set(cm)
+				_orphaned_ok = {
+					cid
+					for cid in _missing_cids
+					if isinstance(co[cid], dict)
+					and isinstance(co[cid].get("blockId"), str)
+					and co[cid]["blockId"] not in _mini_blocks
+					and (
+						opts.remove_unreachable
+						or opts.remove_unused_procedures
+						or opts.fold_constant_expressions
+						or opts.simplify_blocks
+						or opts.group_similar_sequences
+						or opts.fold_constant_variables
+					)
+				}
+				co = {k: v for k, v in co.items() if k not in _orphaned_ok}
 				if set(co) != set(cm):
 					return (
 						False,
