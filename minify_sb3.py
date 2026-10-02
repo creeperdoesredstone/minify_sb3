@@ -10,7 +10,7 @@ import zlib
 import uuid
 from collections import Counter
 
-BLOCK_ID_ALPHABET = "!@#$%^*()+_-={}|[]:;?,./~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+BLOCK_ID_ALPHABET = " !@#$%^*()+_-={}|[]:;?,./~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
 class Ansi:
@@ -1348,6 +1348,7 @@ def rename_identifiers(
 	rename_list_names=True,
 	rename_broadcast_names=True,
 	rename_argument_names=True,
+	rename_procedure_names=True,
 ):
 	targets = project.get("targets", [])
 	stage_index = next(
@@ -1358,6 +1359,7 @@ def rename_identifiers(
 	broadcast_names = {}
 	argument_names = {}
 	argument_metadata = {}
+	procedure_names = {}
 	changed = 0
 
 	variable_new_names = {}
@@ -1579,6 +1581,66 @@ def rename_identifiers(
 		if old_name != new_name:
 			broadcast_names[bid] = old_name
 			changed += 1
+
+	procedure_new_names = {}
+	if rename_procedure_names:
+		for ti, target in enumerate(targets):
+			blocks = target.get("blocks") or {}
+			old_proccodes = set()
+			for block in blocks.values():
+				if not isinstance(block, dict) or block.get("opcode") not in (
+					"procedures_prototype",
+					"procedures_call",
+				):
+					continue
+				mutation = block.get("mutation")
+				proccode = mutation.get("proccode") if isinstance(mutation, dict) else None
+				if isinstance(proccode, str) and proccode:
+					old_proccodes.add(proccode)
+
+			# procedure names are kept to a conservative alphanumeric alphabet so
+			# generated names cannot accidentally introduce Scratch block/icon syntax
+			procedure_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+			def short_procedure_name(index):
+				base = len(procedure_alphabet)
+				name = ""
+				n = index
+				while True:
+					name = procedure_alphabet[n % base] + name
+					n = n // base
+					if n == 0:
+						return name
+
+			for index, old_proccode in enumerate(sorted(old_proccodes)):
+				new_name = short_procedure_name(index)
+				percent = old_proccode.find("%")
+				if percent >= 0:
+					suffix_start = percent
+					while suffix_start > 0 and old_proccode[suffix_start - 1].isspace():
+						suffix_start -= 1
+					new_proccode = new_name + old_proccode[suffix_start:]
+				else:
+					new_proccode = new_name
+				procedure_new_names[(ti, old_proccode)] = new_proccode
+				if old_proccode != new_proccode:
+					procedure_names[(ti, new_proccode)] = old_proccode
+
+		for ti, target in enumerate(targets):
+			blocks = target.get("blocks") or {}
+			for block in blocks.values():
+				if not isinstance(block, dict) or block.get("opcode") not in (
+					"procedures_prototype",
+					"procedures_call",
+				):
+					continue
+				mutation = block.get("mutation")
+				if not isinstance(mutation, dict):
+					continue
+				old_proccode = mutation.get("proccode")
+				new_proccode = procedure_new_names.get((ti, old_proccode))
+				if isinstance(new_proccode, str) and old_proccode != new_proccode:
+					mutation["proccode"] = new_proccode
+					changed += 1
 
 	argument_new_names = {}
 	for ti, target in enumerate(targets):
@@ -1809,6 +1871,7 @@ def rename_identifiers(
 		"lists": list_names,
 		"broadcasts": broadcast_names,
 		"arguments": argument_names,
+		"procedures": procedure_names,
 		"argument_metadata": argument_metadata,
 		# new display name -> original, per target, for sensing_of / monitor restore
 		"variable_name_rev": {
@@ -1947,6 +2010,7 @@ def _restore_identifier_names(project, renamed_names):
 	broadcast_names = renamed_names.get("broadcasts", {})
 	argument_names = renamed_names.get("arguments", {})
 	argument_metadata = renamed_names.get("argument_metadata", {})
+	procedure_names = renamed_names.get("procedures", {})
 	variable_name_rev = renamed_names.get("variable_name_rev", {})
 	list_name_rev = renamed_names.get("list_name_rev", {})
 	stage_index = next(
@@ -2013,6 +2077,14 @@ def _restore_identifier_names(project, renamed_names):
 		for block_id, block in blocks.items():
 			original_argument_names = argument_metadata.get((ti, block_id))
 			mutation = block.get("mutation") if isinstance(block, dict) else None
+			if isinstance(mutation, dict) and block.get("opcode") in (
+				"procedures_prototype",
+				"procedures_call",
+			):
+				current_proccode = mutation.get("proccode")
+				original_proccode = procedure_names.get((ti, current_proccode))
+				if original_proccode is not None:
+					mutation["proccode"] = original_proccode
 			if original_argument_names is not None and isinstance(mutation, dict):
 				mutation["argumentnames"] = original_argument_names
 			if isinstance(block, list):
@@ -4071,6 +4143,7 @@ class Options:
 		rename_list_names=False,
 		rename_broadcast_names=False,
 		rename_argument_names=False,
+		rename_procedure_names=False,
 		remove_unused_variables=False,
 		remove_unused_lists=False,
 		remove_unused_broadcasts=False,
@@ -4121,6 +4194,7 @@ class Options:
 		self.rename_list_names = rename_list_names
 		self.rename_broadcast_names = rename_broadcast_names
 		self.rename_argument_names = rename_argument_names
+		self.rename_procedure_names = rename_procedure_names
 
 		self.remove_unused_variables = remove_unused_variables
 		self.remove_unused_lists = remove_unused_lists
@@ -4228,14 +4302,16 @@ def apply_transforms(project, opts: Options, assets=None):
 		or opts.rename_list_names
 		or opts.rename_broadcast_names
 		or opts.rename_argument_names
+		or opts.rename_procedure_names
 	):
 		opts.renamed_identifiers = rename_identifiers(
 			project,
 			stats,
 		rename_variable_names=(opts.rename_identifiers or opts.rename_variable_names),
 		rename_list_names=(opts.rename_identifiers or opts.rename_list_names),
-		rename_broadcast_names=(opts.rename_identifiers or opts.rename_broadcast_names),
-		rename_argument_names=(opts.rename_identifiers or opts.rename_argument_names),
+			rename_broadcast_names=(opts.rename_identifiers or opts.rename_broadcast_names),
+			rename_argument_names=(opts.rename_identifiers or opts.rename_argument_names),
+			rename_procedure_names=(opts.rename_identifiers or opts.rename_procedure_names),
 		)
 	used_data_ids = set()
 	if opts.rename_variable_ids or opts.rename_list_ids:
@@ -5407,6 +5483,7 @@ def verify(original_path, minified_path, opts):
 			or opts.rename_list_names
 			or opts.rename_broadcast_names
 			or opts.rename_argument_names
+			or opts.rename_procedure_names
 		):
 			_restore_identifier_names(mini, opts.renamed_identifiers)
 
@@ -6087,6 +6164,7 @@ if __name__ == "__main__":
 		"--rename-list-names",
 		"--rename-broadcast-names",
 		"--rename-argument-names",
+		"--rename-procedure-names",
 		"--remove-unused-variables",
 		"--remove-unused-lists",
 		"--remove-unused-broadcasts",
@@ -6188,6 +6266,7 @@ if __name__ == "__main__":
 		rename_list_names="--rename-list-names" in flags,
 		rename_broadcast_names="--rename-broadcast-names" in flags,
 		rename_argument_names="--rename-argument-names" in flags,
+		rename_procedure_names="--rename-procedure-names" in flags,
 		rename_argument_ids=all_optimizations or "--rename-argument-ids" in flags,
 		remove_unused_variables=all_optimizations
 		or "--remove-unused-variables" in flags,
