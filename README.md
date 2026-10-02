@@ -20,7 +20,7 @@
 - [Which flags can change behavior?](#which-flags-can-change-behavior)
 - [Known caveats and limitations](#known-caveats-and-limitations)
 - [Programmatic use](#programmatic-use)
-- [Example workflows](#example-workflows)
+- [Example usage](#example-usage)
 
 ## Requirements
 
@@ -169,21 +169,21 @@ A list qualifies if it is non-empty and meets either threshold.
    4. Round positions (default).
    5. Reset covered shadow values (default).
    6. Clean monitors (default).
-  7. Clear any lists chosen at the prompt.
+   7. Clear any lists chosen at the prompt.
    8. Remove unreachable blocks.
    9. Remove unused procedures.
    10. Remove unreachable blocks again (to sweep anything the procedure pass orphaned).
-  11. Fold selected constant variable reporters, then remove safe matching setter blocks.
-  12. Fold constant expressions.
-  13. Remove unused variables and lists.
-  14. Repair dangling broadcast references.
-  15. Remove unused broadcasts.
-  16. Rename variable and list IDs, then broadcast IDs, then argument IDs, then block IDs.
-  17. Compact numeric inputs, field IDs, and mutation `hasnext`/metadata.
-  18. Normalize numbers.
-  19. Remove sound `rate` and `sampleCount` (unless `--keep-sound-metadata`).
-  20. Remove empty fields, empty inputs, costume metadata, default target properties, empty containers, and project meta.
-  21. Repair any dangling block links ([always-on](#always-on-behavior)).
+   11. Fold selected constant variable reporters, then remove safe matching setter blocks.
+   12. Fold constant expressions.
+   13. Remove unused variables and lists.
+   14. Repair dangling broadcast references.
+   15. Remove unused broadcasts.
+   16. Rename variable and list IDs, then broadcast IDs, then argument IDs, then block IDs.
+   17. Compact numeric inputs, field IDs, and mutation `hasnext`/metadata.
+   18. Normalize numbers.
+   19. Remove sound `rate` and `sampleCount` (unless `--keep-sound-metadata`).
+   20. Remove empty fields, empty inputs, costume metadata, default target properties, empty containers, and project meta.
+   21. Repair any dangling block links ([always-on](#always-on-behavior)).
 4. `project.json` is serialized compactly (`separators=(",", ":")`, `ensure_ascii=False`), then written first into a new ZIP, followed by the assets.
 5. Per-transform counters and size totals are printed.
 6. The original and output archives are independently reloaded and compared. On any mismatch, the output file is deleted and the script exits with status 2.
@@ -319,7 +319,7 @@ Selecting any `LOSS` candidate requires typing `yes` to confirm. `--all-optimiza
 
 ### ID renaming
 
-All renaming uses the same compact 85-character alphabet (`!@#$%^*()+_-={}|[]:;?,./~`, `A-Z` without `I`, `a-z` without `l`, and `0-9`). The first 85 IDs are one character, the next 7,225 are two characters, and so on. Every rewrite updates all references so the project stays coherent.
+All renaming uses the same 87-character alphabet (`!@#$%^*()+_-={}|[]:;?,./~`, `A-Z`, `a-z`, and `0-9`). The first 87 IDs are one character, the next 7569 are two characters, and so on. Every rewrite updates all references so the project stays functional.
 
 - **`--rename-block-ids`**: block IDs are unique per sprite, so renaming is per sprite. Rewrites the block table keys plus every `next`, `parent`, input reference (including shadow slots), and comment `blockId`. IDs that are already dangling in the source are reserved so a new ID can never collide with them.
 - **`--rename-variable-ids`** / **`--rename-list-ids`**: Stage (global) data is renamed first, then each sprite's local data. All new IDs are unique across the whole project. Rewrites the `variables`/`lists` tables, `VARIABLE`/`LIST` fields, variable and list reporter primitives (including those nested in inputs and those stored in the block table), and monitor IDs, honoring local-over-global resolution.
@@ -355,12 +355,33 @@ These can change behavior if a project relies on data or scripts that are only r
 - **`--compact-field-ids`**: field tuples serialized as `[value, null]` become `[value]`. Only an explicit `null` slot is removed; empty-string and non-null IDs are preserved.
 - **`--compact-mutation-hasnext`**: removes `mutation.hasnext` when it is `false` or `"false"`.
 - **`--compact-mutation-metadata`**: re-serializes the JSON-encoded `argumentids`, `argumentnames`, and `argumentdefaults` strings in mutations without whitespace, with decoded values unchanged. `tagName` and `children` are never removed.
-- **`--fold-constant-expressions`**: folds nested `+`, `-`, `*`, `/`, `%`, `=`, `<`, `>`, `and`, `or`, `not`, `length`, and `mathop` reporters for `abs`, `floor`, `ceiling`, `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `ln`, `log`, `e ^`, and `10 ^` when their inputs are constant. Numeric strings may be decimal or prefixed with `0b`, `0o`, or `0x`; surrounding whitespace is ignored. Booleans are implicitly converted to `1` or `0` when used numerically. Expressions involving variables, unsupported math operations, division/modulo by zero, or non-finite results are left unchanged. Folded booleans are encoded according to their destination: false becomes the empty input `[2, null]`, true becomes a `not <>` reporter with an empty operand, and booleans in other sockets become text literals `"true"` or `"false"`. The transform avoids folding expressions with attached comments and verifies the exact input rewrites and any inserted reporter blocks.
+- **`--fold-constant-expressions`**:
+  - Folds nested `+`, `-`, `*`, `/`, `%`, `=`, `<`, `>`, `and`, `or`, `not`, `length`, and `mathop` reporters for `abs`, `floor`, `ceiling`, `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `ln`, `log`, `e ^`, and `10 ^` when their inputs are constant.
+  - Numeric strings may be decimal or prefixed with `0b`, `0o`, or `0x`; surrounding whitespace is ignored.
+  - Booleans are implicitly converted to `1` or `0` when used numerically.
+  - Expressions involving variables, unsupported math operations, division/modulo by zero, or non-finite results are left unchanged.
+  - Folded booleans are encoded according to their destination: false becomes the empty input `[2, null]`, true becomes a `not <>` reporter with an empty operand, and booleans in other sockets become text literals `"true"` or `"false"`.
+  - The transform avoids folding expressions with attached comments and verifies the exact input rewrites and any inserted reporter blocks.
 - **`--remove-empty-fields`** / **`--remove-empty-inputs`**: delete empty `fields`/`inputs` objects. The default keeps these containers.
 - **`--remove-costume-metadata`**: removes a costume's `md5ext` only when it equals `<assetId>.<dataFormat>` and that asset exists in the archive; removes `bitmapResolution` only from SVG costumes when it equals `1`. Bitmap costumes are never changed.
 - **`--remove-default-target-properties`**: removes properties exactly equal (value and type) to Scratch's defaults.
-  - Stage: `currentCostume` 0, `volume` 100, `tempo` 60, `videoTransparency` 50, `videoState` `"on"`, `textToSpeechLanguage` `null`.
-  - Sprites: `currentCostume` 0, `volume` 100, `visible` true, `x` 0, `y` 0, `size` 100, `direction` 90, `draggable` false, `rotationStyle` `"all around"`.
+  - Stage:
+    - `currentCostume`: 0
+    - `volume`: 100
+    - `tempo`: 60
+    - `videoTransparency`: 50
+    - `videoState`: `"on"`
+    - `textToSpeechLanguage`: `null`.
+  - Sprites:
+    - `currentCostume`: 0
+    - `volume`: 100
+    - `visible`: true
+    - `x`: 0
+    - `y`: 0
+    - `size`: 100
+    - `direction`: 90
+    - `draggable`: false
+    - `rotationStyle`: `"all around"`.
 - **`--remove-empty-containers`**: removes empty `lists`, `broadcasts`, and `comments` objects from targets.
 - **`--remove-project-meta`**: removes `meta.agent` and `meta.platform`. `meta.semver` and `meta.vm` are kept.
 - **`--sort-keys`**: writes every JSON object with keys in sorted order. This can help compression experiments and makes diffs stable.
@@ -545,14 +566,64 @@ status = minify_sb3("in.sb3", "out.sb3", opts)
 
 Notes:
 
-- `Options` defaults differ from CLI list behavior: `comments`, `positions`, `covered`, `monitors`, and `lists` are `True` on a directly constructed `Options()` object, so programmatic use scans/prompts for large lists unless `lists=False`. The CLI enables this scan only with `--clear-large-lists`; its ordinary default and `--all-optimizations` do not scan lists. Other defaults include `compression_level=9`, `list_bytes=4096`, `list_items=1000`, and `normalize_epsilon=1e-8`.
+- `Options` defaults differ from CLI list behavior: `comments`, `positions`, `covered`, `monitors`, and `lists` are `True` on a directly constructed `Options()` object, so programmatic use scans/prompts for large lists unless `lists=False`. The CLI enables this scan only with `--clear-large-lists`; its ordinary default and `--all-optimizations` do not scan lists.
+- Other defaults include:
+  - `compression_level=9`
+  - `list_bytes=4096`
+  - `list_items=1000`
+  - `normalize_epsilon=1e-8`
 - `fold_constant_variables=True` always prompts interactively.
-- Available keyword arguments: `comments`, `positions`, `covered`, `monitors`, `lists`, `rename_identifiers`, `rename_variable_names`, `rename_list_names`, `rename_broadcast_names`, `rename_argument_names`, `rename_block_ids`, `rename_variable_ids`, `rename_list_ids`, `rename_broadcast_ids`, `rename_argument_ids`, `remove_unused_variables`, `remove_unused_lists`, `remove_unused_broadcasts`, `remove_unreachable`, `remove_unused_procedures`, `normalize_numbers`, `remove_empty_fields`, `remove_empty_inputs`, `remove_costume_metadata`, `remove_default_target_properties`, `remove_empty_containers` (or `remove_empty_target_containers`), `remove_project_meta`, `convert_wav_to_mp3`, `compress_assets`, `sort_keys`, `compression_level`, `list_bytes`, `list_items`, `normalize_epsilon`, `keep_sound_metadata`, `preserve_asset_compression`, `frequency_block_ids`, `frequency_data_ids`, `compact_numeric_inputs`, `compact_field_ids`, `compact_mutation_hasnext`, `compact_mutation_metadata`, `fold_constant_variables`, `fold_constant_expressions`, `group_similar_sequences`.
+- Available keyword arguments:
+  - `comments`
+  - `positions`
+  - `covered`
+  - `monitors`
+  - `lists`
+  - `rename_identifiers`
+  - `rename_variable_names`
+  - `rename_list_names`
+  - `rename_broadcast_names`
+  - `rename_argument_names`
+  - `rename_block_ids`
+  - `rename_variable_ids`
+  - `rename_list_ids`
+  - `rename_broadcast_ids`
+  - `rename_argument_ids`
+  - `remove_unused_variables`
+  - `remove_unused_lists`
+  - `remove_unused_broadcasts`
+  - `remove_unreachable`
+  - `remove_unused_procedures`
+  - `normalize_numbers`
+  - `remove_empty_fields`
+  - `remove_empty_inputs`
+  - `remove_costume_metadata`
+  - `remove_default_target_properties`
+  - `remove_empty_containers` / `remove_empty_target_containers`
+  - `remove_project_meta`
+  - `convert_wav_to_mp3`
+  - `compress_assets`
+  - `sort_keys`
+  - `compression_level`
+  - `list_bytes`
+  - `list_items`
+  - `normalize_epsilon`
+  - `keep_sound_metadata`
+  - `preserve_asset_compression`
+  - `frequency_block_ids`
+  - `frequency_data_ids`
+  - `compact_numeric_inputs`
+  - `compact_field_ids`
+  - `compact_mutation_hasnext`
+  - `compact_mutation_metadata`
+  - `fold_constant_variables`
+  - `fold_constant_expressions`
+  - `group_similar_sequences`
 - Frequency ordering is selected by `frequency_block_ids`/`frequency_data_ids` together with the corresponding `rename_*` flag; on the CLI the `--frequency-*` flags set both for you.
 - An `Options` instance accumulates run state (rename maps, cleared lists, conversion maps) that the verifier reads, so create a fresh one for each call.
 - Lower-level helpers such as `find_large_lists`, `apply_transforms`, and `verify` are importable too, but they are internal and may change.
 
-## Example workflows
+## Example usage
 
 ```bash
 # Defaults; large-list scan is off
@@ -577,10 +648,16 @@ python minify_sb3.py my_project.sb3 --convert-wav-to-mp3
 python minify_sb3.py my_project.sb3 --all-optimizations --fold-constant-variables
 
 # Treat only large lists as candidates for clearing.
-python minify_sb3.py my_project.sb3 --list-bytes=65536 --list-items=5000
+python minify_sb3.py my_project.sb3 --clear-large-lists --list-bytes=65536 --list-items=5000
 
 # Maximum minimization without touching IDs
 python minify_sb3.py my_project.sb3 --remove-unused-variables --remove-unused-lists \
     --remove-unreachable --remove-unused-procedures --remove-empty-containers \
     --remove-default-target-properties --remove-costume-metadata
+
+# Shrink all identifiers
+python minify_sb3.py my_project.sb3 --rename-identifiers
+
+# Shrink all variable & list names only
+python minify_sb3.py my_project.sb3 --rename-variable-names --rename-list-names
 ```
