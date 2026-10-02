@@ -2770,7 +2770,7 @@ def _find_constant_variables(project):
 	change_counts = Counter()
 	setter_ids = {}
 	setter_locations = {}
-	literal_setters = set()
+	literal_setter_values = {}
 
 	def scan_input(value, ti):
 		if not isinstance(value, list) or not value:
@@ -2799,8 +2799,11 @@ def _find_constant_variables(project):
 						set_blocks[owner] = set_blocks.get(owner, 0) + 1
 						setter_ids.setdefault(owner, []).append(bid)
 						setter_locations.setdefault(owner, (ti, bid))
-						if _is_literal_value((block.get("inputs") or {}).get("VALUE")):
-							literal_setters.add(owner)
+						value = (block.get("inputs") or {}).get("VALUE")
+						if _is_literal_value(value):
+							literal_setter_values.setdefault(owner, []).append(
+								copy.deepcopy(value[1])
+							)
 					elif block.get("opcode") == "data_changevariableby":
 						change_counts[owner] = change_counts.get(owner, 0) + 1
 			for value in (block.get("inputs") or {}).values():
@@ -2808,13 +2811,16 @@ def _find_constant_variables(project):
 
 	candidates = []
 	for owner, count in set_blocks.items():
-		# variable modified by `change variable by` is runtime-mutable -> not foldable.
+		# DON'T FOLD a variable whose runtime value can differ from its initial value.
+		# Ex: a `set variable to 5` on an initially-0 variable is not constant.
 		if (
 			count != 1
-			or owner not in literal_setters
 			or reporter_counts.get(owner, 0) <= 0
 			or change_counts.get(owner, 0) > 0
 		):
+			continue
+		setter_values = literal_setter_values.get(owner, [])
+		if len(setter_values) != 1:
 			continue
 		ti, vid = owner
 		entry = (targets[ti].get("variables") or {}).get(vid)
@@ -2823,6 +2829,8 @@ def _find_constant_variables(project):
 
 		# cloud variables are externally mutable -> not foldable.
 		if len(entry) >= 3 and entry[2] is True:
+			continue
+		if not _literal_storage_equal(setter_values[0], entry[1]):
 			continue
 		literal = _variable_literal(entry[1])
 		if literal is None:
@@ -2901,28 +2909,30 @@ def fold_constant_variables(project, selected, stats):
 	return changed
 
 
-def _literal_key(value):
-	if isinstance(value, bool):
-		return None
-	if isinstance(value, (int, float)):
-		return ("n", float(value)) if math.isfinite(value) else None
-	if isinstance(value, str):
-		try:
-			num = float(value.strip())
-		except ValueError:
-			return ("s", value)
-		if value.strip() and math.isfinite(num):
-			return ("n", num)
-		return ("s", value)
-	return None
+def _literal_storage_equal(literal, initial):
+	if not (isinstance(literal, list) and len(literal) == 2):
+		return False
+	tag, raw = literal
+	if tag in _NUMERIC_TAGS:
+		return (
+			not isinstance(raw, bool)
+			and isinstance(raw, (int, float))
+			and not isinstance(initial, bool)
+			and isinstance(initial, (int, float))
+			and math.isfinite(float(raw))
+			and math.isfinite(float(initial))
+			and float(raw) == float(initial)
+		)
+	if tag == _TEXT_TAG:
+		return isinstance(raw, str) and isinstance(initial, str) and raw == initial
+	return False
 
 
 def _setter_matches_initial(block, initial):
 	value = (block.get("inputs") or {}).get("VALUE")
 	if not _is_literal_value(value):
 		return False
-	a, b = _literal_key(value[1][1]), _literal_key(initial)
-	return a is not None and a == b
+	return _literal_storage_equal(value[1], initial)
 
 
 def remove_constant_variable_setters(project, setters, stats, opts):
@@ -3046,52 +3056,191 @@ def _numeric_primitive_value(value):
 
 
 def _to_scratch_number(val):
+	"""Scratch Cast.toNumber implementation"""
 	if isinstance(val, bool):
 		return 1.0 if val else 0.0
 	if isinstance(val, (int, float)):
-		return float(val) if math.isfinite(val) else None
+		return float(val)
 	if isinstance(val, str):
 		text = val.strip()
 		if not text:
 			return 0.0
+		lower = text.lower()
+		if lower in ("+infinity", "infinity"):
+			return float("inf")
+		if lower == "-infinity":
+			return float("-inf")
 
-		# numeric prefix support
 		prefixes = (
-			("0b", 2, "01"),
-			("0o", 8, "01234567"),
-			("0x", 16, "0123456789abcdef"),
+			("0b", 2),
+			("0o", 8),
+			("0x", 16),
 		)
-		prefix = next(
-			(item for item in prefixes if text.lower().startswith(item[0])), None
-		)
+		for prefix, base in prefixes:
+			if lower.startswith(prefix):
+				digits = lower[2:]
+				if not digits:
+					return 0.0
+				try:
+					return float(int(digits, base))
+				except (ValueError, OverflowError):
+					return 0.0
 		try:
-			if prefix is not None:
-				digits = text[2:].lower()
-				if not digits or any(digit not in prefix[2] for digit in digits):
-					return None
-				num = float(int(digits, prefix[1]))
-			else:
-				num = float(text)
-			return num if math.isfinite(num) else None
+			num = float(text)
 		except (ValueError, OverflowError, TypeError):
-			return None
-	return None
+			return 0.0
+		if math.isnan(num):
+			# Cast.toNumber maps NaN to 0.
+			return 0.0
+		return num
+	return 0.0
 
 
 def _to_scratch_bool(val):
+	"""Scratch Cast.toBoolean implementation; whitespace is not stripped first."""
 	if isinstance(val, bool):
 		return val
-	if isinstance(val, (int, float)):
-		return val != 0 and not math.isnan(val)
 	if isinstance(val, str):
-		text = val.strip().lower()
-		if text in ("true", "1"):
-			return True
-		if text in ("false", "0", ""):
+		if val == "" or val == "0" or val.lower() == "false":
 			return False
-		num = _to_scratch_number(val)
-		return num != 0 if num is not None else len(val) > 0
-	return False
+		return True
+	if isinstance(val, (int, float)):
+		return val != 0 and not (isinstance(val, float) and math.isnan(val))
+	return bool(val)
+
+
+def _scratch_string(val):
+	"""Scratch Cast.toString implementation"""
+	if isinstance(val, bool):
+		return "true" if val else "false"
+	if isinstance(val, str):
+		return val
+	if isinstance(val, (int, float)):
+		if isinstance(val, float):
+			if math.isnan(val):
+				return "NaN"
+			if math.isinf(val):
+				return "Infinity" if val > 0 else "-Infinity"
+			if val == 0:
+				return "0"
+			if val.is_integer():
+				return str(int(val))
+		return str(val)
+	return str(val)
+
+
+def _constant(kind, value):
+	return (kind, value)
+
+
+def _constant_to_number(value):
+	if value is None:
+		return None
+	kind, raw = value
+	if kind == "number":
+		return float(raw)
+	if kind == "bool":
+		return 1.0 if raw else 0.0
+	if kind == "string":
+		return _to_scratch_number(raw)
+	return None
+
+
+def _constant_to_bool(value):
+	if value is None:
+		return None
+	kind, raw = value
+	return _to_scratch_bool(raw)
+
+
+def _constant_to_string(value):
+	if value is None:
+		return None
+	return _scratch_string(value[1])
+
+
+def _scratch_compare(left, right):
+	left_raw = left[1]
+	right_raw = right[1]
+	n1 = _constant_to_number(left)
+	n2 = _constant_to_number(right)
+	if (
+		n1 == 0
+		and isinstance(left_raw, str)
+		and left_raw.strip() == ""
+	):
+		n1 = float("nan")
+	elif (
+		n2 == 0
+		and isinstance(right_raw, str)
+		and right_raw.strip() == ""
+	):
+		n2 = float("nan")
+
+	if math.isnan(n1) or math.isnan(n2):
+		s1 = _scratch_string(left).lower()
+		s2 = _scratch_string(right).lower()
+		return (s1 > s2) - (s1 < s2)
+	if (
+		(math.isinf(n1) or math.isinf(n2))
+		and n1 == n2
+	):
+		return 0
+	return (n1 > n2) - (n1 < n2)
+
+
+def _scratch_mod(a, b):
+	if b == 0:
+		return None
+	try:
+		result = math.fmod(a, b)
+	except (ValueError, OverflowError, ZeroDivisionError):
+		return None
+	if result / b < 0:
+		result += b
+	return result
+
+
+def _scratch_round(n):
+	if not math.isfinite(n):
+		return None
+	result = math.floor(n + 0.5)
+	# JavaScript Math.round(-0.x) returns -0; JSON/Scratch serialization does
+	# not preserve that distinction -> 0 is sufficient here.
+	return float(result)
+
+
+def _utf16_length(text):
+	return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _utf16_char_at(text, index):
+	if index < 0:
+		return ""
+	data = text.encode("utf-16-le", "surrogatepass")
+	start = index * 2
+	if start >= len(data):
+		return ""
+	return data[start : start + 2].decode("utf-16-le", "surrogatepass")
+
+
+def _folded_literal_input(value):
+	if not (isinstance(value, list) and len(value) > 1 and value[0] in (1, 2, 3)):
+		return None
+	child = value[1]
+	if value[0] == 3 and isinstance(child, str):
+		# A block reference; this is not a literal.
+		return None
+	if isinstance(child, list) and len(child) == 2:
+		tag, raw = child
+		if tag in _NUMERIC_TAGS and isinstance(raw, (int, float, str)) and not isinstance(raw, bool):
+			num = _to_scratch_number(raw)
+			if isinstance(raw, str) and raw.strip() == "" and tag not in _TEXT_TAG:
+				return _constant("number", num)
+			return _constant("number", num)
+		if tag == _TEXT_TAG and isinstance(raw, str):
+			return _constant("string", raw)
+	return None
 
 
 def _constant_expression_from_input(value, blocks, visiting=frozenset()):
@@ -3102,14 +3251,9 @@ def _constant_expression_from_input(value, blocks, visiting=frozenset()):
 	else:
 		return None
 
-	number = _numeric_primitive_value(child)
-	if number is not None:
-		val = int(number) if number.is_integer() else number
-		return [4, val], set()
-
-	if isinstance(child, list) and len(child) == 2 and child[0] == _TEXT_TAG:
-		return child, set()
-
+	literal = _folded_literal_input(value)
+	if literal is not None:
+		return literal, set()
 	if isinstance(child, str):
 		return _constant_expression_block(child, blocks, visiting)
 	return None
@@ -3134,35 +3278,109 @@ def _constant_expression_block(block_id, blocks, visiting):
 			inputs.get(name), blocks, current_visiting
 		)
 
-	# unary operators
 	if operation == "operator_not":
 		operand = get_in("OPERAND")
 		if operand is None:
 			return None
-		res_bool = not _to_scratch_bool(operand[0][1])
-		return [10, "true" if res_bool else "false"], operand[1] | {block_id}
+		res = not _constant_to_bool(operand[0])
+		return _constant("bool", res), operand[1] | {block_id}
+
+	if operation in ("operator_and", "operator_or"):
+		left = get_in("OPERAND1")
+		if left is None:
+			return None
+		left_bool = _constant_to_bool(left[0])
+		if operation == "operator_and" and not left_bool:
+			return _constant("bool", False), left[1] | {block_id}
+		if operation == "operator_or" and left_bool:
+			return _constant("bool", True), left[1] | {block_id}
+		right = get_in("OPERAND2")
+		if right is None:
+			return None
+		result = left_bool and _constant_to_bool(right[0]) if operation == "operator_and" else left_bool or _constant_to_bool(right[0])
+		return _constant("bool", result), left[1] | right[1] | {block_id}
+
+	if operation in ("operator_gt", "operator_lt", "operator_equals"):
+		left = get_in("OPERAND1")
+		right = get_in("OPERAND2")
+		if left is None or right is None:
+			return None
+		cmp = _scratch_compare(left[0], right[0])
+		if operation == "operator_gt":
+			result = cmp > 0
+		elif operation == "operator_lt":
+			result = cmp < 0
+		else:
+			result = cmp == 0
+		return _constant("bool", result), left[1] | right[1] | {block_id}
+
+	if operation == "operator_join":
+		left = get_in("STRING1")
+		right = get_in("STRING2")
+		if left is None or right is None:
+			return None
+		return _constant(
+			"string", _constant_to_string(left[0]) + _constant_to_string(right[0])
+		), left[1] | right[1] | {block_id}
+
+	if operation == "operator_letter_of":
+		letter = get_in("LETTER")
+		string = get_in("STRING")
+		if letter is None or string is None:
+			return None
+		n = _constant_to_number(letter[0])
+		if n is None or not math.isfinite(n):
+			return None
+		index = math.trunc(n) - 1
+		text = _constant_to_string(string[0])
+		return _constant("string", _utf16_char_at(text, index)), letter[1] | string[1] | {block_id}
 
 	if operation == "operator_length":
 		operand = get_in("STRING")
 		if operand is None:
 			return None
-		return [4, len(str(operand[0][1]))], operand[1] | {block_id}
+		text = _constant_to_string(operand[0])
+		return _constant("number", _utf16_length(text)), operand[1] | {block_id}
+
+	if operation == "operator_contains":
+		left = get_in("STRING1")
+		right = get_in("STRING2")
+		if left is None or right is None:
+			return None
+		return _constant(
+			"bool",
+			_constant_to_string(right[0]).lower() in _constant_to_string(left[0]).lower(),
+		), left[1] | right[1] | {block_id}
+
+	if operation == "operator_round":
+		operand = get_in("NUM")
+		if operand is None:
+			return None
+		n = _constant_to_number(operand[0])
+		if n is None:
+			return None
+		result = _scratch_round(n)
+		if result is None:
+			return None
+		return _constant("number", result), operand[1] | {block_id}
 
 	if operation == "operator_mathop":
 		operand = get_in("NUM")
 		if operand is None:
 			return None
-		num = _to_scratch_number(operand[0][1])
+		num = _constant_to_number(operand[0])
 		if num is None:
 			return None
-
 		operator_field = (block.get("fields") or {}).get("OPERATOR")
 		op_name = (
 			operator_field[0]
 			if isinstance(operator_field, list) and operator_field
+			and isinstance(operator_field[0], str)
 			else None
 		)
-
+		if op_name is None:
+			return None
+		op_name = op_name.lower()
 		try:
 			match op_name:
 				case "abs":
@@ -3176,11 +3394,16 @@ def _constant_expression_block(block_id, blocks, visiting):
 						return None
 					res = math.sqrt(num)
 				case "sin":
-					res = math.sin(math.radians(num))
+					res = float(f"{math.sin(math.radians(num)):.10f}")
 				case "cos":
-					res = math.cos(math.radians(num))
+					res = float(f"{math.cos(math.radians(num)):.10f}")
 				case "tan":
-					res = math.tan(math.radians(num))
+					angle = num % 360
+					if angle == 90:
+						return None
+					if angle == 270:
+						return None
+					res = float(f"{math.tan(math.radians(angle)):.10f}")
 				case "asin":
 					if not -1 <= num <= 1:
 						return None
@@ -3202,78 +3425,24 @@ def _constant_expression_block(block_id, blocks, visiting):
 				case "e ^":
 					res = math.exp(num)
 				case "10 ^":
-					res = 10**num
+					res = 10 ** num
 				case _:
 					return None
 		except (ValueError, OverflowError, ZeroDivisionError):
 			return None
-
 		if not math.isfinite(res):
 			return None
-		val = int(res) if isinstance(res, float) and res.is_integer() else res
-		return [4, val], operand[1] | {block_id}
+		return _constant("number", res), operand[1] | {block_id}
 
-	if operation in ("operator_and", "operator_or"):
-		left = get_in("OPERAND1")
-		right = get_in("OPERAND2")
-		if left is None or right is None:
-			return None
-		b_left = _to_scratch_bool(left[0][1]) if left is not None else None
-		b_right = _to_scratch_bool(right[0][1]) if right is not None else None
-
-		if left is not None and right is not None:
-			res_bool = (
-				(b_left and b_right)
-				if operation == "operator_and"
-				else (b_left or b_right)
-			)
-			return [10, "true" if res_bool else "false"], left[1] | right[1] | {
-				block_id
-			}
-
-		return None
-
-	if operation in ("operator_gt", "operator_lt", "operator_equals"):
-		left = get_in("OPERAND1") or get_in("NUM1")
-		right = get_in("OPERAND2") or get_in("NUM2")
-		if left is None or right is None:
-			return None
-
-		raw_l, raw_r = left[0][1], right[0][1]
-		num_l = _to_scratch_number(raw_l)
-		num_r = _to_scratch_number(raw_r)
-
-		if num_l is not None and num_r is not None:
-			match operation:
-				case "operator_gt":
-					res_bool = num_l > num_r
-				case "operator_lt":
-					res_bool = num_l < num_r
-				case "operator_equals":
-					res_bool = num_l == num_r
-		else:
-			str_l, str_r = str(raw_l).lower(), str(raw_r).lower()
-			match operation:
-				case "operator_gt":
-					res_bool = str_l > str_r
-				case "operator_lt":
-					res_bool = str_l < str_r
-				case "operator_equals":
-					res_bool = str_l == str_r
-
-		return [10, "true" if res_bool else "false"], left[1] | right[1] | {block_id}
-
-	# binary operators
+	# Binary numeric operators.
 	left = get_in("NUM1")
 	right = get_in("NUM2")
 	if left is None or right is None:
 		return None
-
-	left_num = _to_scratch_number(left[0][1])
-	right_num = _to_scratch_number(right[0][1])
+	left_num = _constant_to_number(left[0])
+	right_num = _constant_to_number(right[0])
 	if left_num is None or right_num is None:
 		return None
-
 	try:
 		match operation:
 			case "operator_add":
@@ -3287,22 +3456,141 @@ def _constant_expression_block(block_id, blocks, visiting):
 					return None
 				result = left_num / right_num
 			case "operator_mod":
-				if right_num == 0:
+				result = _scratch_mod(left_num, right_num)
+				if result is None:
 					return None
-				result = left_num % right_num
 			case _:
 				return None
 	except (OverflowError, ValueError, ZeroDivisionError):
 		return None
-
 	if not math.isfinite(result):
 		return None
-	value = int(result) if result.is_integer() else result
-	return [4, value], left[1] | right[1] | {block_id}
+	return _constant("number", result), left[1] | right[1] | {block_id}
 
 
-def _create_scratch_id():
-	return str(uuid.uuid4()).replace("-", "")[:20]
+def _input_block_ids(value, blocks):
+	refs = set()
+	_serialized_input_refs(value, refs)
+	return {ref for ref in refs if ref in blocks}
+
+
+def _exclusive_input_block_subtree(value, blocks, owner_id):
+	roots = _input_block_ids(value, blocks)
+	if not roots:
+		return set()
+
+	candidate = set()
+	stack = list(roots)
+	while stack:
+		bid = stack.pop()
+		if bid in candidate or bid not in blocks:
+			continue
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		candidate.add(bid)
+		if block.get("topLevel") is True:
+			return None
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in blocks:
+			stack.append(nxt)
+		for value2 in (block.get("inputs") or {}).values():
+			stack.extend(_input_block_ids(value2, blocks))
+
+	# any input/next edge from outside -> the blocks are shared.
+	for bid, block in blocks.items():
+		if bid in candidate or bid == owner_id or not isinstance(block, dict):
+			continue
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in candidate:
+			return None
+		for value2 in (block.get("inputs") or {}).values():
+			if _input_block_ids(value2, blocks) & candidate:
+				return None
+
+	return candidate
+
+
+def _reparent_serialized_input(value, blocks, parent_id):
+	for bid in _input_block_ids(value, blocks):
+		block = blocks.get(bid)
+		if isinstance(block, dict):
+			block["parent"] = parent_id
+
+
+def _simplify_boolean_identity_input(value, blocks, parent_id=None):
+	"""
+	Simplify AND/OR inputs when one operand is a compile-time boolean.
+
+	The other operand may be an irreducible reporter expression.  If that
+	operand is preserved as an alias, its block(s) are re-parented to the new
+	owner.
+	If the operand is discarded, its exclusively-owned subtree is
+	removed as well, so no surviving block is left with a dangling parent.
+
+	Returns `(replacement_input, removed_block_ids)`.
+	"""
+	if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
+		return None
+	block_id = value[1]
+	if not isinstance(block_id, str) or block_id not in blocks:
+		return None
+	block = blocks.get(block_id)
+	if not isinstance(block, dict) or block.get("opcode") not in (
+		"operator_and",
+		"operator_or",
+	):
+		return None
+
+	inputs = block.get("inputs") or {}
+	left_raw = inputs.get("OPERAND1")
+	right_raw = inputs.get("OPERAND2")
+	if left_raw is None or right_raw is None:
+		return None
+
+	left = _constant_expression_from_input(left_raw, blocks)
+	right = _constant_expression_from_input(right_raw, blocks)
+	left_bool = _constant_to_bool(left[0]) if left is not None else None
+	right_bool = _constant_to_bool(right[0]) if right is not None else None
+
+	removed_base = {block_id}
+	operator = block.get("opcode")
+
+	def discard(raw, constant_result, constant_ids):
+		dead_ids = _exclusive_input_block_subtree(raw, blocks, block_id)
+		if dead_ids is None:
+			return None
+		replacement, _ = _constant_to_scratch_input(
+			_constant("bool", constant_result), blocks, parent_id or block_id
+		)
+		return replacement, removed_base | constant_ids | dead_ids
+
+	def preserve(raw, constant_ids):
+		owned_ids = _exclusive_input_block_subtree(raw, blocks, block_id)
+		if owned_ids is None:
+			return None
+		return copy.deepcopy(raw), removed_base | constant_ids
+
+	if operator == "operator_and":
+		if left is not None and left_bool is False:
+			return discard(right_raw, False, left[1])
+		if right is not None and right_bool is False:
+			return discard(left_raw, False, right[1])
+		if left is not None and left_bool is True and right is None:
+			return preserve(right_raw, left[1])
+		if right is not None and right_bool is True and left is None:
+			return preserve(left_raw, right[1])
+	else:
+		if left is not None and left_bool is True:
+			return discard(right_raw, True, left[1])
+		if right is not None and right_bool is True:
+			return discard(left_raw, True, right[1])
+		if left is not None and left_bool is False and right is None:
+			return preserve(right_raw, left[1])
+		if right is not None and right_bool is False and left is None:
+			return preserve(left_raw, right[1])
+
+	return None
 
 
 def _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
@@ -3313,8 +3601,35 @@ def _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
 	)
 
 
+def _constant_to_scratch_input(constant, blocks, parent_id):
+	kind, value = constant
+	if kind == "number":
+		number = int(value) if isinstance(value, float) and value.is_integer() else value
+		return [1, [4, number]], set()
+	if kind == "string":
+		return [1, [10, value]], set()
+	if kind == "bool":
+		return [1, [10, "true" if value else "false"]], set()
+	return None, set()
+
+
+def _fold_ids_have_external_refs(folded_ids, blocks, owner_id):
+	folded_ids = set(folded_ids)
+	for bid, block in blocks.items():
+		if bid in folded_ids or bid == owner_id or not isinstance(block, dict):
+			continue
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in folded_ids:
+			return True
+		for value in (block.get("inputs") or {}).values():
+			if _input_block_ids(value, blocks) & folded_ids:
+				return True
+	return False
+
+
 def fold_constant_expressions(project, stats, opts):
 	targets = project.get("targets", [])
+	opts.folded_constant_expression_link_edits = {}
 	opts.folded_constant_expression_inputs = {}
 	opts.folded_constant_expression_blocks = [set() for _ in targets]
 	opts.folded_constant_expression_new_blocks = [set() for _ in targets]
@@ -3328,62 +3643,96 @@ def fold_constant_expressions(project, stats, opts):
 			if isinstance(c, dict) and c.get("blockId") is not None
 		}
 
-		plans = []
-		for block_id, block in blocks.items():
-			if not isinstance(block, dict):
-				continue
-			for input_name, input_val in (block.get("inputs") or {}).items():
-				res = _constant_expression_from_input(input_val, blocks)
-				if res is None:
+		while True:
+			changed = False
+			for block_id, block in list(blocks.items()):
+				if not isinstance(block, dict) or block_id not in blocks:
 					continue
-				val, folded_ids = res
-				if not folded_ids:
-					continue
-				if _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
-					continue
-				plans.append((block_id, input_name, val, folded_ids))
+				for input_name, input_val in list((block.get("inputs") or {}).items()):
+					identity = _simplify_boolean_identity_input(
+						input_val, blocks, parent_id=block_id
+					)
+					if identity is not None:
+						replacement, folded_ids = identity
+						if _fold_blocked_by_comment(
+							folded_ids, blocks, commented_ids
+						) or _fold_ids_have_external_refs(
+							folded_ids, blocks, block_id
+						):
+							continue
+						if block_id not in blocks:
+							continue
+						inputs = blocks[block_id].get("inputs") or {}
+						if input_name not in inputs:
+							continue
+						if isinstance(replacement, list):
+							new_input = copy.deepcopy(replacement)
+							new_ids = set()
+						else:
+							new_input, new_ids = _constant_to_scratch_input(
+								replacement, blocks, block_id
+							)
+						if new_input is None:
+							continue
+						if isinstance(replacement, list):
+							for child_id in _input_block_ids(new_input, blocks):
+								child = blocks.get(child_id)
+								if isinstance(child, dict) and child.get("parent") != block_id:
+									opts.folded_constant_expression_link_edits[(ti, child_id, "parent")] = block_id
+							_reparent_serialized_input(new_input, blocks, block_id)
+						inputs[input_name] = new_input
+						opts.folded_constant_expression_inputs[
+							(ti, block_id, input_name)
+						] = copy.deepcopy(new_input)
+						opts.folded_constant_expression_blocks[ti].update(
+							folded_ids
+						)
+						opts.folded_constant_expression_new_blocks[ti].update(
+							new_ids
+						)
+						for remove_id in folded_ids:
+							blocks.pop(remove_id, None)
+						folded += 1
+						changed = True
+						break
 
-		doomed = set()
-		for _, _, _, folded_ids in plans:
-			doomed |= folded_ids
-
-		for block_id, input_name, val, folded_ids in plans:
-			if block_id in doomed:
-				continue
-			inputs = blocks[block_id]["inputs"]
-
-			if isinstance(val, list) and len(val) == 2 and val[0] == _TEXT_TAG:
-				# boolean result
-				if str(val[1]).lower() == "true":
-					# an empty slot inside NOT yields false, so NOT(empty) = true
-					new_not_id = _create_scratch_id()
-					while new_not_id in blocks:
-						new_not_id = _create_scratch_id()
-					blocks[new_not_id] = {
-						"opcode": "operator_not",
-						"next": None,
-						"parent": block_id,
-						"inputs": {"OPERAND": [1, None]},
-						"fields": {},
-						"shadow": False,
-						"topLevel": False,
-					}
-					opts.folded_constant_expression_new_blocks[ti].add(new_not_id)
-					new_input = [2, new_not_id]
-				else:
-					new_input = [2, None]
-			else:
-				# [3, block, shadow] needs a shadow; a plain literal is [1, literal]
-				new_input = [1, val]
-
-			inputs[input_name] = new_input
-			opts.folded_constant_expression_inputs[(ti, block_id, input_name)] = (
-				copy.deepcopy(new_input)
-			)
-			opts.folded_constant_expression_blocks[ti].update(folded_ids)
-			for remove_id in folded_ids:
-				blocks.pop(remove_id, None)
-			folded += 1
+					res = _constant_expression_from_input(input_val, blocks)
+					if res is None:
+						continue
+					constant, folded_ids = res
+					if not folded_ids:
+						continue
+					if _fold_blocked_by_comment(
+						folded_ids, blocks, commented_ids
+					) or _fold_ids_have_external_refs(
+						folded_ids, blocks, block_id
+					):
+						continue
+					if block_id not in blocks:
+						continue
+					inputs = blocks[block_id].get("inputs") or {}
+					if input_name not in inputs:
+						continue
+					new_input, new_ids = _constant_to_scratch_input(
+						constant, blocks, block_id
+					)
+					if new_input is None:
+						continue
+					inputs[input_name] = new_input
+					opts.folded_constant_expression_inputs[(ti, block_id, input_name)] = (
+						copy.deepcopy(new_input)
+					)
+					opts.folded_constant_expression_blocks[ti].update(folded_ids)
+					opts.folded_constant_expression_new_blocks[ti].update(new_ids)
+					for remove_id in folded_ids:
+						blocks.pop(remove_id, None)
+					folded += 1
+					changed = True
+					break
+				if changed:
+					break
+			if not changed:
+				break
 
 	stats["constant_expressions_folded"] += folded
 
@@ -3433,9 +3782,8 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 	print("")
 	print(
 		Ansi.warning(
-			"  This replaces every serialized variable reporter with the variable's "
-			"initial value from project.json. Variables with change-by blocks are marked."
-			" Each folded variable's set block is deleted too (kept if it sets a different value)."
+			"  This replaces variable reporters with the variable's unchanged initial value "
+			"from project.json. Only variables whose setter also restores that same initial value are offered."
 		)
 	)
 	print(
@@ -3832,6 +4180,7 @@ class Options:
 		self.variable_setter_link_edits = {}
 		self.variable_setter_input_edits = {}
 
+		self.folded_constant_expression_link_edits = {}
 		self.folded_constant_expression_inputs = {}
 		self.folded_constant_expression_blocks = []
 		self.folded_constant_expression_new_blocks = []
@@ -4538,8 +4887,13 @@ def _check_blocks(
 					return f"{where} (opcode: {o.get('opcode')}): input {name!r} changed from original {oi!r} to minified {mi!r}"
 		else:
 			link_edits = getattr(opts, "variable_setter_link_edits", None) or {}
-			if k in ("next", "parent") and (target_index, block_id, k) in link_edits:
-				if m[k] == link_edits[(target_index, block_id, k)]:
+			fold_link_edits = getattr(opts, "folded_constant_expression_link_edits", None) or {}
+			if k in ("next", "parent"):
+				link_key = (target_index, block_id, k)
+				expected_link = link_edits.get(link_key)
+				if expected_link is None:
+					expected_link = fold_link_edits.get(link_key)
+				if expected_link is not None and m[k] == expected_link:
 					continue
 			if (
 				allow_repairs
