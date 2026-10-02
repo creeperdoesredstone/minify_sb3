@@ -1598,8 +1598,7 @@ def rename_identifiers(
 				if isinstance(proccode, str) and proccode:
 					old_proccodes.add(proccode)
 
-			# procedure names are kept to a conservative alphanumeric alphabet so
-			# generated names cannot accidentally introduce Scratch block/icon syntax
+			# procedure names use a smaller alphabet so generated names cannot accidentally introduce Scratch block/icon syntax
 			procedure_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 			def short_procedure_name(index):
 				base = len(procedure_alphabet)
@@ -2493,11 +2492,745 @@ def remove_unreachable_blocks(project, stats):
 	return removed
 
 
+def _create_scratch_id():
+	return str(uuid.uuid4()).replace("-", "")[:20]
+
+
 def _procedure_key(block):
 	mut = block.get("mutation") if isinstance(block, dict) else None
 	if not isinstance(mut, dict):
 		return None
 	return mut.get("proccode")
+
+
+SEQUENCE_MAX_PARAMETERS = 8
+
+
+def _sequence_reporter_block(block):
+	if not isinstance(block, dict):
+		return False
+	op = block.get("opcode")
+	if not isinstance(op, str) or not op or block.get("next") is not None:
+		return False
+	if op.startswith(("event_", "procedures_", "control_")):
+		return False
+	if op.startswith(("operator_", "argument_reporter_")):
+		return True
+	if op.startswith("sensing_"):
+		return op not in {"sensing_askandwait"}
+	if op in {
+		"data_variable",
+		"data_itemoflist",
+		"data_lengthoflist",
+		"data_listcontainsitem",
+		"looks_costumenumbername",
+		"looks_backdropnumbername",
+		"looks_size",
+		"sound_volume",
+		"motion_xposition",
+		"motion_yposition",
+		"motion_direction",
+	}:
+		return True
+	return False
+
+
+def _sequence_input_refs(value, blocks):
+	if not isinstance(value, list) or not value:
+		return
+	tag = value[0]
+	if tag in (1, 2):
+		if len(value) > 1 and isinstance(value[1], str) and value[1] in blocks:
+			yield value[1]
+		elif len(value) > 1 and isinstance(value[1], (list, dict)):
+			yield from _sequence_input_refs(value[1], blocks)
+		return
+	if tag == 3:
+		for item in value[1:3]:
+			if isinstance(item, str) and item in blocks:
+				yield item
+			elif isinstance(item, (list, dict)):
+				yield from _sequence_input_refs(item, blocks)
+		return
+	for item in value[1:]:
+		if isinstance(item, (list, dict)):
+			yield from _sequence_input_refs(item, blocks)
+
+
+def _sequence_inline_parameterizable(item):
+	if item is None:
+		return True
+	if not isinstance(item, list):
+		return False
+	if len(item) == 2 and item[0] in _NUMERIC_TAGS + (_TEXT_TAG,):
+		return True
+	if len(item) >= 3 and item[0] in (11, 12, 13):
+		return all(isinstance(x, (str, int, float, bool, type(None))) for x in item[1:])
+	return False
+
+
+def _sequence_input_parameterizable(value, blocks):
+	if not isinstance(value, list) or not value:
+		return False
+	refs = list(_sequence_input_refs(value, blocks))
+	if refs:
+		return all(_sequence_reporter_block(blocks.get(ref)) for ref in refs)
+	if value[0] in (1, 2):
+		return len(value) >= 2 and _sequence_inline_parameterizable(value[1])
+	if value[0] == 3:
+		if len(value) < 2:
+			return False
+		return all(
+			item is None
+			or _sequence_inline_parameterizable(item)
+		or (isinstance(item, str) and item in blocks)
+			for item in value[1:]
+		)
+	return False
+
+
+def _sequence_has_unsafe_nested_inputs(block, blocks):
+	for value in (block.get("inputs") or {}).values():
+		for ref in _sequence_input_refs(value, blocks):
+			if not _sequence_reporter_block(blocks.get(ref)):
+				return True
+	return False
+
+
+def _sequence_block_signature(block, blocks):
+	if not isinstance(block, dict):
+		return None
+	op = block.get("opcode")
+	if not isinstance(op, str) or not op:
+		return None
+	if op.startswith(("event_", "procedures_")):
+		return None
+	if op in {"control_stop", "control_delete_this_clone"}:
+		return None
+	if _sequence_has_unsafe_nested_inputs(block, blocks):
+		return None
+	fields = dumps_compact(block.get("fields") or {})
+	mutation = dumps_compact(block.get("mutation")) if block.get("mutation") is not None else None
+	inputs_sig = []
+	for name in sorted((block.get("inputs") or {}).keys()):
+		value = block["inputs"][name]
+		if _sequence_input_parameterizable(value, blocks):
+			inputs_sig.append((name, "PARAM"))
+		else:
+			inputs_sig.append((name, "FIXED", dumps_compact(value)))
+	return (op, fields, mutation, tuple(inputs_sig))
+
+
+def _sequence_signature(sequence, blocks):
+	parts = []
+	for bid in sequence:
+		sig = _sequence_block_signature(blocks.get(bid), blocks)
+		if sig is None:
+			return None
+		parts.append(sig)
+	return tuple(parts)
+
+
+def _collect_linear_sequence_runs(blocks):
+	incoming_next = set()
+	for block in blocks.values():
+		if isinstance(block, dict):
+			nxt = block.get("next")
+			if isinstance(nxt, str) and nxt in blocks:
+				incoming_next.add(nxt)
+
+	runs = []
+	seen_starts = set()
+	for bid, block in blocks.items():
+		if bid in incoming_next or not isinstance(block, dict):
+			continue
+		op = block.get("opcode", "")
+		if op.startswith("argument_reporter_") or op == "procedures_prototype":
+			continue
+		start = bid
+		if op.startswith("event_") or op == "procedures_definition":
+			start = block.get("next")
+		if not isinstance(start, str) or start not in blocks or start in seen_starts:
+			continue
+
+		sequence = []
+		seen = set()
+		current = start
+		while isinstance(current, str) and current in blocks and current not in seen:
+			b = blocks.get(current)
+			if not isinstance(b, dict):
+				break
+			seen.add(current)
+			sequence.append(current)
+			current = b.get("next")
+		if sequence:
+			runs.append(sequence)
+			seen_starts.add(start)
+	return runs
+
+
+def _sequence_compare(base, other, blocks):
+	if len(base) != len(other):
+		return None
+	diff_positions = []
+	for a_id, b_id in zip(base, other):
+		a = blocks.get(a_id)
+		b = blocks.get(b_id)
+		if not isinstance(a, dict) or not isinstance(b, dict):
+			return None
+		if a.get("opcode") != b.get("opcode"):
+			return None
+		if (a.get("fields") or {}) != (b.get("fields") or {}):
+			return None
+		if a.get("mutation") != b.get("mutation"):
+			return None
+		a_inputs = a.get("inputs") or {}
+		b_inputs = b.get("inputs") or {}
+		if set(a_inputs) != set(b_inputs):
+			return None
+		for name in a_inputs:
+			a_value, b_value = a_inputs[name], b_inputs[name]
+			if a_value == b_value:
+				continue
+			if not (
+				_sequence_input_parameterizable(a_value, blocks)
+				and _sequence_input_parameterizable(b_value, blocks)
+			):
+				return None
+			diff_positions.append((base.index(a_id), name))
+	return diff_positions
+
+
+def _sequence_collect_closure(sequence, blocks):
+	closure = set(sequence)
+	stack = list(sequence)
+	while stack:
+		bid = stack.pop()
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		for value in (block.get("inputs") or {}).values():
+			for ref in _sequence_input_refs(value, blocks):
+				if ref not in closure:
+					closure.add(ref)
+					stack.append(ref)
+	return closure
+
+
+def _sequence_has_external_owner(closure, sequence, blocks, comments):
+	root = sequence[0]
+	root_parent = blocks.get(root, {}).get("parent") if isinstance(blocks.get(root), dict) else None
+	for owner_id, block in blocks.items():
+		if owner_id in closure or not isinstance(block, dict):
+			continue
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt in closure:
+			if owner_id == root_parent and nxt == root:
+				continue
+			return True
+		for input_name, value in (block.get("inputs") or {}).items():
+			refs = set(_sequence_input_refs(value, blocks))
+			if not (refs & closure):
+				continue
+			if owner_id == root_parent and root in refs and refs <= {root}:
+				continue
+			return True
+	for comment in comments.values():
+		if isinstance(comment, dict) and comment.get("blockId") in closure:
+			return True
+	return False
+
+
+def _sequence_replace_direct_ref(value, old_id, new_id):
+	value = copy.deepcopy(value)
+
+	def replace(node):
+		if not isinstance(node, list) or not node:
+			return False
+		tag = node[0]
+		if tag in (1, 2):
+			if len(node) > 1 and node[1] == old_id:
+				node[1] = new_id
+				return True
+			return False
+		if tag == 3:
+			# [3, primary, shadow] may reference either block directly.
+			for i in (1, 2):
+				if len(node) > i and node[i] == old_id:
+					node[i] = new_id
+					return True
+			for i in (1, 2):
+				if len(node) > i and isinstance(node[i], (list, dict)) and replace(node[i]):
+					return True
+			return False
+		for i in range(1, len(node)):
+			child = node[i]
+			if isinstance(child, (list, dict)) and replace(child):
+				return True
+		return False
+
+	if not replace(value):
+		return None
+	return value
+
+
+def _sequence_new_id(blocks, generated):
+	bid = _create_scratch_id()
+	while bid in blocks or bid in generated:
+		bid = _create_scratch_id()
+	return bid
+
+
+def _sequence_clone_input(value, blocks, generated, parent_id):
+	memo = {}
+
+	def clone_block(old_id, parent):
+		if old_id in memo:
+			new_id = memo[old_id]
+			generated[new_id]["parent"] = parent
+			return new_id
+		old = blocks.get(old_id)
+		if not isinstance(old, dict):
+			return old_id
+		new_id = _sequence_new_id(blocks, generated)
+		memo[old_id] = new_id
+		new = copy.deepcopy(old)
+		new["parent"] = parent
+		new.pop("topLevel", None)
+		new.pop("x", None)
+		new.pop("y", None)
+		if new.get("next") is not None:
+			return None
+		new["next"] = None
+		generated[new_id] = new
+		for name, child in list((new.get("inputs") or {}).items()):
+			fixed = clone_value(child, new_id)
+			if fixed is None:
+				return None
+			new["inputs"][name] = fixed
+		return new_id
+
+	def clone_value(v, parent):
+		out = copy.deepcopy(v)
+		if not isinstance(out, list) or not out:
+			return out
+		tag = out[0]
+		if tag in (1, 2) and len(out) > 1 and isinstance(out[1], str) and out[1] in blocks:
+			new_ref = clone_block(out[1], parent)
+			if new_ref is None:
+				return None
+			out[1] = new_ref
+		elif tag == 3:
+			for i in (1, 2):
+				if len(out) <= i:
+					continue
+				if isinstance(out[i], str) and out[i] in blocks:
+					new_ref = clone_block(out[i], parent)
+					if new_ref is None:
+						return None
+					out[i] = new_ref
+				elif isinstance(out[i], (list, dict)):
+					out[i] = clone_value(out[i], parent)
+					if out[i] is None:
+						return None
+		return out
+
+	return clone_value(value, parent_id)
+
+
+def _sequence_default_value(value, blocks):
+	if not isinstance(value, list) or not value:
+		return ""
+	child = value[1] if len(value) > 1 else None
+	if isinstance(child, list):
+		if len(child) == 2 and child[0] in _NUMERIC_TAGS + (_TEXT_TAG,):
+			return str(child[1]) if child[1] is not None else ""
+		if len(child) >= 3 and child[0] in (11, 12, 13):
+			return str(child[1]) if child[1] is not None else ""
+	if isinstance(child, str) and child in blocks:
+		return ""
+	return ""
+
+
+def _sequence_make_argument_reporter(generated, parent_id, arg_id, name, shadow=False, blocks=None):
+	bid = _create_scratch_id()
+	while bid in generated or (blocks is not None and bid in blocks):
+		bid = _create_scratch_id()
+	block = {
+		"opcode": "argument_reporter_string_number",
+		"next": None,
+		"parent": parent_id,
+		"inputs": {},
+		"fields": {"VALUE": [name, None]},
+	}
+	if shadow:
+		block["shadow"] = True
+	generated[bid] = block
+	return bid
+
+
+def _sequence_make_call_input(value, blocks, generated, parent_id):
+	return _sequence_clone_input(value, blocks, generated, parent_id)
+
+
+def group_similar_sequences(project, stats, threshold=3, opts=None):
+	threshold = max(1, int(threshold))
+	for ti, target in enumerate(project.get("targets", [])):
+		blocks = target.get("blocks") or {}
+		comments = target.get("comments") or {}
+		runs = _collect_linear_sequence_runs(blocks)
+		buckets = {}
+		for sequence in runs:
+			if len(sequence) < threshold:
+				continue
+			if any(
+				not isinstance(blocks.get(bid), dict)
+				or "comment" in blocks[bid]
+				for bid in sequence
+			):
+				continue
+			sig = _sequence_signature(sequence, blocks)
+			if sig is not None:
+				buckets.setdefault(sig, []).append(sequence)
+
+		if not buckets:
+			continue
+
+		proc_counter = 0
+		existing_procs = {
+			_procedure_key(block)
+			for block in blocks.values()
+			if isinstance(block, dict)
+			and block.get("opcode") in ("procedures_prototype", "procedures_call")
+			and isinstance(_procedure_key(block), str)
+		}
+
+		for sequences in sorted(
+			buckets.values(), key=lambda group: (-len(group), -len(group[0]))
+		):
+			sequences = [
+				seq for seq in sequences
+				if all(bid in blocks for bid in seq) and len(seq) >= threshold
+			]
+			if len(sequences) < 2:
+				continue
+			base = sequences[0]
+			if any(
+				_sequence_compare(base, seq, blocks) is None
+				for seq in sequences[1:]
+			):
+				continue
+
+			closures = {
+				tuple(seq): _sequence_collect_closure(seq, blocks) for seq in sequences
+			}
+			if any(
+				_sequence_has_external_owner(closure, seq, blocks, comments)
+				for seq, closure in ((seq, closures[tuple(seq)]) for seq in sequences)
+			):
+				continue
+			all_closure_ids = list(closures.values())
+			if any(
+				all_closure_ids[i] & all_closure_ids[j]
+				for i in range(len(all_closure_ids))
+				for j in range(i + 1, len(all_closure_ids))
+			):
+				continue
+
+			param_slots = []
+			for index, block_id in enumerate(base):
+				base_block = blocks[block_id]
+				for input_name, base_value in (base_block.get("inputs") or {}).items():
+					values = [
+						(blocks[seq[index]].get("inputs") or {}).get(input_name)
+						for seq in sequences
+					]
+					if len({dumps_compact(v) for v in values}) <= 1:
+						continue
+					if not all(
+						_sequence_input_parameterizable(v, blocks) for v in values
+					):
+						param_slots = None
+						break
+					param_slots.append((index, input_name, values))
+				if param_slots is None:
+					break
+			if param_slots is None:
+				continue
+
+			param_vectors = {}
+			param_for_slot = {}
+			for index, input_name, values in param_slots:
+				vector = tuple(dumps_compact(v) for v in values)
+				if vector not in param_vectors:
+					param_vectors[vector] = len(param_vectors)
+				param_for_slot[(index, input_name)] = param_vectors[vector]
+			parameter_count = len(param_vectors)
+			if parameter_count > SEQUENCE_MAX_PARAMETERS:
+				continue
+
+			proc_counter_start = proc_counter
+			while True:
+				name = f"group{proc_counter}"
+				proc_counter += 1
+				candidate = name + (
+					" " + " ".join("%s" for _ in range(parameter_count))
+					if parameter_count
+					else ""
+				)
+				if candidate not in existing_procs:
+					proc_name = candidate
+					existing_procs.add(candidate)
+					break
+			if proc_counter_start == proc_counter and proc_name in existing_procs:
+				continue
+
+			generated = {}
+			removed = set()
+			link_changes = []
+			input_changes = []
+			# A single control block can own multiple matched sequences (for example,
+			# the two substacks of an if/else).  Build one merged preview per owner
+			# so later edits do not overwrite earlier edits made by this same group.
+			owner_previews = {}
+
+			argument_ids = []
+			argument_names = []
+			argument_defaults = []
+			for pidx in range(parameter_count):
+				arg_id = _create_scratch_id()
+				while arg_id in generated or arg_id in blocks or arg_id in argument_ids:
+					arg_id = _create_scratch_id()
+				argument_ids.append(arg_id)
+				arg_name = f"p{pidx}"
+				argument_names.append(arg_name)
+				first_values = next(
+					values
+					for index, input_name, values in param_slots
+					if param_for_slot[(index, input_name)] == pidx
+				)
+				argument_defaults.append(_sequence_default_value(first_values[0], blocks))
+
+			proto_id = _sequence_new_id(blocks, generated)
+			def_id = _sequence_new_id(blocks, generated)
+			generated[proto_id] = {
+				"opcode": "procedures_prototype",
+				"next": None,
+				"parent": def_id,
+				"inputs": {},
+				"fields": {},
+				"shadow": True,
+				"mutation": {
+					"tagName": "mutation",
+					"children": [],
+					"proccode": proc_name,
+					"argumentids": json.dumps(argument_ids, separators=(",", ":")),
+					"argumentnames": json.dumps(argument_names, separators=(",", ":")),
+					"argumentdefaults": json.dumps(argument_defaults, separators=(",", ":")),
+					"warp": False,
+				},
+			}
+			for arg_id, arg_name in zip(argument_ids, argument_names):
+				reporter_id = _sequence_make_argument_reporter(
+					generated, proto_id, arg_id, arg_name, shadow=True, blocks=blocks
+				)
+				generated[proto_id]["inputs"][arg_id] = [1, reporter_id]
+
+			body_new_ids = []
+			body_map = {old_id: _sequence_new_id(blocks, generated) for old_id in base}
+			for idx, old_id in enumerate(base):
+				old_original = blocks[old_id]
+				old = copy.deepcopy(old_original)
+				new_id = body_map[old_id]
+				old["parent"] = def_id if idx == 0 else body_map[base[idx - 1]]
+				old["next"] = body_map.get(old_original.get("next"))
+				old.pop("topLevel", None)
+				old.pop("x", None)
+				old.pop("y", None)
+				new_inputs = {}
+				for input_name, original_value in (old_original.get("inputs") or {}).items():
+					param_index = param_for_slot.get((idx, input_name))
+					if param_index is not None:
+						arg_reporter_id = _sequence_make_argument_reporter(
+							generated,
+							new_id,
+							argument_ids[param_index],
+							argument_names[param_index],
+							shadow=False,
+							blocks=blocks,
+						)
+						if (
+							isinstance(original_value, list)
+							and original_value
+							and original_value[0] == 3
+							and len(original_value) > 2
+						):
+							shadow = copy.deepcopy(original_value[2])
+							if isinstance(shadow, str) and shadow in blocks:
+								shadow_value = _sequence_clone_input(
+									[1, shadow], blocks, generated, new_id
+								)
+								if isinstance(shadow_value, list) and len(shadow_value) == 2:
+									shadow = shadow_value[1]
+								else:
+									continue
+							new_inputs[input_name] = [3, arg_reporter_id, shadow]
+						else:
+							new_inputs[input_name] = [2, arg_reporter_id]
+					else:
+						cloned = _sequence_clone_input(
+							original_value, blocks, generated, new_id
+						)
+						if cloned is None:
+							new_inputs = None
+							break
+						new_inputs[input_name] = cloned
+				if new_inputs is None:
+					break
+				old["inputs"] = new_inputs
+				generated[new_id] = old
+				body_new_ids.append(new_id)
+			if len(body_new_ids) != len(base):
+				continue
+
+			generated[def_id] = {
+				"opcode": "procedures_definition",
+				"next": body_new_ids[0],
+				"parent": None,
+				"inputs": {"custom_block": [1, proto_id]},
+				"fields": {},
+				"topLevel": True,
+				"x": 5,
+				"y": 5,
+			}
+
+			construction_ok = True
+			for seq in sequences:
+				root = seq[0]
+				root_block = blocks[root]
+				call_id = _sequence_new_id(blocks, generated)
+				call_inputs = {}
+				for idx, old_id in enumerate(seq):
+					for input_name, value in (blocks[old_id].get("inputs") or {}).items():
+						param_index = param_for_slot.get((idx, input_name))
+						if param_index is None:
+							continue
+						cloned_arg = _sequence_make_call_input(
+							value, blocks, generated, call_id
+						)
+						if cloned_arg is None:
+							construction_ok = False
+							break
+						call_inputs[argument_ids[param_index]] = cloned_arg
+					if not construction_ok:
+						break
+				if not construction_ok:
+					break
+
+				call = {
+					"opcode": "procedures_call",
+					"next": None,
+					"parent": root_block.get("parent"),
+					"inputs": call_inputs,
+					"fields": {},
+					"mutation": {
+						"tagName": "mutation",
+						"children": [],
+						"proccode": proc_name,
+						"argumentids": json.dumps(argument_ids, separators=(",", ":")),
+						"warp": False,
+					},
+				}
+				if root_block.get("topLevel") is True or root_block.get("parent") is None:
+					call["topLevel"] = True
+					call["x"] = root_block.get("x", 5)
+					call["y"] = root_block.get("y", 5)
+				generated[call_id] = call
+
+				parent_id = root_block.get("parent")
+				if isinstance(parent_id, str) and parent_id in blocks:
+					parent_block = owner_previews.get(parent_id, blocks[parent_id])
+					if not isinstance(parent_block, dict):
+						construction_ok = False
+						break
+					if parent_block.get("next") == root:
+						preview = copy.deepcopy(parent_block)
+						preview["next"] = call_id
+						owner_previews[parent_id] = preview
+						link_changes.append(
+							(parent_id, preview, root, call_id)
+						)
+					else:
+						found = False
+						for input_name, input_value in (parent_block.get("inputs") or {}).items():
+							replaced = _sequence_replace_direct_ref(
+								input_value, root, call_id
+							)
+							if replaced is None:
+								continue
+							preview = copy.deepcopy(parent_block)
+							preview["inputs"][input_name] = replaced
+							owner_previews[parent_id] = preview
+							input_changes.append(
+								(parent_id, input_name, preview, replaced, root, call_id)
+							)
+							found = True
+							break
+						if not found:
+							construction_ok = False
+							break
+			if not construction_ok:
+				continue
+
+			for seq in sequences:
+				removed.update(closures[tuple(seq)])
+
+			old_target_bytes = _json_len(target)
+			candidate_blocks = dict(blocks)
+			for owner_id, preview in owner_previews.items():
+				candidate_blocks[owner_id] = preview
+			for new_id, block in generated.items():
+				candidate_blocks[new_id] = block
+			for old_id in removed:
+				candidate_blocks.pop(old_id, None)
+			candidate_target = copy.copy(target)
+			candidate_target["blocks"] = candidate_blocks
+			new_target_bytes = _json_len(candidate_target)
+			byte_delta = old_target_bytes - new_target_bytes
+
+			if byte_delta <= 0:
+				if opts is not None:
+					opts.grouped_sequence_rejected_size += 1
+				stats["sequence_groups_rejected_size"] += 1
+				continue
+
+			for owner_id, preview in owner_previews.items():
+				blocks[owner_id] = preview
+			for new_id, block in generated.items():
+				blocks[new_id] = block
+			for old_id in removed:
+				blocks.pop(old_id, None)
+
+			if opts is not None:
+				while len(opts.grouped_sequence_removed_blocks) <= ti:
+					opts.grouped_sequence_removed_blocks.append(set())
+				while len(opts.grouped_sequence_new_blocks) <= ti:
+					opts.grouped_sequence_new_blocks.append(set())
+				opts.grouped_sequence_removed_blocks[ti].update(removed)
+				opts.grouped_sequence_new_blocks[ti].update(generated)
+				for owner_id, _preview, _old, new_value in link_changes:
+					opts.grouped_sequence_link_edits[(ti, owner_id, "next")] = new_value
+				for owner_id, input_name, _preview, new_value, _old, _call in input_changes:
+					opts.grouped_sequence_input_edits[(ti, owner_id, input_name)] = copy.deepcopy(
+						new_value
+					)
+			stats["sequence_groups_created"] += 1
+			stats["sequences_grouped"] += len(sequences)
+			stats["sequence_procedures_created"] += 1
+			stats["sequence_parameters"] += parameter_count
+			stats["sequence_blocks_removed"] += len(removed)
+			stats["sequence_blocks_added"] += len(generated)
+			stats["sequence_bytes_saved"] += byte_delta
 
 
 def remove_unused_procedures(project, stats):
@@ -2825,7 +3558,7 @@ def _is_literal_value(value):
 	if tag in _NUMERIC_TAGS:
 		return (
 			not isinstance(raw, bool)
-			and isinstance(raw, (bool, str, int, float))
+			and isinstance(raw, (str, int, float))
 			and (not isinstance(raw, float) or math.isfinite(raw))
 		)
 	return tag == _TEXT_TAG and isinstance(raw, str)
@@ -2843,6 +3576,7 @@ def _find_constant_variables(project):
 	setter_ids = {}
 	setter_locations = {}
 	literal_setter_values = {}
+	literal_setters = set()
 
 	def scan_input(value, ti):
 		if not isinstance(value, list) or not value:
@@ -2876,6 +3610,7 @@ def _find_constant_variables(project):
 							literal_setter_values.setdefault(owner, []).append(
 								copy.deepcopy(value[1])
 							)
+							literal_setters.add(owner)
 					elif block.get("opcode") == "data_changevariableby":
 						change_counts[owner] = change_counts.get(owner, 0) + 1
 			for value in (block.get("inputs") or {}).values():
@@ -2887,6 +3622,7 @@ def _find_constant_variables(project):
 		# Ex: a `set variable to 5` on an initially-0 variable is not constant.
 		if (
 			count != 1
+			or owner not in literal_setters
 			or reporter_counts.get(owner, 0) <= 0
 			or change_counts.get(owner, 0) > 0
 		):
@@ -3096,37 +3832,6 @@ def remove_constant_variable_setters(project, setters, stats, opts):
 	return removed
 
 
-def _numeric_primitive_value(value):
-	if not (isinstance(value, list) and len(value) == 2 and value[0] in _NUMERIC_TAGS):
-		return None
-	raw = value[1]
-	if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
-		return None
-	try:
-		if isinstance(raw, str):
-			text = raw.strip()
-			prefixes = (
-				("0b", 2, "01"),
-				("0o", 8, "01234567"),
-				("0x", 16, "0123456789abcdef"),
-			)
-			prefix = next(
-				(item for item in prefixes if text.lower().startswith(item[0])), None
-			)
-			if prefix is not None:
-				digits = text[2:].lower()
-				if not digits or any(digit not in prefix[2] for digit in digits):
-					return None
-				number = float(int(digits, prefix[1]))
-			else:
-				number = float(raw)
-		else:
-			number = float(raw)
-	except (TypeError, ValueError, OverflowError):
-		return None
-	return number if math.isfinite(number) else None
-
-
 def _to_scratch_number(val):
 	"""Scratch Cast.toNumber implementation"""
 	if isinstance(val, bool):
@@ -3162,7 +3867,7 @@ def _to_scratch_number(val):
 		except (ValueError, OverflowError, TypeError):
 			return 0.0
 		if math.isnan(num):
-			# Cast.toNumber maps NaN to 0.
+			# Cast.toNumber maps NaN to 0
 			return 0.0
 		return num
 	return 0.0
@@ -4175,6 +4880,7 @@ class Options:
 		fold_constant_variables=False,
 		fold_constant_expressions=False,
 		group_similar_sequences=False,
+		sequence_threshold=3,
 	):
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
@@ -4229,6 +4935,7 @@ class Options:
 		self.fold_constant_variables = fold_constant_variables
 		self.fold_constant_expressions = fold_constant_expressions
 		self.group_similar_sequences = group_similar_sequences
+		self.sequence_threshold = max(1, int(sequence_threshold))
 
 		self.renamed_block_ids = {}
 		self.renamed_variable_ids = {}
@@ -4259,6 +4966,12 @@ class Options:
 		self.folded_constant_expression_blocks = []
 		self.folded_constant_expression_new_blocks = []
 
+		self.grouped_sequence_removed_blocks = []
+		self.grouped_sequence_new_blocks = []
+		self.grouped_sequence_link_edits = {}
+		self.grouped_sequence_input_edits = {}
+		self.grouped_sequence_rejected_size = 0
+
 
 def apply_transforms(project, opts: Options, assets=None):
 	stats = minify_blocks(project)
@@ -4287,6 +5000,8 @@ def apply_transforms(project, opts: Options, assets=None):
 		)
 	if opts.fold_constant_expressions:
 		fold_constant_expressions(project, stats, opts)
+	if opts.group_similar_sequences:
+		group_similar_sequences(project, stats, opts.sequence_threshold, opts)
 	if opts.remove_unused_variables or opts.remove_unused_lists:
 		remove_unused_data(
 			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
@@ -4957,6 +5672,20 @@ def _check_blocks(
 					)
 				):
 					continue
+				grouped_inputs = getattr(opts, "grouped_sequence_input_edits", {}) or {}
+				grouped_input = grouped_inputs.get((target_index, block_id, name))
+				if grouped_input is not None and (
+					grouped_input == mi
+					or _check_inputs_match(
+						grouped_input,
+						mi,
+						opts,
+						original_blocks,
+						remaining_blocks,
+						target_index,
+					)
+				):
+					continue
 				if not _check_inputs_match(
 					oi, mi, opts, original_blocks, remaining_blocks, target_index
 				):
@@ -4964,11 +5693,14 @@ def _check_blocks(
 		else:
 			link_edits = getattr(opts, "variable_setter_link_edits", None) or {}
 			fold_link_edits = getattr(opts, "folded_constant_expression_link_edits", None) or {}
+			group_link_edits = getattr(opts, "grouped_sequence_link_edits", None) or {}
 			if k in ("next", "parent"):
 				link_key = (target_index, block_id, k)
 				expected_link = link_edits.get(link_key)
 				if expected_link is None:
 					expected_link = fold_link_edits.get(link_key)
+				if expected_link is None:
+					expected_link = group_link_edits.get(link_key)
 				if expected_link is not None and m[k] == expected_link:
 					continue
 			if (
@@ -5364,6 +6096,9 @@ def _expected_removed_blocks(project, opts):
 		setter_blocks = getattr(opts, "removed_variable_setter_blocks", ())
 		if ti < len(setter_blocks):
 			ids.update(setter_blocks[ti])
+		grouped_removed = getattr(opts, "grouped_sequence_removed_blocks", ())
+		if ti < len(grouped_removed):
+			ids.update(grouped_removed[ti])
 		allowed.append(ids)
 	return allowed
 
@@ -5736,6 +6471,11 @@ def verify(original_path, minified_path, opts):
 			allowed_new_blocks = (
 				new_block_sets[ti] if ti < len(new_block_sets) else set()
 			)
+			group_new_block_sets = (
+				getattr(opts, "grouped_sequence_new_blocks", None) or []
+			)
+			if ti < len(group_new_block_sets):
+				allowed_new_blocks = set(allowed_new_blocks) | set(group_new_block_sets[ti])
 			unexpected_blocks = (
 				set(tm["blocks"]) - set(to["blocks"]) - allowed_new_blocks
 			)
@@ -6004,6 +6744,14 @@ STAT_ORDER = [
 	("list_ids", "list IDs renamed"),
 	("broadcast_ids", "broadcast IDs renamed"),
 	("argument_ids", "argument IDs renamed"),
+	("sequence_groups_created", "similar sequence groups created"),
+	("sequence_groups_rejected_size", "sequence groups rejected"),
+	("sequences_grouped", "sequence instances grouped"),
+	("sequence_procedures_created", "sequence procedures created"),
+	("sequence_parameters", "sequence parameters created"),
+	("sequence_blocks_removed", "sequence blocks removed"),
+	("sequence_blocks_added", "sequence procedure blocks added"),
+	("sequence_bytes_saved", "sequence grouping byte delta"),
 	("variables_removed", "unused variables removed"),
 	("lists_removed", "unused lists removed"),
 	("broadcasts_removed", "unused broadcasts removed"),
@@ -6200,6 +6948,7 @@ if __name__ == "__main__":
 		"--list-items",
 		"--compression-level",
 		"--normalize-epsilon",
+		"--sequence-threshold",
 	}
 	values, bad = {}, []
 	for f in flags:
@@ -6231,7 +6980,7 @@ if __name__ == "__main__":
 		print(Ansi.error(f"Unknown or malformed option(s): {bad}"))
 		print(
 			Ansi.muted(
-				f"Valid: {sorted(toggles)} and --list-bytes=N --list-items=N (positive), --compression-level=N (0-9), --normalize-epsilon=N (positive)"
+				f"Valid: {sorted(toggles)} and --list-bytes=N --list-items=N --sequence-threshold=N (positive), --compression-level=N (0-9), --normalize-epsilon=N (positive)"
 			)
 		)
 		sys.exit(1)
@@ -6304,6 +7053,7 @@ if __name__ == "__main__":
 		fold_constant_expressions=all_optimizations
 		or "--fold-constant-expressions" in flags,
 		group_similar_sequences="--group-similar-sequences" in flags,
+		sequence_threshold=values.get("--sequence-threshold", 3),
 		compress_assets=all_optimizations or "--compress-assets" in flags,
 		convert_wav_to_mp3=all_optimizations or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
