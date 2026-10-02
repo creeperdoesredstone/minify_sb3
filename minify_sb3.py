@@ -2993,9 +2993,6 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			removed = set()
 			link_changes = []
 			input_changes = []
-			# A single control block can own multiple matched sequences (for example,
-			# the two substacks of an if/else).  Build one merged preview per owner
-			# so later edits do not overwrite earlier edits made by this same group.
 			owner_previews = {}
 
 			argument_ids = []
@@ -4016,7 +4013,7 @@ def _folded_literal_input(value):
 		return None
 	child = value[1]
 	if value[0] == 3 and isinstance(child, str):
-		# A block reference; this is not a literal.
+		# block ref
 		return None
 	if isinstance(child, list) and len(child) == 2:
 		tag, raw = child
@@ -4221,7 +4218,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 			return None
 		return _constant("number", res), operand[1] | {block_id}
 
-	# Binary numeric operators.
+	# binary operators
 	left = get_in("NUM1")
 	right = get_in("NUM2")
 	if left is None or right is None:
@@ -4603,138 +4600,6 @@ def _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
 	)
 
 
-def _demorgan_boolean_input(value, blocks, owner_id=None):
-	"""
-	Apply De Morgan's law in exactly one direction:
-
-	    (not a) and (not b) -> not (a or b)
-	    (not a) or  (not b) -> not (a and b)
-
-	The reverse direction is deliberately never attempted.
-
-	Only the canonical direct-block shape is rewritten. The existing NOT and
-	logical blocks are reused, and only the redundant right NOT block is removed.
-	Unusual/shared structures are rejected rather than reinterpreted.
-	"""
-	if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
-		return None
-
-	logic_id = value[1]
-	if not isinstance(logic_id, str) or logic_id not in blocks:
-		return None
-	logic = blocks.get(logic_id)
-	if not isinstance(logic, dict) or logic.get("opcode") not in ("operator_and", "operator_or"):
-		return None
-	if owner_id is not None:
-		if owner_id == logic_id or logic.get("parent") != owner_id:
-			return None
-		if _fold_ids_have_external_refs({logic_id}, blocks, owner_id):
-			return None
-
-	inputs = logic.get("inputs") or {}
-	left_raw = inputs.get("OPERAND1")
-	right_raw = inputs.get("OPERAND2")
-	for raw in (left_raw, right_raw):
-		if not (
-			isinstance(raw, list)
-			and len(raw) > 1
-			and raw[0] in (2, 3)
-			and isinstance(raw[1], str)
-		):
-			return None
-
-	left_not_id = left_raw[1]
-	right_not_id = right_raw[1]
-	if (
-		left_not_id == right_not_id
-		or left_not_id in (logic_id, owner_id)
-		or right_not_id in (logic_id, owner_id)
-	):
-		return None
-	if _fold_ids_have_external_refs({left_not_id}, blocks, logic_id):
-		return None
-	if _fold_ids_have_external_refs({right_not_id}, blocks, logic_id):
-		return None
-
-	left_not = blocks.get(left_not_id)
-	right_not = blocks.get(right_not_id)
-	if not (
-		isinstance(left_not, dict)
-		and isinstance(right_not, dict)
-		and left_not.get("opcode") == "operator_not"
-		and right_not.get("opcode") == "operator_not"
-	):
-		return None
-
-	# Reporter blocks should not carry statement chains.
-	if (
-		logic.get("next") is not None
-		or left_not.get("next") is not None
-		or right_not.get("next") is not None
-	):
-		return None
-	if left_not.get("parent") != logic_id or right_not.get("parent") != logic_id:
-		return None
-
-	left_inputs = left_not.get("inputs") or {}
-	right_inputs = right_not.get("inputs") or {}
-	left_operand = left_inputs.get("OPERAND")
-	right_operand = right_inputs.get("OPERAND")
-	if not (
-		isinstance(left_operand, list)
-		and len(left_operand) > 1
-		and isinstance(right_operand, list)
-		and len(right_operand) > 1
-	):
-		return None
-
-	# The operand trees are moved from the NOT blocks to the new inner
-	# logical block, so they must not be shared elsewhere.
-	left_owned = _exclusive_input_block_subtree(left_operand, blocks, left_not_id)
-	right_owned = _exclusive_input_block_subtree(right_operand, blocks, right_not_id)
-	if left_owned is None or right_owned is None:
-		return None
-
-	left_root = left_operand[1] if isinstance(left_operand[1], str) else None
-	right_root = right_operand[1] if isinstance(right_operand[1], str) else None
-	if left_root and left_root == right_root:
-		return None
-	for root in (left_root, right_root):
-		if root in (logic_id, left_not_id, right_not_id, owner_id):
-			return None
-
-	# Caller-owned input: point the containing block at the surviving outer NOT.
-	# Use the primary-block form so an existing owner shadow is not duplicated
-	# into the new outer NOT input.
-	new_owner_input = [2, left_not_id]
-
-	# Outer NOT input: point at the repurposed logical block while preserving the
-	# original left operand's input/shadow representation.
-	new_outer_input = copy.deepcopy(left_operand)
-	new_outer_input[1] = logic_id
-
-	return {
-		"logic_id": logic_id,
-		"left_not_id": left_not_id,
-		"right_not_id": right_not_id,
-		"old_logic_parent": logic.get("parent"),
-		"new_owner_input": new_owner_input,
-		"new_outer_input": new_outer_input,
-		"new_inner_left": copy.deepcopy(left_operand),
-		"new_inner_right": copy.deepcopy(right_operand),
-		"new_inner_opcode": (
-			"operator_or"
-			if logic.get("opcode") == "operator_and"
-			else "operator_and"
-		),
-		"changed_ids": (
-			{logic_id, left_not_id, right_not_id}
-			| left_owned
-			| right_owned
-		),
-	}
-
-
 def _direct_input_block_refs(value, blocks):
     """Return block IDs directly stored as primary/shadow refs in one input."""
     if not isinstance(value, list) or not value:
@@ -4923,13 +4788,8 @@ def _demorgan_boolean_input(value, blocks, owner_id=None, incoming_refs=None):
         if root in (logic_id, left_not_id, right_not_id, owner_id):
             return None
 
-    # The containing block retains its input/shadow representation, but now
-    # points to the surviving left NOT.
     new_owner_input = copy.deepcopy(value)
     new_owner_input[1] = left_not_id
-
-    # The outer NOT receives the repurposed logical block. Primary-only avoids
-    # sharing the left operand's shadow block between two inputs.
     new_outer_input = [2, logic_id]
 
     return {
