@@ -7,10 +7,10 @@ import subprocess
 import sys
 import zipfile
 import zlib
+import uuid
 from collections import Counter
 
-
-BLOCK_ID_ALPHABET = '!@#$%^*()+_-={}|[]:;?,./~ABCDEFGHJKLMNOPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789'
+BLOCK_ID_ALPHABET = "!@#$%^*()+_-={}|[]:;?,./~ABCDEFGHJKLMNOPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789"
 
 
 class Ansi:
@@ -144,7 +144,9 @@ def rename_block_ids(project, stats, frequency_order=False):
 		block_ids = _rename_id_map(old_ids, existing_ids=dangling)
 		all_maps[ti] = block_ids
 
-		new_blocks = {block_ids.get(old_id, old_id): block for old_id, block in blocks.items()}
+		new_blocks = {
+			block_ids.get(old_id, old_id): block for old_id, block in blocks.items()
+		}
 		for block in new_blocks.values():
 			if isinstance(block, dict):
 				for key in ("next", "parent"):
@@ -153,8 +155,14 @@ def rename_block_ids(project, stats, frequency_order=False):
 				for value in (block.get("inputs") or {}).values():
 					_replace_input_block_ids(value, block_ids)
 		for comment in (target.get("comments") or {}).values():
-			if isinstance(comment, dict) and "blockId" in comment and comment["blockId"] is not None:
-				comment["blockId"] = block_ids.get(comment["blockId"], comment["blockId"])
+			if (
+				isinstance(comment, dict)
+				and "blockId" in comment
+				and comment["blockId"] is not None
+			):
+				comment["blockId"] = block_ids.get(
+					comment["blockId"], comment["blockId"]
+				)
 		target["blocks"] = new_blocks
 		total_stats += len(block_ids)
 
@@ -287,7 +295,6 @@ def round_positions(project, stats):
 						stats["rounded"] += 1
 
 
-# input type tags whose obscured shadow holds a plain number / text literal
 _NUMERIC_TAGS = (4, 5, 6, 7, 8)  # number, positive, whole, integer, angle
 _TEXT_TAG = 10
 
@@ -381,18 +388,20 @@ def clean_monitors(project, stats):
 		if is_list and m.get("params"):
 			m["params"] = {}
 			stats["monitor_params"] += 1
-		
+
 		want = [] if is_list else 0
 		if "value" in m and m["value"] != want:
 			m["value"] = want
 			stats["monitor_value"] += 1
 		kept.append(m)
-	
+
 	project["monitors"] = kept
 
 
 def dumps_compact(obj, sort_keys=False):
-	return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, sort_keys=sort_keys)
+	return json.dumps(
+		obj, separators=(",", ":"), ensure_ascii=False, sort_keys=sort_keys
+	)
 
 
 LIST_READ_OPS = {
@@ -583,9 +592,7 @@ def _parse_selection(text, n) -> set[str]:
 	return chosen
 
 
-def prompt_for_lists(
-	project, candidates, project_bytes
-) -> set | None:
+def prompt_for_lists(project, candidates, project_bytes) -> set | None:
 	"""
 	Interactively decide which large lists to clear.
 	Returns a set of (target_index, list_id) to clear, or None if the user aborted.
@@ -635,7 +642,9 @@ def prompt_for_lists(
 	while True:
 		try:
 			answer = (
-				input(Ansi.prompt("Clear which lists? [Enter = keep all] > ")).strip().lower()
+				input(Ansi.prompt("Clear which lists? [Enter = keep all] > "))
+				.strip()
+				.lower()
 			)
 		except EOFError:
 			print(Ansi.muted("\n(no input available, keeping all lists)"))
@@ -693,7 +702,9 @@ def prompt_for_lists(
 		)
 		if risky:
 			print(
-				Ansi.warning(f"  WARNING: {len(risky)} of them are used by the project:")
+				Ansi.warning(
+					f"  WARNING: {len(risky)} of them are used by the project:"
+				)
 			)
 			for c in risky:
 				print(f"    - [{c['scope']}] {c['name']!r}: {c['label']}")
@@ -751,8 +762,14 @@ def _field_id(block, names):
 def _collect_data_references(project, var_owners=None, list_owners=None):
 	targets = project.get("targets", [])
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
-	stage_var_ids = set(targets[stage_index].get("variables", {})) if stage_index is not None else set()
-	stage_list_ids = set(targets[stage_index].get("lists", {})) if stage_index is not None else set()
+	stage_var_ids = (
+		set(targets[stage_index].get("variables", {}))
+		if stage_index is not None
+		else set()
+	)
+	stage_list_ids = (
+		set(targets[stage_index].get("lists", {})) if stage_index is not None else set()
+	)
 
 	var_refs = {}
 	list_refs = {}
@@ -814,14 +831,28 @@ def _collect_data_references(project, var_owners=None, list_owners=None):
 
 			if block.get("opcode") == "sensing_of_property_menu":
 				prop_field = fields.get("PROPERTY")
-				if isinstance(prop_field, list) and len(prop_field) > 0 and isinstance(prop_field[0], str):
+				if (
+					isinstance(prop_field, list)
+					and len(prop_field) > 0
+					and isinstance(prop_field[0], str)
+				):
 					prop_name = prop_field[0]
 					for target_idx, t in enumerate(targets):
 						for vid, vdata in (t.get("variables") or {}).items():
-							if isinstance(vdata, list) and len(vdata) > 0 and vdata[0] == prop_name:
-								add_var_ref(target_idx, vid, f"sensing_of property {prop_name!r} in {desc}")
+							if (
+								isinstance(vdata, list)
+								and len(vdata) > 0
+								and vdata[0] == prop_name
+							):
+								add_var_ref(
+									target_idx,
+									vid,
+									f"sensing_of property {prop_name!r} in {desc}",
+								)
 
-	name_to_index = {t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")}
+	name_to_index = {
+		t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")
+	}
 	for m in project.get("monitors", []):
 		if not isinstance(m, dict):
 			continue
@@ -872,13 +903,23 @@ def _replace_field_id(block, field_names, mapping):
 	return changed
 
 
-def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists=True, frequency_order=False):
+def rename_variable_list_ids(
+	project, stats, rename_variables=True, rename_lists=True, frequency_order=False
+):
 	targets = project.get("targets", [])
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
-	stage_var_ids = set(targets[stage_index].get("variables", {})) if stage_index is not None else set()
-	stage_list_ids = set(targets[stage_index].get("lists", {})) if stage_index is not None else set()
+	stage_var_ids = (
+		set(targets[stage_index].get("variables", {}))
+		if stage_index is not None
+		else set()
+	)
+	stage_list_ids = (
+		set(targets[stage_index].get("lists", {})) if stage_index is not None else set()
+	)
 
-	var_refs, list_refs, _ = _collect_data_references(project) if frequency_order else ({}, {}, {})
+	var_refs, list_refs, _ = (
+		_collect_data_references(project) if frequency_order else ({}, {}, {})
+	)
 
 	var_map = {}
 	list_map = {}
@@ -890,7 +931,9 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 		for ti, target in enumerate(targets):
 			if ti == stage_index:
 				continue
-			local_ids = set((target.get("variables") if tag == 12 else target.get("lists")) or {})
+			local_ids = set(
+				(target.get("variables") if tag == 12 else target.get("lists")) or {}
+			)
 
 			def scan(value):
 				if isinstance(value, list):
@@ -912,7 +955,12 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 					continue
 				field_key = "VARIABLE" if tag == 12 else "LIST"
 				f = (block.get("fields") or {}).get(field_key)
-				if isinstance(f, list) and len(f) > 1 and f[1] in stage_ids and f[1] not in local_ids:
+				if (
+					isinstance(f, list)
+					and len(f) > 1
+					and f[1] in stage_ids
+					and f[1] not in local_ids
+				):
 					hits.add(ti)
 				for value in (block.get("inputs") or {}).values():
 					scan(value)
@@ -922,16 +970,29 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 				if not isinstance(m, dict) or m.get("spriteName") != target.get("name"):
 					continue
 				op = "data_variable" if tag == 12 else "data_listcontents"
-				if m.get("opcode") == op and m.get("id") in stage_ids and m.get("id") not in local_ids:
+				if (
+					m.get("opcode") == op
+					and m.get("id") in stage_ids
+					and m.get("id") not in local_ids
+				):
 					hits.add(ti)
 		return hits
 
 	allocated_ids = set()
 	if rename_variables:
-		stage_ids = list(targets[stage_index].get("variables", {}).keys()) if stage_index is not None else []
+		stage_ids = (
+			list(targets[stage_index].get("variables", {}).keys())
+			if stage_index is not None
+			else []
+		)
 		if frequency_order and stage_index is not None:
-			stage_ids = sorted(stage_ids, key=lambda vid: (-len(var_refs.get((stage_index, vid), [])), vid))
-		stage_new_ids = _rename_id_map(stage_ids, existing_ids=allocated_ids) if stage_ids else {}
+			stage_ids = sorted(
+				stage_ids,
+				key=lambda vid: (-len(var_refs.get((stage_index, vid), [])), vid),
+			)
+		stage_new_ids = (
+			_rename_id_map(stage_ids, existing_ids=allocated_ids) if stage_ids else {}
+		)
 		allocated_ids.update(stage_new_ids.values())
 		if stage_index is not None:
 			for old, new in stage_new_ids.items():
@@ -943,16 +1004,27 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 			if not ids:
 				continue
 			if frequency_order:
-				ids = sorted(ids, key=lambda vid: (-len(var_refs.get((ti, vid), [])), vid))
+				ids = sorted(
+					ids, key=lambda vid: (-len(var_refs.get((ti, vid), [])), vid)
+				)
 			new_ids = _rename_id_map(ids, existing_ids=allocated_ids)
 			allocated_ids.update(new_ids.values())
 			for old, new in new_ids.items():
 				var_map[(ti, old)] = new
 	if rename_lists:
-		stage_ids = list(targets[stage_index].get("lists", {}).keys()) if stage_index is not None else []
+		stage_ids = (
+			list(targets[stage_index].get("lists", {}).keys())
+			if stage_index is not None
+			else []
+		)
 		if frequency_order and stage_index is not None:
-			stage_ids = sorted(stage_ids, key=lambda lid: (-len(list_refs.get((stage_index, lid), [])), lid))
-		stage_new_ids = _rename_id_map(stage_ids, existing_ids=allocated_ids) if stage_ids else {}
+			stage_ids = sorted(
+				stage_ids,
+				key=lambda lid: (-len(list_refs.get((stage_index, lid), [])), lid),
+			)
+		stage_new_ids = (
+			_rename_id_map(stage_ids, existing_ids=allocated_ids) if stage_ids else {}
+		)
 		allocated_ids.update(stage_new_ids.values())
 		if stage_index is not None:
 			for old, new in stage_new_ids.items():
@@ -964,7 +1036,9 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 			if not ids:
 				continue
 			if frequency_order:
-				ids = sorted(ids, key=lambda lid: (-len(list_refs.get((ti, lid), [])), lid))
+				ids = sorted(
+					ids, key=lambda lid: (-len(list_refs.get((ti, lid), [])), lid)
+				)
 			new_ids = _rename_id_map(ids, existing_ids=allocated_ids)
 			allocated_ids.update(new_ids.values())
 			for old, new in new_ids.items():
@@ -1021,7 +1095,7 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 			}
 
 		for block in target.get("blocks", {}).values():
-			if isinstance(block, list):        # [12/13, name, id, x, y]
+			if isinstance(block, list):  # [12/13, name, id, x, y]
 				if len(block) > 2 and block[0] == 12:
 					block[2] = rewrite_var(ti, block[2])
 				elif len(block) > 2 and block[0] == 13:
@@ -1039,7 +1113,9 @@ def rename_variable_list_ids(project, stats, rename_variables=True, rename_lists
 			for value in (block.get("inputs") or {}).values():
 				rewrite_nested(ti, value)
 
-	name_to_index = {t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")}
+	name_to_index = {
+		t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")
+	}
 	for m in project.get("monitors", []):
 		if not isinstance(m, dict):
 			continue
@@ -1073,7 +1149,12 @@ def _replace_nested_primitive_ids(value, var_map, list_map):
 def _replace_broadcast_ids_in_value(value, mapping):
 	if not isinstance(value, list) or not value:
 		return
-	if len(value) > 2 and value[0] == 11 and isinstance(value[2], str) and value[2] in mapping:
+	if (
+		len(value) > 2
+		and value[0] == 11
+		and isinstance(value[2], str)
+		and value[2] in mapping
+	):
 		value[2] = mapping[value[2]]
 	else:
 		for v in value:
@@ -1100,11 +1181,15 @@ def _collect_broadcast_references(project):
 			for field_name in ("BROADCAST_OPTION", "BROADCAST_INPUT"):
 				f = (block.get("fields") or {}).get(field_name)
 				if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str):
-					add(f[1], f[0] if isinstance(f[0], str) else None,
-						f"block {bid!r} ({block.get('opcode')}) in {tname!r}")
+					add(
+						f[1],
+						f[0] if isinstance(f[0], str) else None,
+						f"block {bid!r} ({block.get('opcode')}) in {tname!r}",
+					)
 			for value in (block.get("inputs") or {}).values():
-				_collect_broadcast_refs_in_value(value, add,
-						f"block {bid!r} ({block.get('opcode')}) in {tname!r}")
+				_collect_broadcast_refs_in_value(
+					value, add, f"block {bid!r} ({block.get('opcode')}) in {tname!r}"
+				)
 	return refs
 
 
@@ -1127,7 +1212,6 @@ def _all_broadcast_ids(project):
 
 
 def _repair_dangling_broadcast_refs(project, stats):
-	"""Restore missing broadcast definitions only when their name is unambiguous."""
 	targets = project.get("targets", [])
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
 	if stage_index is None:
@@ -1153,10 +1237,11 @@ def _repair_dangling_broadcast_refs(project, stats):
 		stats["broadcast_ref_conflicts"] += len(conflicts)
 	return repaired, conflicts
 
+
 def rename_broadcast_ids(project, stats, existing_ids=(), frequency_order=False):
 	ids = set()
 	for target in project.get("targets", []):
-		for old_id in (target.get("broadcasts") or {}):
+		for old_id in target.get("broadcasts") or {}:
 			ids.add(old_id)
 		for block in target.get("blocks", {}).values():
 			if isinstance(block, dict):
@@ -1175,7 +1260,8 @@ def rename_broadcast_ids(project, stats, existing_ids=(), frequency_order=False)
 	for target in project.get("targets", []):
 		if target.get("broadcasts"):
 			target["broadcasts"] = {
-				mapping.get(old, old): name for old, name in target["broadcasts"].items()
+				mapping.get(old, old): name
+				for old, name in target["broadcasts"].items()
 			}
 		for block in target.get("blocks", {}).values():
 			if not isinstance(block, dict):
@@ -1213,13 +1299,16 @@ def _parse_argumentids(mut):
 
 
 def rename_argument_ids(project, stats):
-	mapping = {}   # {(target_index, proccode, old_id): new_id} -- for the verifier
+	mapping = {}  # {(target_index, proccode, old_id): new_id} -- for the verifier
 	total = 0
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks", {})
 		by_proccode = {}
 		for bid, b in blocks.items():
-			if not isinstance(b, dict) or b.get("opcode") not in ("procedures_prototype", "procedures_call"):
+			if not isinstance(b, dict) or b.get("opcode") not in (
+				"procedures_prototype",
+				"procedures_call",
+			):
 				continue
 			vals = _parse_argumentids(b.get("mutation"))
 			if vals is None:
@@ -1238,7 +1327,9 @@ def rename_argument_ids(project, stats):
 			for bid, vals in entries:
 				b = blocks[bid]
 				b["mutation"]["argumentids"] = json.dumps(
-					[local_map.get(x, x) for x in vals], separators=(",", ":"), ensure_ascii=False
+					[local_map.get(x, x) for x in vals],
+					separators=(",", ":"),
+					ensure_ascii=False,
 				)
 				inputs = b.get("inputs") or {}
 				b["inputs"] = {local_map.get(k, k): v for k, v in inputs.items()}
@@ -1263,7 +1354,9 @@ def remove_unused_data(project, stats, remove_variables=True, remove_lists=True)
 			variables = target.get("variables") or {}
 			for vid in list(variables):
 				entry = variables[vid]
-				is_cloud = isinstance(entry, list) and len(entry) > 2 and entry[2] is True
+				is_cloud = (
+					isinstance(entry, list) and len(entry) > 2 and entry[2] is True
+				)
 				if (ti, vid) not in used_vars and not is_cloud:
 					del variables[vid]
 					removed_vars += 1
@@ -1296,14 +1389,18 @@ def _is_hat(block):
 	if not isinstance(block, dict):
 		return False
 	op = block.get("opcode", "")
-	return op.endswith("_whenflagclicked") or op.endswith("_whenkeypressed") or (
-		op.startswith("event_when") or op.startswith("control_start_as_clone")
-	) or op in {
-		"event_whenthisspriteclicked",
-		"event_whenbackdropswitchesto",
-		"event_whenbroadcastreceived",
-		"event_whengreaterthan",
-	}
+	return (
+		op.endswith("_whenflagclicked")
+		or op.endswith("_whenkeypressed")
+		or (op.startswith("event_when") or op.startswith("control_start_as_clone"))
+		or op
+		in {
+			"event_whenthisspriteclicked",
+			"event_whenbackdropswitchesto",
+			"event_whenbroadcastreceived",
+			"event_whengreaterthan",
+		}
+	)
 
 
 def _build_block_graph(target):
@@ -1377,7 +1474,7 @@ def _repair_dangling_block_ref(value, blocks):
 					shadow = value[2]
 					if isinstance(shadow, str) and shadow not in blocks:
 						return None, True
-					# Preserve the shadow value when the covering block vanished.
+					# preserve shadow value
 					return [1, shadow], True
 				return None, True
 
@@ -1408,7 +1505,6 @@ def _repair_dangling_block_ref(value, blocks):
 
 
 def _is_known_orphan_argument_reporter(block, blocks):
-	"""Tolerate detached shadow argument reporters left in some Scratch projects."""
 	if not isinstance(block, dict):
 		return False
 	return (
@@ -1420,7 +1516,6 @@ def _is_known_orphan_argument_reporter(block, blocks):
 
 
 def _iter_input_block_refs(value):
-	"""Yield block IDs referenced by a serialized Scratch input tuple."""
 	if not isinstance(value, list) or not value:
 		return
 	tag = value[0]
@@ -1445,11 +1540,10 @@ def _iter_input_block_refs(value):
 
 
 def _repair_dangling_block_refs(target):
-	"""Repair block links in both directions without inventing ambiguous edges."""
 	blocks = target.get("blocks", {})
 	fixed = 0
 
-	# Remove references that cannot resolve.
+	# remove unresolved refs
 	for block in blocks.values():
 		if not isinstance(block, dict):
 			continue
@@ -1471,8 +1565,8 @@ def _repair_dangling_block_refs(target):
 				inputs[name] = fixed_value
 			fixed += 1
 
-	# When an existing next/input edge unambiguously identifies the owner,
-	# repair the child's reverse parent link too. Never overwrite another valid parent.
+	# when an existing next/input edge unambiguously identifies the owner,
+	# repair the child's reverse parent link too
 	input_owners = {}
 	for owner_id, block in blocks.items():
 		if not isinstance(block, dict):
@@ -1511,9 +1605,14 @@ def _repair_dangling_block_refs(target):
 	comments = target.get("comments") or {}
 	for cid in list(comments):
 		c = comments[cid]
-		if isinstance(c, dict) and c.get("blockId") is not None and c["blockId"] not in blocks:
+		if (
+			isinstance(c, dict)
+			and c.get("blockId") is not None
+			and c["blockId"] not in blocks
+		):
 			del comments[cid]
 	return fixed
+
 
 def remove_unreachable_blocks(project, stats):
 	removed = 0
@@ -1540,7 +1639,6 @@ def remove_unreachable_blocks(project, stats):
 			if bid not in reachable:
 				del blocks[bid]
 				removed += 1
-
 
 	stats["blocks_removed"] += removed
 	return removed
@@ -1570,19 +1668,21 @@ def remove_unused_procedures(project, stats):
 			if isinstance(parent, str) and parent in blocks:
 				children.setdefault(parent, set()).add(bid)
 
-		definition_blocks = {}  # (proccode, definition_id) -> complete definition closure
+		definition_blocks = (
+			{}
+		)  # (proccode, definition_id) -> complete definition closure
 		for bid, b in blocks.items():
 			if not isinstance(b, dict) or b.get("opcode") != "procedures_definition":
 				continue
 			custom = (b.get("inputs") or {}).get("custom_block") or [None, None]
-			proto_id = custom[1] if len(custom) > 1 and isinstance(custom[1], str) else None
+			proto_id = (
+				custom[1] if len(custom) > 1 and isinstance(custom[1], str) else None
+			)
 			proto = blocks.get(proto_id)
 			proc = _procedure_key(proto) if isinstance(proto, dict) else None
 			if proc is None:
 				continue
 
-			# In Scratch serialization, the procedure body is connected through
-			# parent links; definition.next is the next top-level stack, not the body.
 			todo, seen = [bid], set()
 			while todo:
 				x = todo.pop()
@@ -1607,7 +1707,6 @@ def remove_unused_procedures(project, stats):
 					if proc is not None and proc not in live_procs:
 						queue.append(proc)
 
-		# Calls outside procedure closures are the program's procedure entry points.
 		seed_calls(set(blocks) - owned)
 		while queue:
 			proc = queue.pop()
@@ -1643,6 +1742,7 @@ def remove_unused_procedures(project, stats):
 
 def normalize_numbers(project, stats, epsilon):
 	changed = 0
+
 	def rec(v):
 		nonlocal changed
 		if isinstance(v, bool):
@@ -1662,6 +1762,7 @@ def normalize_numbers(project, stats, epsilon):
 		if isinstance(v, dict):
 			return {k: rec(x) for k, x in v.items()}
 		return v
+
 	for i, target in enumerate(project.get("targets", [])):
 		project["targets"][i] = rec(target)
 	project["monitors"] = rec(project.get("monitors", []))
@@ -1672,7 +1773,10 @@ def normalize_numbers(project, stats, epsilon):
 def _ffmpeg_available():
 	try:
 		r = subprocess.run(
-			["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+			["ffmpeg", "-version"],
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+			timeout=5,
 		)
 		return r.returncode == 0
 	except (OSError, subprocess.TimeoutExpired):
@@ -1683,11 +1787,24 @@ def _encode_wav_to_mp3(wav_bytes):
 	try:
 		proc = subprocess.run(
 			[
-				"ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-				"-i", "pipe:0",
-				"-c:a", "libmp3lame", "-b:a", WAV_TO_MP3_BITRATE,
-				"-ar", str(WAV_TO_MP3_SAMPLE_RATE), "-ac", str(WAV_TO_MP3_CHANNELS),
-				"-f", "mp3", "pipe:1",
+				"ffmpeg",
+				"-hide_banner",
+				"-loglevel",
+				"error",
+				"-y",
+				"-i",
+				"pipe:0",
+				"-c:a",
+				"libmp3lame",
+				"-b:a",
+				WAV_TO_MP3_BITRATE,
+				"-ar",
+				str(WAV_TO_MP3_SAMPLE_RATE),
+				"-ac",
+				str(WAV_TO_MP3_CHANNELS),
+				"-f",
+				"mp3",
+				"pipe:1",
 			],
 			input=wav_bytes,
 			stdout=subprocess.PIPE,
@@ -1744,8 +1861,6 @@ def convert_wav_sounds_to_mp3(project, assets, stats):
 			stats["wav_converted"] += 1
 			stats["wav_bytes_saved"] += len(wav_bytes) - len(mp3_bytes)
 
-	# The source may be shared by several sounds, so remove it only after the
-	# conversion mapping has been established for every reference.
 	for old_name in conversions:
 		assets.pop(old_name, None)
 
@@ -1761,13 +1876,6 @@ def remove_sound_metadata(project):
 
 
 def compact_redundant_field_ids(project, stats):
-	"""Remove the optional null field-ID slot from serialized Scratch fields.
-
-	Scratch field tuples are commonly serialized as [value, null] when a field
-	has no associated variable/list/broadcast ID. The ID slot is optional, so
-	[value] is an equivalent and smaller representation. Only an explicit null
-	slot is removed; empty-string and non-null IDs are preserved.
-	"""
 	count = 0
 	for target in project.get("targets", []):
 		for block in target.get("blocks", {}).values():
@@ -1781,9 +1889,7 @@ def compact_redundant_field_ids(project, stats):
 	return count
 
 
-
 def compact_mutation_hasnext(project, stats):
-	"""Remove mutation.hasnext only when it is explicitly false."""
 	count = 0
 	for target in project.get("targets", []):
 		for block in (target.get("blocks") or {}).values():
@@ -1797,6 +1903,7 @@ def compact_mutation_hasnext(project, stats):
 				count += 1
 	stats["mutation_hasnext_compacted"] += count
 	return count
+
 
 def compact_mutation_metadata(project, stats):
 	"""Losslessly compact JSON-encoded custom-block mutation arrays.
@@ -1833,25 +1940,22 @@ def compact_mutation_metadata(project, stats):
 	return count
 
 
-
 def _resolve_variable_owner(project, ti, variable_id):
-	"""Resolve a variable reference using Scratch's local-then-global scope rules."""
 	targets = project.get("targets", [])
 	if not isinstance(variable_id, str):
 		return None
 	if 0 <= ti < len(targets) and variable_id in (targets[ti].get("variables") or {}):
 		return (ti, variable_id)
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
-	if stage_index is not None and variable_id in (targets[stage_index].get("variables") or {}):
+	if stage_index is not None and variable_id in (
+		targets[stage_index].get("variables") or {}
+	):
 		return (stage_index, variable_id)
 	return None
 
 
 def _variable_literal(value):
-	"""Return the shortest Scratch primitive representation for a scalar variable value."""
 	if isinstance(value, bool):
-		# Scratch scalar variables normally deserialize as strings/numbers. Treat a
-		# boolean as unsupported rather than silently changing its serialized type.
 		return None
 	if isinstance(value, (int, float)):
 		if isinstance(value, float) and not math.isfinite(value):
@@ -1883,7 +1987,6 @@ def _primitive_json_len(value):
 
 
 def _find_constant_variables(project):
-	"""Find variables with exactly one set-variable-to and at least one reporter use."""
 	targets = project.get("targets", [])
 	set_blocks = {}
 	reporter_counts = Counter()
@@ -1945,35 +2048,42 @@ def _find_constant_variables(project):
 		literal = _variable_literal(entry[1])
 		if literal is None:
 			continue
-		
+
 		old = [12, entry[0], vid]
 		per_use = _primitive_json_len(old) - _primitive_json_len(literal)
 		total = per_use * reporter_counts[owner]
-		scope = "GLOBAL" if targets[ti].get("isStage") else f"local:{targets[ti].get('name')}"
-		candidates.append({
-			"ti": ti,
-			"id": vid,
-			"scope": scope,
-			"name": str(entry[0]),
-			"value": entry[1],
-			"reporters": reporter_counts[owner],
-			"bytes": total,
-			"per_use": per_use,
-			"changes": change_counts.get(owner, 0),
-			"setter": setter_ids[owner][0],
-			"literal": literal,
-		})
+		scope = (
+			"GLOBAL"
+			if targets[ti].get("isStage")
+			else f"local:{targets[ti].get('name')}"
+		)
+		candidates.append(
+			{
+				"ti": ti,
+				"id": vid,
+				"scope": scope,
+				"name": str(entry[0]),
+				"value": entry[1],
+				"reporters": reporter_counts[owner],
+				"bytes": total,
+				"per_use": per_use,
+				"changes": change_counts.get(owner, 0),
+				"setter": setter_ids[owner][0],
+				"literal": literal,
+			}
+		)
 	candidates.sort(key=lambda c: (-c["bytes"], c["scope"], c["name"], c["id"]))
 	return candidates
 
 
 def _replace_constant_variable_reporters(value, ti, selected, project, stats):
-	"""Replace serialized variable-reporter primitives with selected literals."""
 	if not isinstance(value, list) or not value:
 		if isinstance(value, dict):
 			changed = 0
 			for child in value.values():
-				changed += _replace_constant_variable_reporters(child, ti, selected, project, stats)
+				changed += _replace_constant_variable_reporters(
+					child, ti, selected, project, stats
+				)
 			return changed
 		return 0
 	changed = 0
@@ -1989,21 +2099,25 @@ def _replace_constant_variable_reporters(value, ti, selected, project, stats):
 			return 1
 	for child in value:
 		if isinstance(child, (list, dict)):
-			changed += _replace_constant_variable_reporters(child, ti, selected, project, stats)
+			changed += _replace_constant_variable_reporters(
+				child, ti, selected, project, stats
+			)
 	return changed
 
 
 def fold_constant_variables(project, selected, stats):
 	if not selected:
 		return 0
-	selected_map = { (ti, vid): literal for (ti, vid), literal in selected.items() }
+	selected_map = {(ti, vid): literal for (ti, vid), literal in selected.items()}
 	changed = 0
 	for ti, target in enumerate(project.get("targets", [])):
 		for block in (target.get("blocks") or {}).values():
 			if not isinstance(block, dict):
 				continue
 			for value in (block.get("inputs") or {}).values():
-				changed += _replace_constant_variable_reporters(value, ti, selected_map, project, stats)
+				changed += _replace_constant_variable_reporters(
+					value, ti, selected_map, project, stats
+				)
 	return changed
 
 
@@ -2016,8 +2130,14 @@ def _numeric_primitive_value(value):
 	try:
 		if isinstance(raw, str):
 			text = raw.strip()
-			prefixes = (("0b", 2, "01"), ("0o", 8, "01234567"), ("0x", 16, "0123456789abcdef"))
-			prefix = next((item for item in prefixes if text.lower().startswith(item[0])), None)
+			prefixes = (
+				("0b", 2, "01"),
+				("0o", 8, "01234567"),
+				("0x", 16, "0123456789abcdef"),
+			)
+			prefix = next(
+				(item for item in prefixes if text.lower().startswith(item[0])), None
+			)
 			if prefix is not None:
 				digits = text[2:].lower()
 				if not digits or any(digit not in prefix[2] for digit in digits):
@@ -2032,19 +2152,71 @@ def _numeric_primitive_value(value):
 	return number if math.isfinite(number) else None
 
 
+def _to_scratch_number(val):
+	if isinstance(val, bool):
+		return 1.0 if val else 0.0
+	if isinstance(val, (int, float)):
+		return float(val) if math.isfinite(val) else None
+	if isinstance(val, str):
+		text = val.strip()
+		if not text:
+			return 0.0
+
+		# numeric prefix support
+		prefixes = (
+			("0b", 2, "01"),
+			("0o", 8, "01234567"),
+			("0x", 16, "0123456789abcdef"),
+		)
+		prefix = next(
+			(item for item in prefixes if text.lower().startswith(item[0])), None
+		)
+		try:
+			if prefix is not None:
+				digits = text[2:].lower()
+				if not digits or any(digit not in prefix[2] for digit in digits):
+					return None
+				num = float(int(digits, prefix[1]))
+			else:
+				num = float(text)
+			return num if math.isfinite(num) else None
+		except (ValueError, OverflowError, TypeError):
+			return None
+	return None
+
+
+def _to_scratch_bool(val):
+	if isinstance(val, bool):
+		return val
+	if isinstance(val, (int, float)):
+		return val != 0 and not math.isnan(val)
+	if isinstance(val, str):
+		text = val.strip().lower()
+		if text in ("true", "1"):
+			return True
+		if text in ("false", "0", ""):
+			return False
+		num = _to_scratch_number(val)
+		return num != 0 if num is not None else len(val) > 0
+	return False
+
+
 def _constant_expression_from_input(value, blocks, visiting=frozenset()):
 	if not (isinstance(value, list) and len(value) > 1):
 		return None
-	if value[0] in (1, 2):
-		child = value[1]
-	elif value[0] == 3:
+	if value[0] in (1, 2, 3):
 		child = value[1]
 	else:
 		return None
 
 	number = _numeric_primitive_value(child)
 	if number is not None:
-		return [4, number], set()
+		val = int(number) if number.is_integer() else number
+		return [4, val], set()
+
+	if isinstance(child, list) and len(child) == 2 and child[0] == _TEXT_TAG:
+		return child, set()
+
 	if isinstance(child, str):
 		return _constant_expression_block(child, blocks, visiting)
 	return None
@@ -2057,93 +2229,276 @@ def _constant_expression_block(block_id, blocks, visiting):
 	if not isinstance(block, dict):
 		return None
 
-	operations = {
-		"operator_add": "add",
-		"operator_subtract": "subtract",
-		"operator_multiply": "multiply",
-		"operator_divide": "divide",
-		"operator_mod": "modulo",
-	}
-	operation = operations.get(block.get("opcode"))
+	operation = block.get("opcode")
 	if operation is None:
 		return None
 
 	inputs = block.get("inputs") or {}
-	left = _constant_expression_from_input(inputs.get("NUM1"), blocks, visiting | {block_id})
-	right = _constant_expression_from_input(inputs.get("NUM2"), blocks, visiting | {block_id})
+	current_visiting = visiting | {block_id}
+
+	def get_in(name):
+		return _constant_expression_from_input(
+			inputs.get(name), blocks, current_visiting
+		)
+
+	# unary operators
+	if operation == "operator_not":
+		operand = get_in("OPERAND")
+		if operand is None:
+			return None
+		res_bool = not _to_scratch_bool(operand[0][1])
+		return [10, "true" if res_bool else "false"], operand[1] | {block_id}
+
+	if operation == "operator_length":
+		operand = get_in("STRING")
+		if operand is None:
+			return None
+		return [4, len(str(operand[0][1]))], operand[1] | {block_id}
+
+	if operation == "operator_mathop":
+		operand = get_in("NUM")
+		if operand is None:
+			return None
+		num = _to_scratch_number(operand[0][1])
+		if num is None:
+			return None
+
+		operator_field = (block.get("fields") or {}).get("OPERATOR")
+		op_name = (
+			operator_field[0]
+			if isinstance(operator_field, list) and operator_field
+			else None
+		)
+
+		try:
+			match op_name:
+				case "abs":
+					res = abs(num)
+				case "floor":
+					res = math.floor(num)
+				case "ceiling":
+					res = math.ceil(num)
+				case "sqrt":
+					if num < 0:
+						return None
+					res = math.sqrt(num)
+				case "sin":
+					res = math.sin(math.radians(num))
+				case "cos":
+					res = math.cos(math.radians(num))
+				case "tan":
+					res = math.tan(math.radians(num))
+				case "asin":
+					if not -1 <= num <= 1:
+						return None
+					res = math.degrees(math.asin(num))
+				case "acos":
+					if not -1 <= num <= 1:
+						return None
+					res = math.degrees(math.acos(num))
+				case "atan":
+					res = math.degrees(math.atan(num))
+				case "ln":
+					if num <= 0:
+						return None
+					res = math.log(num)
+				case "log":
+					if num <= 0:
+						return None
+					res = math.log10(num)
+				case "e ^":
+					res = math.exp(num)
+				case "10 ^":
+					res = 10**num
+				case _:
+					return None
+		except (ValueError, OverflowError, ZeroDivisionError):
+			return None
+
+		if not math.isfinite(res):
+			return None
+		val = int(res) if isinstance(res, float) and res.is_integer() else res
+		return [4, val], operand[1] | {block_id}
+
+	if operation in ("operator_and", "operator_or"):
+		left = get_in("OPERAND1")
+		right = get_in("OPERAND2")
+		if left is None or right is None:
+			return None
+		b_left = _to_scratch_bool(left[0][1]) if left is not None else None
+		b_right = _to_scratch_bool(right[0][1]) if right is not None else None
+
+		if left is not None and right is not None:
+			res_bool = (b_left and b_right) if operation == "operator_and" else (b_left or b_right)
+			return [10, "true" if res_bool else "false"], left[1] | right[1] | {block_id}
+
+		return None
+
+	if operation in ("operator_gt", "operator_lt", "operator_equals"):
+		left = get_in("OPERAND1") or get_in("NUM1")
+		right = get_in("OPERAND2") or get_in("NUM2")
+		if left is None or right is None:
+			return None
+
+		raw_l, raw_r = left[0][1], right[0][1]
+		num_l = _to_scratch_number(raw_l)
+		num_r = _to_scratch_number(raw_r)
+
+		if num_l is not None and num_r is not None:
+			match operation:
+				case "operator_gt":
+					res_bool = num_l > num_r
+				case "operator_lt":
+					res_bool = num_l < num_r
+				case "operator_equals":
+					res_bool = num_l == num_r
+		else:
+			str_l, str_r = str(raw_l).lower(), str(raw_r).lower()
+			match operation:
+				case "operator_gt":
+					res_bool = str_l > str_r
+				case "operator_lt":
+					res_bool = str_l < str_r
+				case "operator_equals":
+					res_bool = str_l == str_r
+
+		return [10, "true" if res_bool else "false"], left[1] | right[1] | {block_id}
+
+	# binary operators
+	left = get_in("NUM1")
+	right = get_in("NUM2")
 	if left is None or right is None:
 		return None
 
-	left_value = float(left[0][1])
-	right_value = float(right[0][1])
+	left_num = _to_scratch_number(left[0][1])
+	right_num = _to_scratch_number(right[0][1])
+	if left_num is None or right_num is None:
+		return None
+
 	try:
-		if operation == "add":
-			result = left_value + right_value
-		elif operation == "subtract":
-			result = left_value - right_value
-		elif operation == "multiply":
-			result = left_value * right_value
-		elif operation == "divide":
-			if right_value == 0:
+		match operation:
+			case "operator_add":
+				result = left_num + right_num
+			case "operator_subtract":
+				result = left_num - right_num
+			case "operator_multiply":
+				result = left_num * right_num
+			case "operator_divide":
+				if right_num == 0:
+					return None
+				result = left_num / right_num
+			case "operator_mod":
+				if right_num == 0:
+					return None
+				result = left_num % right_num
+			case _:
 				return None
-			result = left_value / right_value
-		else:
-			if right_value == 0:
-				return None
-			result = left_value % right_value
 	except (OverflowError, ValueError, ZeroDivisionError):
 		return None
+
 	if not math.isfinite(result):
 		return None
 	value = int(result) if result.is_integer() else result
 	return [4, value], left[1] | right[1] | {block_id}
 
 
+def _create_scratch_id():
+	return str(uuid.uuid4()).replace("-", "")[:20]
+
+
+def _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
+	"""A fold deletes its intermediate blocks; never delete one a comment points at."""
+	return any(
+		bid in commented_ids
+		or (isinstance(blocks.get(bid), dict) and "comment" in blocks[bid])
+		for bid in folded_ids
+	)
+
+
 def fold_constant_expressions(project, stats, opts):
-	"""Fold finite numeric arithmetic reporters whose operands are all literals."""
 	targets = project.get("targets", [])
 	opts.folded_constant_expression_inputs = {}
 	opts.folded_constant_expression_blocks = [set() for _ in targets]
+	opts.folded_constant_expression_new_blocks = [set() for _ in targets]
 	folded = 0
 
 	for ti, target in enumerate(targets):
 		blocks = target.get("blocks") or {}
-		candidates = []
-		for parent_id, parent in blocks.items():
-			if not isinstance(parent, dict):
-				continue
-			for input_name, value in (parent.get("inputs") or {}).items():
-				result = _constant_expression_from_input(value, blocks)
-				if result is not None and result[1]:
-					candidates.append((parent_id, input_name, result[0], result[1]))
+		commented_ids = {
+			c.get("blockId")
+			for c in (target.get("comments") or {}).values()
+			if isinstance(c, dict) and c.get("blockId") is not None
+		}
 
-		consumed_by_candidates = set().union(*(entry[3] for entry in candidates)) if candidates else set()
-		removed = set()
-		for parent_id, input_name, literal, expression_blocks in candidates:
-			if parent_id in consumed_by_candidates:
+		# Pass 1: evaluate only. Nothing is mutated, so every plan sees the
+		# original block graph.
+		plans = []
+		for block_id, block in blocks.items():
+			if not isinstance(block, dict):
 				continue
-			parent = blocks.get(parent_id)
-			if not isinstance(parent, dict):
+			for input_name, input_val in (block.get("inputs") or {}).items():
+				res = _constant_expression_from_input(input_val, blocks)
+				if res is None:
+					continue
+				val, folded_ids = res
+				if not folded_ids:
+					continue  # bare literal: no block was collapsed, leave it alone
+				if _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
+					continue
+				plans.append((block_id, input_name, val, folded_ids))
+
+		# A plan whose owning block is itself folded away by an enclosing plan
+		# must not run: the owner is about to be deleted, so anything attached
+		# to it (e.g. the <not> built for a true result) would be left with a
+		# dangling parent. An enclosing plan always covers the enclosed one's
+		# blocks, so skipping loses nothing.
+		doomed = set()
+		for _, _, _, folded_ids in plans:
+			doomed |= folded_ids
+
+		# Pass 2: apply, and delete the intermediates of *this* target.
+		for block_id, input_name, val, folded_ids in plans:
+			if block_id in doomed:
 				continue
-			inputs = parent.get("inputs") or {}
-			if input_name not in inputs:
-				continue
-			replacement = [1, literal]
-			inputs[input_name] = replacement
-			opts.folded_constant_expression_inputs[(ti, parent_id, input_name)] = replacement
-			removed.update(expression_blocks)
+			inputs = blocks[block_id]["inputs"]
+
+			if isinstance(val, list) and len(val) == 2 and val[0] == _TEXT_TAG:
+				# boolean result
+				if str(val[1]).lower() == "true":
+					# an empty slot inside NOT yields false, so NOT(empty) = true
+					new_not_id = _create_scratch_id()
+					while new_not_id in blocks:
+						new_not_id = _create_scratch_id()
+					blocks[new_not_id] = {
+						"opcode": "operator_not",
+						"next": None,
+						"parent": block_id,
+						"inputs": {"OPERAND": [1, None]},
+						"fields": {},
+						"shadow": False,
+						"topLevel": False,
+					}
+					opts.folded_constant_expression_new_blocks[ti].add(new_not_id)
+					new_input = [2, new_not_id]
+				else:
+					new_input = [2, None]
+			else:
+				# [3, block, shadow] needs a shadow; a plain literal is [1, literal]
+				new_input = [1, val]
+
+			inputs[input_name] = new_input
+			opts.folded_constant_expression_inputs[(ti, block_id, input_name)] = (
+				copy.deepcopy(new_input)
+			)
+			opts.folded_constant_expression_blocks[ti].update(folded_ids)
+			for remove_id in folded_ids:
+				blocks.pop(remove_id, None)
 			folded += 1
 
-		for block_id in removed:
-			blocks.pop(block_id, None)
-		opts.folded_constant_expression_blocks[ti] = removed
-
 	stats["constant_expressions_folded"] += folded
-	return folded
 
 
 def prompt_for_constant_variables(project, candidates) -> dict:
-	"""Interactively choose constant-variable candidates whose reporter reads may be folded."""
 	if not candidates:
 		print(Ansi.muted("\nNo constant-variable candidates found."))
 		return {}
@@ -2155,43 +2510,65 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 	w_name = min(34, max(len(c["name"]) for c in candidates))
 
 	print("")
-	print(Ansi.heading(
-		f"Constant variables found: {len(candidates)}  "
-		f"({sum(c['reporters'] for c in candidates):,} reporter uses)"
-	))
-	print(Ansi.muted(
-		f"  Positive-size candidates: {len(positive)} (about {total_positive:,} bytes saved)"
-	))
-	print(Ansi.muted(
-		f"  Negative-size candidates: {len(negative)} (folding would increase project.json)"
-	))
+	print(
+		Ansi.heading(
+			f"Constant variables found: {len(candidates)}  "
+			f"({sum(c['reporters'] for c in candidates):,} reporter uses)"
+		)
+	)
+	print(
+		Ansi.muted(
+			f"  Positive-size candidates: {len(positive)} (about {total_positive:,} bytes saved)"
+		)
+	)
+	print(
+		Ansi.muted(
+			f"  Negative-size candidates: {len(negative)} (folding would increase project.json)"
+		)
+	)
 	print("")
-	print(f"  {'#':>4}  {'scope':<{w_scope}}  {'variable':<{w_name}}  {'uses':>5}  {'bytes':>8}  notes")
+	print(
+		f"  {'#':>4}  {'scope':<{w_scope}}  {'variable':<{w_name}}  {'uses':>5}  {'bytes':>8}  notes"
+	)
 	for i, c in enumerate(candidates, 1):
-		nm = c["name"] if len(c["name"]) <= w_name else c["name"][:w_name - 1] + "…"
+		nm = c["name"] if len(c["name"]) <= w_name else c["name"][: w_name - 1] + "…"
 		notes = []
 		if c["bytes"] < 0:
 			notes.append("LOSS")
 		if c["changes"]:
 			notes.append(f"+{c['changes']} change")
-		print(f" {i:>4}  {c['scope']:<{w_scope}}  {nm:<{w_name}}  {c['reporters']:>5,}  {c['bytes']:>+8,}  {'; '.join(notes)}")
+		print(
+			f" {i:>4}  {c['scope']:<{w_scope}}  {nm:<{w_name}}  {c['reporters']:>5,}  {c['bytes']:>+8,}  {'; '.join(notes)}"
+		)
 	print("")
-	print(Ansi.warning(
-		"  This replaces every serialized variable reporter with the variable's "
-		"initial value from project.json. Variables with change-by blocks are marked."
-	))
-	print(Ansi.muted("  Negative byte estimates are marked LOSS and are not selected by 'p'."))
+	print(
+		Ansi.warning(
+			"  This replaces every serialized variable reporter with the variable's "
+			"initial value from project.json. Variables with change-by blocks are marked."
+		)
+	)
+	print(
+		Ansi.muted(
+			"  Negative byte estimates are marked LOSS and are not selected by 'p'."
+		)
+	)
 	print("")
 	print(Ansi.muted("  Enter / n       keep every variable"))
 	print(Ansi.muted("  p               fold only candidates that reduce project.json"))
 	print(Ansi.muted("  a               fold all candidates"))
-	print(Ansi.muted("  u               fold only candidates without change-variable-by"))
+	print(
+		Ansi.muted("  u               fold only candidates without change-variable-by")
+	)
 	print(Ansi.muted("  1,3,5-7         fold those numbers"))
 	print("")
 
 	while True:
 		try:
-			answer = input(Ansi.prompt("Fold which variables? [Enter = keep all] > ")).strip().lower()
+			answer = (
+				input(Ansi.prompt("Fold which variables? [Enter = keep all] > "))
+				.strip()
+				.lower()
+			)
 		except EOFError:
 			print(Ansi.muted("\n(no input available, keeping all variables)"))
 			return {}
@@ -2205,7 +2582,11 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 		if answer in ("p", "positive", "safe", "s"):
 			picked = {i for i, c in enumerate(candidates, 1) if c["bytes"] > 0}
 		elif answer in ("u", "unchanged"):
-			picked = {i for i, c in enumerate(candidates, 1) if c["changes"] == 0 and c["bytes"] > 0}
+			picked = {
+				i
+				for i, c in enumerate(candidates, 1)
+				if c["changes"] == 0 and c["bytes"] > 0
+			}
 		elif answer in ("a", "all"):
 			picked = set(range(1, len(candidates) + 1))
 		else:
@@ -2221,11 +2602,17 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 			continue
 		estimate = sum(c["bytes"] for c in chosen)
 		risky = [c for c in chosen if c["changes"] or c["bytes"] < 0]
-		print(Ansi.success(
-			f"  Selected {len(chosen)} variable(s), estimated project.json change: {estimate:+,} bytes."
-		))
+		print(
+			Ansi.success(
+				f"  Selected {len(chosen)} variable(s), estimated project.json change: {estimate:+,} bytes."
+			)
+		)
 		if risky:
-			print(Ansi.warning(f"  WARNING: {len(risky)} selected variable(s) need extra care:"))
+			print(
+				Ansi.warning(
+					f"  WARNING: {len(risky)} selected variable(s) need extra care:"
+				)
+			)
 			for c in risky[:20]:
 				reasons = []
 				if c["changes"]:
@@ -2236,7 +2623,13 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 			if len(risky) > 20:
 				print(f"    ... {len(risky) - 20:,} more")
 			try:
-				confirm = input("  Type 'yes' to fold them anyway, anything else to go back > ").strip().lower()
+				confirm = (
+					input(
+						"  Type 'yes' to fold them anyway, anything else to go back > "
+					)
+					.strip()
+					.lower()
+				)
 			except EOFError:
 				print(Ansi.muted("\n(no input available, keeping all variables)"))
 				return {}
@@ -2247,6 +2640,7 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 				print(Ansi.warning("  Not confirmed. Nothing was folded... yet >:)."))
 				continue
 		return {(c["ti"], c["id"]): c["literal"] for c in chosen}
+
 
 def remove_empty_fields(project, stats):
 	count = 0
@@ -2270,9 +2664,7 @@ def remove_empty_inputs(project, stats):
 	return count
 
 
-
 def _target_default_properties_for_removal(target):
-	"""Return only target properties with fixed Scratch defaults."""
 	if target.get("isStage"):
 		return {
 			"currentCostume": 0,
@@ -2296,25 +2688,29 @@ def _target_default_properties_for_removal(target):
 
 
 def remove_default_target_properties(project, stats):
-	"""Remove target properties only when their value is exactly Scratch's default."""
 	count = 0
 	for target in project.get("targets", []):
 		for key, default in _target_default_properties_for_removal(target).items():
-			if key in target and target[key] == default and type(target[key]) is type(default):
+			if (
+				key in target
+				and target[key] == default
+				and type(target[key]) is type(default)
+			):
 				del target[key]
 				count += 1
 	stats["default_target_properties_removed"] += count
 	return count
 
+
 def remove_costume_metadata(project, stats, assets=None):
 	"""Remove only costume metadata that is provably redundant.
 
-		`md5ext` is removable only when it is exactly the canonical
-		`assetId.dataFormat` filename and that asset exists. This avoids
-		breaking projects which deliberately use a non-canonical extension.
+	`md5ext` is removable only when it is exactly the canonical
+	`assetId.dataFormat` filename and that asset exists. This avoids
+	breaking projects which deliberately use a non-canonical extension.
 
-		`bitmapResolution=1` is removable only for SVG costumes; Scratch's
-		vector costume path treats the omitted value as the default.
+	`bitmapResolution=1` is removable only for SVG costumes; Scratch's
+	vector costume path treats the omitted value as the default.
 	"""
 	count = 0
 	for target in project.get("targets", []):
@@ -2323,9 +2719,13 @@ def remove_costume_metadata(project, stats, assets=None):
 				continue
 			aid = costume.get("assetId")
 			fmt = costume.get("dataFormat")
-			canonical = f"{aid}.{fmt}" if isinstance(aid, str) and isinstance(fmt, str) else None
+			canonical = (
+				f"{aid}.{fmt}"
+				if isinstance(aid, str) and isinstance(fmt, str)
+				else None
+			)
 
-			# Do not remove md5ext unless we can prove it is derivable and the
+			# DON'T remove md5ext unless we can prove it is derivable and the
 			# referenced asset is actually present in the archive.
 			if (
 				canonical
@@ -2335,8 +2735,7 @@ def remove_costume_metadata(project, stats, assets=None):
 				del costume["md5ext"]
 				count += 1
 
-			# SVGs use vector geometry directly; bitmapResolution=1 is the
-			# default and is safe to omit. Never do this for bitmap costumes.
+			# SVGs use vector geometry directly; bitmapResolution=1 is the default and is safe to omit.
 			if fmt == "svg" and costume.get("bitmapResolution") == 1:
 				del costume["bitmapResolution"]
 				count += 1
@@ -2346,7 +2745,6 @@ def remove_costume_metadata(project, stats, assets=None):
 
 
 def remove_empty_target_containers(project, stats):
-	"""Remove schema-optional target containers when they are empty."""
 	count = 0
 	for target in project.get("targets", []):
 		for key in ("lists", "broadcasts", "comments"):
@@ -2357,7 +2755,7 @@ def remove_empty_target_containers(project, stats):
 	return count
 
 
-# Backwards-compatible internal alias for older callers.
+# for backwards compatibility
 remove_empty_containers = remove_empty_target_containers
 
 
@@ -2383,7 +2781,11 @@ def compact_numeric_inputs(project, stats):
 				if not isinstance(ival, list):
 					continue
 				for item in ival[1:]:
-					if isinstance(item, list) and len(item) > 1 and item[0] in _NUMERIC_TAGS:
+					if (
+						isinstance(item, list)
+						and len(item) > 1
+						and item[0] in _NUMERIC_TAGS
+					):
 						v = item[1]
 						if isinstance(v, str):
 							try:
@@ -2396,7 +2798,14 @@ def compact_numeric_inputs(project, stats):
 								pass
 							try:
 								fv = float(v)
-								if "." in v and "e" not in v.lower() and str(fv) == v and not (fv != fv or fv in (float("inf"), float("-inf"))):
+								if (
+									"." in v
+									and "e" not in v.lower()
+									and str(fv) == v
+									and not (
+										fv != fv or fv in (float("inf"), float("-inf"))
+									)
+								):
 									item[1] = fv
 									count += 1
 							except ValueError:
@@ -2505,6 +2914,7 @@ class Options:
 		self.folded_constant_variable_literals = {}
 		self.folded_constant_expression_inputs = {}
 		self.folded_constant_expression_blocks = []
+		self.folded_constant_expression_new_blocks = []
 
 
 def apply_transforms(project, opts: Options, assets=None):
@@ -2535,20 +2945,27 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_unused_data(
 			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
 		)
-	opts.repaired_broadcast_ids, opts.broadcast_repair_conflicts = _repair_dangling_broadcast_refs(project, stats)
+	opts.repaired_broadcast_ids, opts.broadcast_repair_conflicts = (
+		_repair_dangling_broadcast_refs(project, stats)
+	)
 	if opts.remove_unused_broadcasts:
 		remove_unused_broadcasts(project, stats)
 	used_data_ids = set()
 	if opts.rename_variable_ids or opts.rename_list_ids:
 		opts.renamed_variable_ids, opts.renamed_list_ids = rename_variable_list_ids(
-			project, stats, opts.rename_variable_ids, opts.rename_list_ids,
+			project,
+			stats,
+			opts.rename_variable_ids,
+			opts.rename_list_ids,
 			frequency_order=opts.frequency_data_ids,
 		)
 		used_data_ids.update(opts.renamed_variable_ids.values())
 		used_data_ids.update(opts.renamed_list_ids.values())
 	if opts.rename_broadcast_ids:
 		opts.renamed_broadcast_ids = rename_broadcast_ids(
-			project, stats, existing_ids=used_data_ids,
+			project,
+			stats,
+			existing_ids=used_data_ids,
 			frequency_order=opts.frequency_data_ids,
 		)
 	if opts.rename_argument_ids:
@@ -2614,7 +3031,8 @@ def _restore_block_ids(project, renamed_ids):
 			continue
 		blocks = target.get("blocks", {})
 		target["blocks"] = {
-			block_ids.get(block_id, block_id): block for block_id, block in blocks.items()
+			block_ids.get(block_id, block_id): block
+			for block_id, block in blocks.items()
 		}
 		for block in target["blocks"].values():
 			if isinstance(block, dict):
@@ -2624,8 +3042,14 @@ def _restore_block_ids(project, renamed_ids):
 				for value in (block.get("inputs") or {}).values():
 					_replace_input_block_ids(value, block_ids)
 		for comment in (target.get("comments") or {}).values():
-			if isinstance(comment, dict) and "blockId" in comment and comment["blockId"] is not None:
-				comment["blockId"] = block_ids.get(comment["blockId"], comment["blockId"])
+			if (
+				isinstance(comment, dict)
+				and "blockId" in comment
+				and comment["blockId"] is not None
+			):
+				comment["blockId"] = block_ids.get(
+					comment["blockId"], comment["blockId"]
+				)
 
 
 def _restore_data_ids(project, variable_ids, list_ids):
@@ -2670,10 +3094,12 @@ def _restore_data_ids(project, variable_ids, list_ids):
 
 	for ti, target in enumerate(targets):
 		target["variables"] = {
-			var_rev.get(ti, {}).get(k, k): v for k, v in (target.get("variables") or {}).items()
+			var_rev.get(ti, {}).get(k, k): v
+			for k, v in (target.get("variables") or {}).items()
 		}
 		target["lists"] = {
-			list_rev.get(ti, {}).get(k, k): v for k, v in (target.get("lists") or {}).items()
+			list_rev.get(ti, {}).get(k, k): v
+			for k, v in (target.get("lists") or {}).items()
 		}
 		for block in target.get("blocks", {}).values():
 			if isinstance(block, list):
@@ -2694,7 +3120,9 @@ def _restore_data_ids(project, variable_ids, list_ids):
 			for value in (block.get("inputs") or {}).values():
 				restore_nested(ti, value)
 
-	name_to_index = {t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")}
+	name_to_index = {
+		t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")
+	}
 	for m in project.get("monitors", []):
 		if not isinstance(m, dict):
 			continue
@@ -2723,13 +3151,16 @@ def _restore_broadcast_ids(project, mapping):
 
 
 def _restore_argument_ids(project, mapping):
-	rev = {}   # {(ti, proccode): {new_id: old_id}}
+	rev = {}  # {(ti, proccode): {new_id: old_id}}
 	for (ti, proc, old), new in (mapping or {}).items():
 		rev.setdefault((ti, proc), {})[new] = old
 
 	for ti, target in enumerate(project.get("targets", [])):
 		for block in target.get("blocks", {}).values():
-			if not isinstance(block, dict) or block.get("opcode") not in ("procedures_prototype", "procedures_call"):
+			if not isinstance(block, dict) or block.get("opcode") not in (
+				"procedures_prototype",
+				"procedures_call",
+			):
 				continue
 			mut = block.get("mutation")
 			vals = _parse_argumentids(mut)
@@ -2740,7 +3171,9 @@ def _restore_argument_ids(project, mapping):
 			if not local_rev:
 				continue
 			mut["argumentids"] = json.dumps(
-				[local_rev.get(x, x) for x in vals], separators=(",", ":"), ensure_ascii=False
+				[local_rev.get(x, x) for x in vals],
+				separators=(",", ":"),
+				ensure_ascii=False,
 			)
 			inputs = block.get("inputs") or {}
 			block["inputs"] = {local_rev.get(k, k): v for k, v in inputs.items()}
@@ -2756,9 +3189,7 @@ def _num_eq(a, b):
 	)
 
 
-
 def _check_broadcast_consistency(project):
-	"""Require every broadcast reference to resolve to one consistent message name."""
 	definitions = {}
 	for ti, target in enumerate(project.get("targets", [])):
 		for bid, name in (target.get("broadcasts") or {}).items():
@@ -2782,6 +3213,7 @@ def _check_broadcast_consistency(project):
 			return f"broadcast {bid!r}: definition name {defined_name!r} conflicts with reference name(s) {conflicts}"
 	return None
 
+
 def _check_broadcast_ids_resolve(project):
 	valid = _all_broadcast_ids(project)
 	for target in project.get("targets", []):
@@ -2790,7 +3222,12 @@ def _check_broadcast_ids_resolve(project):
 				continue
 			for name in ("BROADCAST_OPTION", "BROADCAST_INPUT"):
 				f = (b.get("fields") or {}).get(name)
-				if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str) and f[1] not in valid:
+				if (
+					isinstance(f, list)
+					and len(f) > 1
+					and isinstance(f[1], str)
+					and f[1] not in valid
+				):
 					return f"{target.get('name')!r}/{bid!r}: broadcast id {f[1]!r} has no matching message"
 			for value in (b.get("inputs") or {}).values():
 				bad = _find_dangling_broadcast(value, valid)
@@ -2812,14 +3249,17 @@ def _find_dangling_broadcast(value, valid):
 
 
 def _check_block_references_resolve(project):
-	"""Require all serialized input/next references to resolve."""
 	for target in project.get("targets", []):
 		blocks = target.get("blocks", {})
 		for bid, block in blocks.items():
 			if not isinstance(block, dict):
 				continue
 			parent = block.get("parent")
-			if isinstance(parent, str) and parent not in blocks and not _is_known_orphan_argument_reporter(block, blocks):
+			if (
+				isinstance(parent, str)
+				and parent not in blocks
+				and not _is_known_orphan_argument_reporter(block, blocks)
+			):
 				return f"{target.get('name')!r}/{bid!r}: parent points to missing block {parent!r}"
 			nxt = block.get("next")
 			if isinstance(nxt, str) and nxt not in blocks:
@@ -2830,16 +3270,22 @@ def _check_block_references_resolve(project):
 						return f"{target.get('name')!r}/{bid!r}: input {name!r} points to missing block {child_id!r}"
 	return None
 
+
 def _check_argument_id_consistency(target, where):
 	for bid, b in target.get("blocks", {}).items():
-		if not isinstance(b, dict) or b.get("opcode") not in ("procedures_prototype", "procedures_call"):
+		if not isinstance(b, dict) or b.get("opcode") not in (
+			"procedures_prototype",
+			"procedures_call",
+		):
 			continue
 		vals = _parse_argumentids(b.get("mutation"))
 		if vals is None:
 			continue
 		if set(vals) != set((b.get("inputs") or {}).keys()):
-			return (f"{where}/{bid!r}: procedures argumentids {vals} does not match "
-					f"inputs keys {sorted((b.get('inputs') or {}).keys())}")
+			return (
+				f"{where}/{bid!r}: procedures argumentids {vals} does not match "
+				f"inputs keys {sorted((b.get('inputs') or {}).keys())}"
+			)
 	return None
 
 
@@ -2848,7 +3294,11 @@ def _input_val_eq(vo, vm, opts):
 		return True
 	if opts.normalize_numbers and (_num_eq(vo, vm) or vo == vm):
 		return True
-	if opts.compact_numeric_inputs and isinstance(vo, str) and isinstance(vm, (int, float)):
+	if (
+		opts.compact_numeric_inputs
+		and isinstance(vo, str)
+		and isinstance(vm, (int, float))
+	):
 		try:
 			if isinstance(vm, int) and str(int(vo)) == vo and int(vo) == vm:
 				return True
@@ -2883,34 +3333,57 @@ def _input_has_dangling_block_ref(value, blocks):
 	return False
 
 
-
 def _folded_input_equivalent(value, literals, project, target_index):
-	"""Canonicalize selected variable reporter primitives in an input value."""
 	if not isinstance(value, list):
 		if isinstance(value, dict):
-			return {k: _folded_input_equivalent(v, literals, project, target_index) for k, v in value.items()}
+			return {
+				k: _folded_input_equivalent(v, literals, project, target_index)
+				for k, v in value.items()
+			}
 		return value
 	if value and value[0] == 12 and len(value) > 2 and isinstance(value[2], str):
 		owner = _resolve_variable_owner(project, target_index, value[2])
 		if owner in literals:
 			return copy.deepcopy(literals[owner])
-	return [_folded_input_equivalent(v, literals, project, target_index) if isinstance(v, (list, dict)) else v for v in value]
+	return [
+		(
+			_folded_input_equivalent(v, literals, project, target_index)
+			if isinstance(v, (list, dict))
+			else v
+		)
+		for v in value
+	]
 
-def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=None, target_index=None, _allow_folded=True):
+
+def _check_inputs_match(
+	oi,
+	mi,
+	opts,
+	original_blocks=None,
+	remaining_blocks=None,
+	target_index=None,
+	_allow_folded=True,
+):
 	if oi == mi:
 		return True
 	if _allow_folded:
-		folded_literals = (
-			getattr(opts, "folded_constant_variable_literals", None)
-			or getattr(opts, "folded_constant_variables", None)
-		)
+		folded_literals = getattr(
+			opts, "folded_constant_variable_literals", None
+		) or getattr(opts, "folded_constant_variables", None)
 		verify_project = getattr(opts, "_verify_project", None)
 		if folded_literals and target_index is not None and verify_project is not None:
-			folded = _folded_input_equivalent(oi, folded_literals, verify_project, target_index)
+			folded = _folded_input_equivalent(
+				oi, folded_literals, verify_project, target_index
+			)
 			if folded != oi:
 				return _check_inputs_match(
-					folded, mi, opts, original_blocks, remaining_blocks,
-					target_index, _allow_folded=False,
+					folded,
+					mi,
+					opts,
+					original_blocks,
+					remaining_blocks,
+					target_index,
+					_allow_folded=False,
 				)
 	if (
 		(opts.remove_unreachable or opts.remove_unused_procedures)
@@ -2923,7 +3396,12 @@ def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=Non
 			return False
 		if expected != oi:
 			return expected == mi or _check_inputs_match(
-				expected, mi, opts, None, None, target_index,
+				expected,
+				mi,
+				opts,
+				None,
+				None,
+				target_index,
 				_allow_folded=_allow_folded,
 			)
 	if not (isinstance(oi, list) and isinstance(mi, list) and len(oi) == len(mi)):
@@ -2932,7 +3410,11 @@ def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=Non
 		return False
 	if oi[0] in (1, 2):
 		if len(oi) > 1 and len(mi) > 1:
-			if isinstance(oi[1], list) and isinstance(mi[1], list) and len(oi[1]) == len(mi[1]):
+			if (
+				isinstance(oi[1], list)
+				and isinstance(mi[1], list)
+				and len(oi[1]) == len(mi[1])
+			):
 				if oi[1][0] == mi[1][0] and oi[1][0] in _NUMERIC_TAGS:
 					return _input_val_eq(oi[1][1], mi[1][1], opts)
 				return oi[1] == mi[1]
@@ -2951,7 +3433,11 @@ def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=Non
 				and oi[2][0] in (4, 5, 6, 7, 8, 10)
 			):
 				return True
-			if isinstance(oi[2], list) and isinstance(mi[2], list) and len(oi[2]) == len(mi[2]):
+			if (
+				isinstance(oi[2], list)
+				and isinstance(mi[2], list)
+				and len(oi[2]) == len(mi[2])
+			):
 				if oi[2][0] == mi[2][0] and oi[2][0] in _NUMERIC_TAGS:
 					return _input_val_eq(oi[2][1], mi[2][1], opts)
 				return oi[2] == mi[2]
@@ -2961,7 +3447,11 @@ def _check_inputs_match(oi, mi, opts, original_blocks=None, remaining_blocks=Non
 def _check_fields_match(original_fields, minified_fields, opts):
 	if original_fields == minified_fields:
 		return True
-	if not (opts.compact_field_ids and isinstance(original_fields, dict) and isinstance(minified_fields, dict)):
+	if not (
+		opts.compact_field_ids
+		and isinstance(original_fields, dict)
+		and isinstance(minified_fields, dict)
+	):
 		return False
 	if set(original_fields) != set(minified_fields):
 		return False
@@ -2985,20 +3475,27 @@ def _check_fields_match(original_fields, minified_fields, opts):
 def _check_mutation_match(original_mutation, minified_mutation, opts):
 	if original_mutation == minified_mutation:
 		return True
-	if not (isinstance(original_mutation, dict) and isinstance(minified_mutation, dict)):
+	if not (
+		isinstance(original_mutation, dict) and isinstance(minified_mutation, dict)
+	):
 		return False
 	missing_keys = set(original_mutation) - set(minified_mutation)
 	extra_keys = set(minified_mutation) - set(original_mutation)
 	allowed_missing = set()
-	if opts.compact_mutation_hasnext and missing_keys == {"hasnext"} and original_mutation.get("hasnext") in (False, "false"):
+	if (
+		opts.compact_mutation_hasnext
+		and missing_keys == {"hasnext"}
+		and original_mutation.get("hasnext") in (False, "false")
+	):
 		allowed_missing.add("hasnext")
 	if opts.compact_mutation_metadata:
-		# canonicalization of these three JSON-string arrays.
 		if missing_keys or extra_keys:
 			if missing_keys - allowed_missing or extra_keys:
 				return False
 	else:
-		if set(original_mutation) != set(minified_mutation) and (missing_keys - allowed_missing or extra_keys):
+		if set(original_mutation) != set(minified_mutation) and (
+			missing_keys - allowed_missing or extra_keys
+		):
 			return False
 	for key, ov in original_mutation.items():
 		if key not in minified_mutation:
@@ -3008,7 +3505,12 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 		mv = minified_mutation[key]
 		if ov == mv:
 			continue
-		if opts.compact_mutation_metadata and key in ("argumentids", "argumentnames", "argumentdefaults") and isinstance(ov, str) and isinstance(mv, str):
+		if (
+			opts.compact_mutation_metadata
+			and key in ("argumentids", "argumentnames", "argumentdefaults")
+			and isinstance(ov, str)
+			and isinstance(mv, str)
+		):
 			try:
 				if json.loads(ov) == json.loads(mv):
 					continue
@@ -3018,8 +3520,19 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 	return True
 
 
-def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None, target_index=None, block_id=None):
-	remaining_blocks = remaining_blocks if remaining_blocks is not None else set(original_blocks or ())
+def _check_blocks(
+	o,
+	m,
+	opts,
+	where,
+	original_blocks=None,
+	remaining_blocks=None,
+	target_index=None,
+	block_id=None,
+):
+	remaining_blocks = (
+		remaining_blocks if remaining_blocks is not None else set(original_blocks or ())
+	)
 	if set(o) != set(m):
 		gone = set(o) - set(m)
 		extra = set(m) - set(o)
@@ -3044,7 +3557,9 @@ def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None
 			allowed_gone = set()
 			if allow_repairs and remaining_blocks is not None:
 				for name in gone_inputs:
-					fixed, changed = _repair_dangling_block_ref(copy.deepcopy(o["inputs"][name]), remaining_blocks)
+					fixed, changed = _repair_dangling_block_ref(
+						copy.deepcopy(o["inputs"][name]), remaining_blocks
+					)
 					if changed and fixed is None:
 						allowed_gone.add(name)
 			if extra_inputs or gone_inputs - allowed_gone:
@@ -3056,11 +3571,18 @@ def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None
 				if folded_input is not None and (
 					folded_input == mi
 					or _check_inputs_match(
-						folded_input, mi, opts, original_blocks, remaining_blocks, target_index
+						folded_input,
+						mi,
+						opts,
+						original_blocks,
+						remaining_blocks,
+						target_index,
 					)
 				):
 					continue
-				if not _check_inputs_match(oi, mi, opts, original_blocks, remaining_blocks, target_index):
+				if not _check_inputs_match(
+					oi, mi, opts, original_blocks, remaining_blocks, target_index
+				):
 					return f"{where} (opcode: {o.get('opcode')}): input {name!r} changed from original {oi!r} to minified {mi!r}"
 		else:
 			if (
@@ -3077,8 +3599,6 @@ def _check_blocks(o, m, opts, where, original_blocks=None, remaining_blocks=None
 	return None
 
 
-
-
 _ASSET_EXTENSIONS = {
 	"costume": {"png", "svg", "jpeg", "jpg", "bmp", "gif"},
 	"sound": {"wav", "wave", "mp3"},
@@ -3086,7 +3606,6 @@ _ASSET_EXTENSIONS = {
 
 
 def _zip_entry_names(zf):
-	"""Return archive entry names, rejecting duplicate/unsafe entries."""
 	infos = zf.infolist()
 	names = [info.filename for info in infos]
 	if len(names) != len(set(names)):
@@ -3094,7 +3613,10 @@ def _zip_entry_names(zf):
 		return None, f"archive contains duplicate entry names: {dupes[:10]}"
 	for name in names:
 		if not isinstance(name, str) or not name or name.startswith("/"):
-			return None, f"archive contains an invalid absolute/empty entry name: {name!r}"
+			return (
+				None,
+				f"archive contains an invalid absolute/empty entry name: {name!r}",
+			)
 		parts = name.replace("\\", "/").split("/")
 		if any(part in ("", ".", "..") for part in parts if name != "project.json"):
 			return None, f"archive contains an unsafe entry path: {name!r}"
@@ -3102,7 +3624,11 @@ def _zip_entry_names(zf):
 
 
 def _valid_asset_id(value):
-	return isinstance(value, str) and len(value) == 32 and all(c in "0123456789abcdefABCDEF" for c in value)
+	return (
+		isinstance(value, str)
+		and len(value) == 32
+		and all(c in "0123456789abcdefABCDEF" for c in value)
+	)
 
 
 def _asset_filename(entry, kind):
@@ -3119,7 +3645,6 @@ def _asset_filename(entry, kind):
 
 
 def _validate_asset_entries(project, zf, label):
-	"""Validate every referenced costume/sound and its backing archive asset."""
 	try:
 		names, err = _zip_entry_names(zf)
 	except Exception as exc:
@@ -3151,7 +3676,9 @@ def _validate_asset_entries(project, zf, label):
 						return f"{where}: md5ext {md5ext!r} disagrees with assetId {entry['assetId']!r}"
 					allowed_exts = _ASSET_EXTENSIONS[kind]
 					if ext.lower() not in allowed_exts:
-						return f"{where}: md5ext extension {ext!r} is invalid for {kind}"
+						return (
+							f"{where}: md5ext extension {ext!r} is invalid for {kind}"
+						)
 					filename = md5ext
 				else:
 					filename = _asset_filename(entry, kind)
@@ -3174,17 +3701,22 @@ def _validate_asset_entries(project, zf, label):
 						if isinstance(br, bool) or not isinstance(br, int) or br <= 0:
 							return f"{where}: invalid bitmapResolution {br!r}"
 					for axis in ("rotationCenterX", "rotationCenterY"):
-						if axis in entry and (isinstance(entry[axis], bool) or not isinstance(entry[axis], (int, float))):
+						if axis in entry and (
+							isinstance(entry[axis], bool)
+							or not isinstance(entry[axis], (int, float))
+						):
 							return f"{where}: invalid {axis} {entry[axis]!r}"
 				else:
 					for field in ("rate", "sampleCount"):
-						if field in entry and (isinstance(entry[field], bool) or not isinstance(entry[field], (int, float))):
+						if field in entry and (
+							isinstance(entry[field], bool)
+							or not isinstance(entry[field], (int, float))
+						):
 							return f"{where}: invalid {field} {entry[field]!r}"
 	return None
 
 
 def _serialized_input_refs(value, out):
-	"""Collect only positions in Scratch input tuples that are block IDs."""
 	if not isinstance(value, list) or not value:
 		return
 	tag = value[0]
@@ -3207,7 +3739,6 @@ def _serialized_input_refs(value, out):
 
 
 def _validate_block_structure(project, label):
-	"""Strictly validate the block graph of the produced project."""
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks", {})
 		if not isinstance(blocks, dict):
@@ -3232,15 +3763,29 @@ def _validate_block_structure(project, label):
 				if ref is not None and not isinstance(ref, str):
 					return f"{where}: {key} must be null or a string"
 				if isinstance(ref, str) and ref not in blocks:
-					if key == "parent" and _is_known_orphan_argument_reporter(block, blocks):
+					if key == "parent" and _is_known_orphan_argument_reporter(
+						block, blocks
+					):
 						_orphan_parent_quirk = True
 						continue
 					return f"{where}: {key} points to missing block {ref!r}"
-			if not isinstance(block.get("inputs"), dict) or not isinstance(block.get("fields"), dict):
+			if not isinstance(block.get("inputs"), dict) or not isinstance(
+				block.get("fields"), dict
+			):
 				return f"{where}: inputs/fields must be objects"
-			if isinstance(block.get("topLevel"), bool) and block.get("topLevel") and block.get("parent") is not None:
-				return f"{where}: topLevel block has non-null parent {block['parent']!r}"
-			if isinstance(block.get("shadow"), bool) and block.get("shadow") and block.get("topLevel"):
+			if (
+				isinstance(block.get("topLevel"), bool)
+				and block.get("topLevel")
+				and block.get("parent") is not None
+			):
+				return (
+					f"{where}: topLevel block has non-null parent {block['parent']!r}"
+				)
+			if (
+				isinstance(block.get("shadow"), bool)
+				and block.get("shadow")
+				and block.get("topLevel")
+			):
 				return f"{where}: shadow block cannot be topLevel"
 			mut = block.get("mutation")
 			if mut is not None:
@@ -3258,7 +3803,7 @@ def _validate_block_structure(project, label):
 				if child in blocks:
 					input_parents.setdefault(child, set()).add(bid)
 
-		# next must be reciprocated by parent.
+		# next must be reciprocated by parent
 		for bid, block in blocks.items():
 			if not isinstance(block, dict):
 				continue
@@ -3272,9 +3817,9 @@ def _validate_block_structure(project, label):
 				pb = blocks.get(parent)
 				if not isinstance(pb, dict):
 					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent is not an object"
-				if pb.get("next") != bid and parent not in input_parents.get(bid, set()):
-					# The input-parent map is keyed by child; require this parent to
-					# actually be one of the serialized owners of the child.
+				if pb.get("next") != bid and parent not in input_parents.get(
+					bid, set()
+				):
 					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent {parent!r} does not reference this block"
 			for child in input_parents.get(bid, set()):
 				cb = blocks.get(bid)
@@ -3289,7 +3834,15 @@ def _check_costumes(original_target, minified_target, opts, zf):
 	if len(original) != len(minified):
 		return f"Target {original_target.get('name')!r}: costume count changed from {len(original)} to {len(minified)}"
 
-	allowed_keys = {"assetId", "name", "md5ext", "dataFormat", "bitmapResolution", "rotationCenterX", "rotationCenterY"}
+	allowed_keys = {
+		"assetId",
+		"name",
+		"md5ext",
+		"dataFormat",
+		"bitmapResolution",
+		"rotationCenterX",
+		"rotationCenterY",
+	}
 	for index, (co, cm) in enumerate(zip(original, minified)):
 		where = f"Target {original_target.get('name')!r}, costume {index}"
 		if not isinstance(co, dict) or not isinstance(cm, dict):
@@ -3327,12 +3880,15 @@ def _check_costumes(original_target, minified_target, opts, zf):
 
 	return None
 
+
 def _reachable_block_ids(target):
 	blocks = target.get("blocks", {})
 	edges = _build_block_graph(target)
 	roots = {
-		bid for bid, block in blocks.items()
-		if isinstance(block, list) or (isinstance(block, dict) and block.get("topLevel"))
+		bid
+		for bid, block in blocks.items()
+		if isinstance(block, list)
+		or (isinstance(block, dict) and block.get("topLevel"))
 	}
 	reachable = set()
 	stack = list(roots)
@@ -3358,7 +3914,10 @@ def _dead_procedure_block_ids(target):
 			children.setdefault(parent, set()).add(bid)
 	definitions = {}
 	for bid, block in blocks.items():
-		if not isinstance(block, dict) or block.get("opcode") != "procedures_definition":
+		if (
+			not isinstance(block, dict)
+			or block.get("opcode") != "procedures_definition"
+		):
 			continue
 		custom = (block.get("inputs") or {}).get("custom_block") or [None, None]
 		proto_id = custom[1] if len(custom) > 1 and isinstance(custom[1], str) else None
@@ -3379,6 +3938,7 @@ def _dead_procedure_block_ids(target):
 	owned = set().union(*definitions.values())
 	live = set()
 	queue = []
+
 	def seed_calls(ids):
 		for bid in ids:
 			b = blocks.get(bid)
@@ -3386,6 +3946,7 @@ def _dead_procedure_block_ids(target):
 				proc = _procedure_key(b)
 				if proc is not None and proc not in live:
 					queue.append(proc)
+
 	seed_calls(set(blocks) - owned)
 	while queue:
 		proc = queue.pop()
@@ -3416,7 +3977,6 @@ def _expected_removed_blocks(project, opts):
 			ids.update(folded_blocks[ti])
 		allowed.append(ids)
 	return allowed
-
 
 
 def _target_default_properties(target):
@@ -3461,16 +4021,25 @@ def verify(original_path, minified_path, opts):
 		if mini_assets != expected_assets:
 			diff_missing = sorted(expected_assets - mini_assets)
 			diff_extra = sorted(mini_assets - expected_assets)
-			return False, f"zip archive entries differ. Missing: {diff_missing[:10]}, unexpected extra: {diff_extra[:10]}"
+			return (
+				False,
+				f"zip archive entries differ. Missing: {diff_missing[:10]}, unexpected extra: {diff_extra[:10]}",
+			)
 		for name in orig_assets:
 			if name in conversions:
 				new_name = conversions[name]
 				new_bytes = b.read(new_name)
 				if hashlib.md5(new_bytes).hexdigest() != new_name.rsplit(".", 1)[0]:
-					return False, f"converted asset {new_name!r} does not match its MD5 asset ID"
+					return (
+						False,
+						f"converted asset {new_name!r} does not match its MD5 asset ID",
+					)
 			else:
 				if a.read(name) != b.read(name):
-					return False, f"asset byte-for-byte mismatch: {name!r} ({len(a.read(name))} bytes vs {len(b.read(name))} bytes)"
+					return (
+						False,
+						f"asset byte-for-byte mismatch: {name!r} ({len(a.read(name))} bytes vs {len(b.read(name))} bytes)",
+					)
 
 		try:
 			orig_raw = json.loads(a.read("project.json"))
@@ -3479,7 +4048,9 @@ def verify(original_path, minified_path, opts):
 			return False, f"project.json is not valid UTF-8 JSON: {exc}"
 		if not isinstance(orig_raw, dict) or not isinstance(mini_raw_project, dict):
 			return False, "project.json root must be an object"
-		if not isinstance(orig_raw.get("targets"), list) or not isinstance(mini_raw_project.get("targets"), list):
+		if not isinstance(orig_raw.get("targets"), list) or not isinstance(
+			mini_raw_project.get("targets"), list
+		):
 			return False, "project.json targets must be arrays"
 		orig = _reinflate(orig_raw)
 		mini = _reinflate(mini_raw_project)
@@ -3488,9 +4059,6 @@ def verify(original_path, minified_path, opts):
 		err = _validate_asset_entries(mini, b, "minified project")
 		if err:
 			return False, err
-		# The original is checked too, but referenced assets may legitimately be
-		# renamed by an explicitly requested WAV->MP3 conversion. Its asset bytes
-		# still have to be internally consistent.
 		err = _validate_asset_entries(orig, a, "original project")
 		if err:
 			return False, err
@@ -3501,7 +4069,10 @@ def verify(original_path, minified_path, opts):
 		conflicts = getattr(opts, "broadcast_repair_conflicts", {}) or {}
 		if conflicts:
 			first_id = sorted(conflicts)[0]
-			return False, f"broadcast {first_id!r} has conflicting reference names {conflicts[first_id]!r}; refusing to guess a definition"
+			return (
+				False,
+				f"broadcast {first_id!r} has conflicting reference names {conflicts[first_id]!r}; refusing to guess a definition",
+			)
 		err = _check_broadcast_ids_resolve(mini_raw_project)
 		if err:
 			return False, err
@@ -3523,11 +4094,19 @@ def verify(original_path, minified_path, opts):
 				if key == "meta" and opts.remove_project_meta:
 					mo = orig.get("meta") or {}
 					mm = mini.get("meta") or {}
-					if mo.get("semver") == mm.get("semver") and mo.get("vm") == mm.get("vm"):
+					if mo.get("semver") == mm.get("semver") and mo.get("vm") == mm.get(
+						"vm"
+					):
 						continue
-				return False, f"Top-level project key {key!r} changed: original has {orig.get(key)!r}, minified has {mini.get(key)!r}"
+				return (
+					False,
+					f"Top-level project key {key!r} changed: original has {orig.get(key)!r}, minified has {mini.get(key)!r}",
+				)
 		if len(orig["targets"]) != len(mini["targets"]):
-			return False, f"Target count changed: original has {len(orig['targets'])}, minified has {len(mini['targets'])}"
+			return (
+				False,
+				f"Target count changed: original has {len(orig['targets'])}, minified has {len(mini['targets'])}",
+			)
 
 		allowed_removed_by_target = _expected_removed_blocks(orig, opts)
 
@@ -3551,45 +4130,85 @@ def verify(original_path, minified_path, opts):
 			allowed_container_keys = set()
 			if opts.remove_empty_target_containers:
 				allowed_container_keys.update(
-				k for k in missing_target_keys
+					k
+					for k in missing_target_keys
 					if k in ("lists", "broadcasts", "comments") and to.get(k) == {}
 				)
 			if opts.remove_unused_lists and "lists" in missing_target_keys:
 				allowed_container_keys.add("lists")
 			if opts.remove_unused_broadcasts and "broadcasts" in missing_target_keys:
 				allowed_container_keys.add("broadcasts")
-			if opts.comments and not to.get("isStage") and "comments" in missing_target_keys:
+			if (
+				opts.comments
+				and not to.get("isStage")
+				and "comments" in missing_target_keys
+			):
 				allowed_container_keys.add("comments")
 			allowed_default_keys = set()
 			if opts.remove_default_target_properties:
 				defaults = _target_default_properties(to)
 				allowed_default_keys = {
-					k for k in missing_target_keys
+					k
+					for k in missing_target_keys
 					if k in defaults and to.get(k) == defaults[k]
 				}
-			if missing_target_keys - allowed_default_keys - allowed_container_keys or extra_target_keys:
-				return False, f"Target {ti} ({name!r}): target keys changed. Missing: {sorted(missing_target_keys - allowed_default_keys - allowed_container_keys)}, unexpected extra: {sorted(extra_target_keys)}"
+			if (
+				missing_target_keys - allowed_default_keys - allowed_container_keys
+				or extra_target_keys
+			):
+				return (
+					False,
+					f"Target {ti} ({name!r}): target keys changed. Missing: {sorted(missing_target_keys - allowed_default_keys - allowed_container_keys)}, unexpected extra: {sorted(extra_target_keys)}",
+				)
 			for k in to:
-				if k in ("blocks", "comments", "lists", "variables", "sounds", "costumes", "broadcasts"):
+				if k in (
+					"blocks",
+					"comments",
+					"lists",
+					"variables",
+					"sounds",
+					"costumes",
+					"broadcasts",
+				):
 					continue
 				if k not in tm and k in allowed_default_keys:
 					continue
 				if to[k] != tm[k]:
 					if opts.normalize_numbers and _num_eq(to[k], tm[k]):
 						continue
-					return False, f"Target {ti} ({name!r}): property {k!r} changed from {to[k]!r} to {tm[k]!r}"
+					return (
+						False,
+						f"Target {ti} ({name!r}): property {k!r} changed from {to[k]!r} to {tm[k]!r}",
+					)
 
 			to_bcasts = to.get("broadcasts", {})
 			tm_bcasts = tm.get("broadcasts", {})
 			unexpected_bcasts = set(tm_bcasts) - set(to_bcasts)
 			allowed_repaired = set(getattr(opts, "repaired_broadcast_ids", ()) or ())
 			if unexpected_bcasts - allowed_repaired:
-				return False, f"Target {ti} ({name!r}): unexpected new broadcast ID(s) appeared in minified project: {sorted(unexpected_bcasts - allowed_repaired)}"
+				return (
+					False,
+					f"Target {ti} ({name!r}): unexpected new broadcast ID(s) appeared in minified project: {sorted(unexpected_bcasts - allowed_repaired)}",
+				)
 			missing_bcasts = set(to_bcasts) - set(tm_bcasts)
-			if missing_bcasts and not (opts.remove_unused_broadcasts or (opts.remove_empty_containers and not to.get("isStage") and not to_bcasts)):
-				return False, f"Target {ti} ({name!r}): {len(missing_bcasts)} broadcast(s) removed without --remove-unused-broadcasts: {sorted(missing_bcasts)}"
+			if missing_bcasts and not (
+				opts.remove_unused_broadcasts
+				or (
+					opts.remove_empty_containers
+					and not to.get("isStage")
+					and not to_bcasts
+				)
+			):
+				return (
+					False,
+					f"Target {ti} ({name!r}): {len(missing_bcasts)} broadcast(s) removed without --remove-unused-broadcasts: {sorted(missing_bcasts)}",
+				)
 			if missing_bcasts and opts.remove_unused_broadcasts:
-				still_used_bcasts = {bid: mini_bcast_refs.get(bid, []) for bid in missing_bcasts if bid in mini_bcast_refs}
+				still_used_bcasts = {
+					bid: mini_bcast_refs.get(bid, [])
+					for bid in missing_bcasts
+					if bid in mini_bcast_refs
+				}
 				if still_used_bcasts:
 					first_bid = next(iter(still_used_bcasts))
 					return False, (
@@ -3598,20 +4217,37 @@ def verify(original_path, minified_path, opts):
 					)
 			for bid, bo in to_bcasts.items():
 				if bid in tm_bcasts and bo != tm_bcasts[bid]:
-					return False, f"Target {ti} ({name!r}): broadcast name for id {bid!r} changed from {bo!r} to {tm_bcasts[bid]!r}"
+					return (
+						False,
+						f"Target {ti} ({name!r}): broadcast name for id {bid!r} changed from {bo!r} to {tm_bcasts[bid]!r}",
+					)
 
 			to_vars = to.get("variables", {})
 			tm_vars = tm.get("variables", {})
 			if set(tm_vars) - set(to_vars):
-				return False, f"Target {ti} ({name!r}): unexpected new variable ID(s) appeared in minified project: {sorted(set(tm_vars) - set(to_vars))}"
+				return (
+					False,
+					f"Target {ti} ({name!r}): unexpected new variable ID(s) appeared in minified project: {sorted(set(tm_vars) - set(to_vars))}",
+				)
 			missing_vars = set(to_vars) - set(tm_vars)
 			if missing_vars and not opts.remove_unused_variables:
-				return False, f"Target {ti} ({name!r}): {len(missing_vars)} variable(s) removed without --remove-unused-variables: {sorted(missing_vars)}"
+				return (
+					False,
+					f"Target {ti} ({name!r}): {len(missing_vars)} variable(s) removed without --remove-unused-variables: {sorted(missing_vars)}",
+				)
 			if missing_vars:
-				still_used = {vid: mini_var_refs.get((ti, vid), []) for vid in missing_vars if (ti, vid) in mini_var_refs}
+				still_used = {
+					vid: mini_var_refs.get((ti, vid), [])
+					for vid in missing_vars
+					if (ti, vid) in mini_var_refs
+				}
 				if still_used:
 					first_vid = next(iter(still_used))
-					first_name = to_vars[first_vid][0] if isinstance(to_vars[first_vid], list) and to_vars[first_vid] else first_vid
+					first_name = (
+						to_vars[first_vid][0]
+						if isinstance(to_vars[first_vid], list) and to_vars[first_vid]
+						else first_vid
+					)
 					return False, (
 						f"Target {ti} ({name!r}): variable {first_name!r} (id: {first_vid!r}) was removed, "
 						f"but is still referenced in the minified project by: {', '.join(still_used[first_vid])}"
@@ -3631,20 +4267,37 @@ def verify(original_path, minified_path, opts):
 						and (len(vo) < 3 or vo[2:] == vm[2:])
 					):
 						continue
-					return False, f"Target {ti} ({name!r}): variable {vo[0] if isinstance(vo, list) and vo else vid!r} (id: {vid!r}) value changed from {vo!r} to {vm!r}"
+					return (
+						False,
+						f"Target {ti} ({name!r}): variable {vo[0] if isinstance(vo, list) and vo else vid!r} (id: {vid!r}) value changed from {vo!r} to {vm!r}",
+					)
 
 			to_lists = to.get("lists", {})
 			tm_lists = tm.get("lists", {})
 			if set(tm_lists) - set(to_lists):
-				return False, f"Target {ti} ({name!r}): unexpected new list ID(s) appeared in minified project: {sorted(set(tm_lists) - set(to_lists))}"
+				return (
+					False,
+					f"Target {ti} ({name!r}): unexpected new list ID(s) appeared in minified project: {sorted(set(tm_lists) - set(to_lists))}",
+				)
 			missing_lists = set(to_lists) - set(tm_lists)
 			if missing_lists and not opts.remove_unused_lists:
-				return False, f"Target {ti} ({name!r}): {len(missing_lists)} list(s) removed without --remove-unused-lists: {sorted(missing_lists)}"
+				return (
+					False,
+					f"Target {ti} ({name!r}): {len(missing_lists)} list(s) removed without --remove-unused-lists: {sorted(missing_lists)}",
+				)
 			if missing_lists:
-				still_used = {lid: mini_list_refs.get((ti, lid), []) for lid in missing_lists if (ti, lid) in mini_list_refs}
+				still_used = {
+					lid: mini_list_refs.get((ti, lid), [])
+					for lid in missing_lists
+					if (ti, lid) in mini_list_refs
+				}
 				if still_used:
 					first_lid = next(iter(still_used))
-					first_name = to_lists[first_lid][0] if isinstance(to_lists[first_lid], list) and to_lists[first_lid] else first_lid
+					first_name = (
+						to_lists[first_lid][0]
+						if isinstance(to_lists[first_lid], list) and to_lists[first_lid]
+						else first_lid
+					)
 					return False, (
 						f"Target {ti} ({name!r}): list {first_name!r} (id: {first_lid!r}) was removed, "
 						f"but is still referenced in the minified project by: {', '.join(still_used[first_lid])}"
@@ -3664,10 +4317,7 @@ def verify(original_path, minified_path, opts):
 					and isinstance(lo[1], list)
 					and isinstance(lm[1], list)
 					and len(lo[1]) == len(lm[1])
-					and all(
-						x == y or _num_eq(x, y)
-						for x, y in zip(lo[1], lm[1])
-					)
+					and all(x == y or _num_eq(x, y) for x, y in zip(lo[1], lm[1]))
 				):
 					continue
 				if not (
@@ -3682,9 +4332,21 @@ def verify(original_path, minified_path, opts):
 						f"Target {ti} ({name!r}): list {lo[0]!r} (id: {lid!r}) changed from {len(lo[1]) if isinstance(lo, list) and len(lo)>1 and isinstance(lo[1], list) else 'N/A'} items to {len(lm[1]) if isinstance(lm, list) and len(lm)>1 and isinstance(lm[1], list) else 'N/A'} items but was not approved for clearing",
 					)
 
-			if set(tm["blocks"]) - set(to["blocks"]):
-				extra_blocks = sorted(set(tm["blocks"]) - set(to["blocks"]))
-				return False, f"Target {ti} ({name!r}): {len(extra_blocks)} unexpected new block ID(s) appeared: {extra_blocks[:10]}"
+			new_block_sets = (
+				getattr(opts, "folded_constant_expression_new_blocks", None) or []
+			)
+			allowed_new_blocks = (
+				new_block_sets[ti] if ti < len(new_block_sets) else set()
+			)
+			unexpected_blocks = (
+				set(tm["blocks"]) - set(to["blocks"]) - allowed_new_blocks
+			)
+			if unexpected_blocks:
+				extra_blocks = sorted(unexpected_blocks)
+				return (
+					False,
+					f"Target {ti} ({name!r}): {len(extra_blocks)} unexpected new block ID(s) appeared: {extra_blocks[:10]}",
+				)
 			missing_blocks = set(to["blocks"]) - set(tm["blocks"])
 			illegal_missing = missing_blocks - allowed_removed_by_target[ti]
 			if illegal_missing:
@@ -3705,9 +4367,21 @@ def verify(original_path, minified_path, opts):
 						and all(_num_eq(x, y) or x == y for x, y in zip(bo[3:], bm[3:]))
 					)
 					if not (ok and (opts.positions or bo == bm)):
-						return False, f"Target {ti} ({name!r}), primitive block {bid!r} changed from {bo!r} to {bm!r}"
+						return (
+							False,
+							f"Target {ti} ({name!r}), primitive block {bid!r} changed from {bo!r} to {bm!r}",
+						)
 					continue
-				err = _check_blocks(bo, bm, opts, f"Target {ti} ({name!r}), block {bid!r}", to["blocks"], set(tm["blocks"]), ti, bid)
+				err = _check_blocks(
+					bo,
+					bm,
+					opts,
+					f"Target {ti} ({name!r}), block {bid!r}",
+					to["blocks"],
+					set(tm["blocks"]),
+					ti,
+					bid,
+				)
 				if err:
 					return False, err
 				if not isinstance(bm.get("inputs"), dict) or not isinstance(
@@ -3718,38 +4392,68 @@ def verify(original_path, minified_path, opts):
 						f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): inputs or fields is not a dict (violates Scratch VM format)",
 					)
 				if "next" not in bm or "parent" not in bm:
-					return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute"
+					return (
+						False,
+						f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute",
+					)
 				mu = bm.get("mutation")
 				if mu is not None:
 					if not isinstance(mu, dict):
-						return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): mutation is not an object"
-					if not opts.compact_mutation_metadata and ("tagName" not in mu or "children" not in mu):
-						return False, f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children"
+						return (
+							False,
+							f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): mutation is not an object",
+						)
+					if not opts.compact_mutation_metadata and (
+						"tagName" not in mu or "children" not in mu
+					):
+						return (
+							False,
+							f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children",
+						)
 
 			co, cm = to.get("comments", {}), tm.get("comments", {})
 			if not isinstance(cm, dict):
-				return False, f"Target {ti} ({name!r}): comments is not a dict (violates Scratch VM format)"
+				return (
+					False,
+					f"Target {ti} ({name!r}): comments is not a dict (violates Scratch VM format)",
+				)
 			if opts.comments and not to.get("isStage"):
 				if cm:
-					return False, f"Target {ti} ({name!r}): comments remain ({len(cm)} comments) despite comment stripping enabled"
+					return (
+						False,
+						f"Target {ti} ({name!r}): comments remain ({len(cm)} comments) despite comment stripping enabled",
+					)
 			else:
 				if set(co) != set(cm):
-					return False, f"Target {ti} ({name!r}): comment ID set changed. Missing: {sorted(set(co) - set(cm))}, extra: {sorted(set(cm) - set(co))}"
+					return (
+						False,
+						f"Target {ti} ({name!r}): comment ID set changed. Missing: {sorted(set(co) - set(cm))}, extra: {sorted(set(cm) - set(co))}",
+					)
 				for cid in co:
 					for f in set(co[cid]) | set(cm[cid]):
 						x, y = co[cid].get(f), cm[cid].get(f)
 						if f in ("x", "y", "width", "height") and opts.positions:
 							if not (x == y or _num_eq(x, y)):
-								return False, f"Target {ti} ({name!r}): comment {cid!r} attribute {f!r} changed from {x!r} to {y!r}"
+								return (
+									False,
+									f"Target {ti} ({name!r}): comment {cid!r} attribute {f!r} changed from {x!r} to {y!r}",
+								)
 						elif x != y:
-							return False, f"Target {ti} ({name!r}): comment {cid!r} attribute {f!r} changed from {x!r} to {y!r}"
+							return (
+								False,
+								f"Target {ti} ({name!r}): comment {cid!r} attribute {f!r} changed from {x!r} to {y!r}",
+							)
 			if opts.comments and not to.get("isStage"):
 				dangling_comments = [
-					bid for bid, x in tm["blocks"].items()
+					bid
+					for bid, x in tm["blocks"].items()
 					if isinstance(x, dict) and "comment" in x
 				]
 				if dangling_comments:
-					return False, f"Target {ti} ({name!r}): dangling block.comment link in block(s): {dangling_comments[:10]}"
+					return (
+						False,
+						f"Target {ti} ({name!r}): dangling block.comment link in block(s): {dangling_comments[:10]}",
+					)
 
 			err = _check_sounds(to, tm, opts)
 			if err:
@@ -3792,7 +4496,9 @@ def _check_sounds(original_target, minified_target, opts):
 			continue
 
 		expected = dict(so)
-		old_name = so.get("md5ext") or (f"{so.get('assetId')}.wav" if so.get("dataFormat") == "wav" else None)
+		old_name = so.get("md5ext") or (
+			f"{so.get('assetId')}.wav" if so.get("dataFormat") == "wav" else None
+		)
 		if so.get("dataFormat") == "wav" and old_name in conversions:
 			new_name = conversions[old_name]
 			expected["assetId"] = new_name.rsplit(".", 1)[0]
@@ -3817,7 +4523,11 @@ def _check_sounds(original_target, minified_target, opts):
 def _check_monitors(orig, mini, opts):
 	mo, mm = orig.get("monitors", []), mini.get("monitors", [])
 	if not opts.monitors:
-		return None if mo == mm else "monitors changed without monitor optimization (use --keep-monitors to preserve)"
+		return (
+			None
+			if mo == mm
+			else "monitors changed without monitor optimization (use --keep-monitors to preserve)"
+		)
 
 	def key(m):
 		return (m.get("id"), m.get("spriteName"), m.get("opcode"))
@@ -3945,7 +4655,11 @@ def minify_sb3(src, dst, opts=None):
 			opts.folded_constant_variables = picked
 			opts.folded_constant_variable_literals = dict(picked)
 
-		asset_infos = {item.filename: item for item in zin.infolist() if item.filename != "project.json"}
+		asset_infos = {
+			item.filename: item
+			for item in zin.infolist()
+			if item.filename != "project.json"
+		}
 		assets = {
 			item.filename: zin.read(item.filename)
 			for item in zin.infolist()
@@ -3954,20 +4668,30 @@ def minify_sb3(src, dst, opts=None):
 
 		stats = apply_transforms(project, opts, assets)
 		out_json = dumps_compact(project, opts.sort_keys).encode("utf-8")
-		with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=opts.compression_level) as zout:
+		with zipfile.ZipFile(
+			dst, "w", zipfile.ZIP_DEFLATED, compresslevel=opts.compression_level
+		) as zout:
 			zout.writestr("project.json", out_json)
 			for name, data in assets.items():
 				written = False
-				if opts.preserve_asset_compression and name in asset_infos and zin.read(name) == data:
+				if (
+					opts.preserve_asset_compression
+					and name in asset_infos
+					and zin.read(name) == data
+				):
 					orig_info = asset_infos[name]
 					if orig_info.compress_type == zipfile.ZIP_DEFLATED:
-						py_comp_size = len(zlib.compress(data, opts.compression_level)) - 6
+						py_comp_size = (
+							len(zlib.compress(data, opts.compression_level)) - 6
+						)
 						if orig_info.compress_size <= py_comp_size:
 							zin.fp.seek(orig_info.header_offset)
 							header = zin.fp.read(30)
 							fn_len = int.from_bytes(header[26:28], "little")
 							extra_len = int.from_bytes(header[28:30], "little")
-							zin.fp.seek(orig_info.header_offset + 30 + fn_len + extra_len)
+							zin.fp.seek(
+								orig_info.header_offset + 30 + fn_len + extra_len
+							)
 							raw_comp = zin.fp.read(orig_info.compress_size)
 
 							zinfo = zipfile.ZipInfo(name)
@@ -3985,12 +4709,14 @@ def minify_sb3(src, dst, opts=None):
 							zout.start_dir = zout.fp.tell()
 							written = True
 				if not written:
-					zout.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=opts.compression_level)
+					zout.writestr(
+						name,
+						data,
+						compress_type=zipfile.ZIP_DEFLATED,
+						compresslevel=opts.compression_level,
+					)
 
-	print(
-		f'Input : "{src}"\nOutput: "{dst}"\n\n'
-		+ Ansi.heading("Transforms applied:")
-	)
+	print(f'Input : "{src}"\nOutput: "{dst}"\n\n' + Ansi.heading("Transforms applied:"))
 	for k, label in STAT_ORDER:
 		print(Ansi.muted(f"  {label:40} {stats[k]:>8,}"))
 	b, a = len(raw), len(out_json)
@@ -4057,7 +4783,12 @@ if __name__ == "__main__":
 		"--fold-constant-expressions",
 		"--remove-empty-target-containers",
 	}
-	valued = {"--list-bytes", "--list-items", "--compression-level", "--normalize-epsilon"}
+	valued = {
+		"--list-bytes",
+		"--list-items",
+		"--compression-level",
+		"--normalize-epsilon",
+	}
 	values, bad = {}, []
 	for f in flags:
 		key, eq, val = f.partition("=")
@@ -4102,32 +4833,58 @@ if __name__ == "__main__":
 		covered=("--keep-covered" not in flags),
 		monitors=("--keep-monitors" not in flags),
 		lists=False if ("--keep-lists" in flags or all_optimizations) else True,
-		rename_block_ids=all_optimizations or "--rename-block-ids" in flags or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
-		rename_variable_ids=all_optimizations or "--rename-variable-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
-		rename_list_ids=all_optimizations or "--rename-list-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
-		rename_broadcast_ids=all_optimizations or "--rename-broadcast-ids" in flags or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
+		rename_block_ids=all_optimizations
+		or "--rename-block-ids" in flags
+		or "--frequency-block-ids" in flags
+		or "--order-block-ids-by-frequency" in flags,
+		rename_variable_ids=all_optimizations
+		or "--rename-variable-ids" in flags
+		or "--frequency-data-ids" in flags
+		or "--order-data-ids-by-frequency" in flags,
+		rename_list_ids=all_optimizations
+		or "--rename-list-ids" in flags
+		or "--frequency-data-ids" in flags
+		or "--order-data-ids-by-frequency" in flags,
+		rename_broadcast_ids=all_optimizations
+		or "--rename-broadcast-ids" in flags
+		or "--frequency-data-ids" in flags
+		or "--order-data-ids-by-frequency" in flags,
 		rename_argument_ids=all_optimizations or "--rename-argument-ids" in flags,
-		remove_unused_variables=all_optimizations or "--remove-unused-variables" in flags,
+		remove_unused_variables=all_optimizations
+		or "--remove-unused-variables" in flags,
 		remove_unused_lists=all_optimizations or "--remove-unused-lists" in flags,
-		remove_unused_broadcasts=all_optimizations or "--remove-unused-broadcasts" in flags,
+		remove_unused_broadcasts=all_optimizations
+		or "--remove-unused-broadcasts" in flags,
 		remove_unreachable=all_optimizations or "--remove-unreachable" in flags,
-		remove_unused_procedures=all_optimizations or "--remove-unused-procedures" in flags,
+		remove_unused_procedures=all_optimizations
+		or "--remove-unused-procedures" in flags,
 		normalize_numbers=all_optimizations or "--normalize-numbers" in flags,
 		remove_empty_fields=all_optimizations or "--remove-empty-fields" in flags,
 		remove_empty_inputs=all_optimizations or "--remove-empty-inputs" in flags,
-		remove_costume_metadata=all_optimizations or "--remove-costume-metadata" in flags,
-		remove_default_target_properties=all_optimizations or "--remove-default-target-properties" in flags,
-		remove_empty_target_containers=all_optimizations or "--remove-empty-containers" in flags or "--remove-empty-target-containers" in flags,
+		remove_costume_metadata=all_optimizations
+		or "--remove-costume-metadata" in flags,
+		remove_default_target_properties=all_optimizations
+		or "--remove-default-target-properties" in flags,
+		remove_empty_target_containers=all_optimizations
+		or "--remove-empty-containers" in flags
+		or "--remove-empty-target-containers" in flags,
 		remove_project_meta=all_optimizations or "--remove-project-meta" in flags,
-		preserve_asset_compression=all_optimizations or "--preserve-asset-compression" in flags,
-		frequency_block_ids=all_optimizations or "--frequency-block-ids" in flags or "--order-block-ids-by-frequency" in flags,
-		frequency_data_ids=all_optimizations or "--frequency-data-ids" in flags or "--order-data-ids-by-frequency" in flags,
+		preserve_asset_compression=all_optimizations
+		or "--preserve-asset-compression" in flags,
+		frequency_block_ids=all_optimizations
+		or "--frequency-block-ids" in flags
+		or "--order-block-ids-by-frequency" in flags,
+		frequency_data_ids=all_optimizations
+		or "--frequency-data-ids" in flags
+		or "--order-data-ids-by-frequency" in flags,
 		compact_numeric_inputs=all_optimizations or "--compact-numeric-inputs" in flags,
 		compact_field_ids=all_optimizations or "--compact-field-ids" in flags,
-		compact_mutation_hasnext=all_optimizations or "--compact-mutation-hasnext" in flags,
+		compact_mutation_hasnext=all_optimizations
+		or "--compact-mutation-hasnext" in flags,
 		compact_mutation_metadata="--compact-mutation-metadata" in flags,
 		fold_constant_variables="--fold-constant-variables" in flags,
-		fold_constant_expressions=all_optimizations or "--fold-constant-expressions" in flags,
+		fold_constant_expressions=all_optimizations
+		or "--fold-constant-expressions" in flags,
 		compress_assets=all_optimizations or "--compress-assets" in flags,
 		convert_wav_to_mp3=all_optimizations or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
