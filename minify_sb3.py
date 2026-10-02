@@ -13,7 +13,7 @@ from collections import Counter
 BLOCK_ID_ALPHABET = " !@#$%^*()+_-={}|[]:;?,./~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
-class Ansi:
+class AnsiPrint:
 	RESET = "\033[0m"
 	BOLD = "\033[1m"
 	DIM = "\033[2m"
@@ -53,7 +53,7 @@ class Ansi:
 		return self.paint(text, self.BOLD)
 
 
-Ansi = Ansi()
+Ansi = AnsiPrint()
 
 
 def _short_id(index):
@@ -4603,140 +4603,538 @@ def _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
 	)
 
 
+def _demorgan_boolean_input(value, blocks, owner_id=None):
+	"""
+	Apply De Morgan's law in exactly one direction:
+
+	    (not a) and (not b) -> not (a or b)
+	    (not a) or  (not b) -> not (a and b)
+
+	The reverse direction is deliberately never attempted.
+
+	Only the canonical direct-block shape is rewritten. The existing NOT and
+	logical blocks are reused, and only the redundant right NOT block is removed.
+	Unusual/shared structures are rejected rather than reinterpreted.
+	"""
+	if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
+		return None
+
+	logic_id = value[1]
+	if not isinstance(logic_id, str) or logic_id not in blocks:
+		return None
+	logic = blocks.get(logic_id)
+	if not isinstance(logic, dict) or logic.get("opcode") not in ("operator_and", "operator_or"):
+		return None
+	if owner_id is not None:
+		if owner_id == logic_id or logic.get("parent") != owner_id:
+			return None
+		if _fold_ids_have_external_refs({logic_id}, blocks, owner_id):
+			return None
+
+	inputs = logic.get("inputs") or {}
+	left_raw = inputs.get("OPERAND1")
+	right_raw = inputs.get("OPERAND2")
+	for raw in (left_raw, right_raw):
+		if not (
+			isinstance(raw, list)
+			and len(raw) > 1
+			and raw[0] in (2, 3)
+			and isinstance(raw[1], str)
+		):
+			return None
+
+	left_not_id = left_raw[1]
+	right_not_id = right_raw[1]
+	if (
+		left_not_id == right_not_id
+		or left_not_id in (logic_id, owner_id)
+		or right_not_id in (logic_id, owner_id)
+	):
+		return None
+	if _fold_ids_have_external_refs({left_not_id}, blocks, logic_id):
+		return None
+	if _fold_ids_have_external_refs({right_not_id}, blocks, logic_id):
+		return None
+
+	left_not = blocks.get(left_not_id)
+	right_not = blocks.get(right_not_id)
+	if not (
+		isinstance(left_not, dict)
+		and isinstance(right_not, dict)
+		and left_not.get("opcode") == "operator_not"
+		and right_not.get("opcode") == "operator_not"
+	):
+		return None
+
+	# Reporter blocks should not carry statement chains.
+	if (
+		logic.get("next") is not None
+		or left_not.get("next") is not None
+		or right_not.get("next") is not None
+	):
+		return None
+	if left_not.get("parent") != logic_id or right_not.get("parent") != logic_id:
+		return None
+
+	left_inputs = left_not.get("inputs") or {}
+	right_inputs = right_not.get("inputs") or {}
+	left_operand = left_inputs.get("OPERAND")
+	right_operand = right_inputs.get("OPERAND")
+	if not (
+		isinstance(left_operand, list)
+		and len(left_operand) > 1
+		and isinstance(right_operand, list)
+		and len(right_operand) > 1
+	):
+		return None
+
+	# The operand trees are moved from the NOT blocks to the new inner
+	# logical block, so they must not be shared elsewhere.
+	left_owned = _exclusive_input_block_subtree(left_operand, blocks, left_not_id)
+	right_owned = _exclusive_input_block_subtree(right_operand, blocks, right_not_id)
+	if left_owned is None or right_owned is None:
+		return None
+
+	left_root = left_operand[1] if isinstance(left_operand[1], str) else None
+	right_root = right_operand[1] if isinstance(right_operand[1], str) else None
+	if left_root and left_root == right_root:
+		return None
+	for root in (left_root, right_root):
+		if root in (logic_id, left_not_id, right_not_id, owner_id):
+			return None
+
+	# Caller-owned input: point the containing block at the surviving outer NOT.
+	# Use the primary-block form so an existing owner shadow is not duplicated
+	# into the new outer NOT input.
+	new_owner_input = [2, left_not_id]
+
+	# Outer NOT input: point at the repurposed logical block while preserving the
+	# original left operand's input/shadow representation.
+	new_outer_input = copy.deepcopy(left_operand)
+	new_outer_input[1] = logic_id
+
+	return {
+		"logic_id": logic_id,
+		"left_not_id": left_not_id,
+		"right_not_id": right_not_id,
+		"old_logic_parent": logic.get("parent"),
+		"new_owner_input": new_owner_input,
+		"new_outer_input": new_outer_input,
+		"new_inner_left": copy.deepcopy(left_operand),
+		"new_inner_right": copy.deepcopy(right_operand),
+		"new_inner_opcode": (
+			"operator_or"
+			if logic.get("opcode") == "operator_and"
+			else "operator_and"
+		),
+		"changed_ids": (
+			{logic_id, left_not_id, right_not_id}
+			| left_owned
+			| right_owned
+		),
+	}
+
+
+def _direct_input_block_refs(value, blocks):
+    """Return block IDs directly stored as primary/shadow refs in one input."""
+    if not isinstance(value, list) or not value:
+        return ()
+    refs = []
+    if value[0] in (2, 3) and len(value) > 1:
+        ref = value[1]
+        if isinstance(ref, str) and ref in blocks:
+            refs.append(ref)
+    if value[0] == 3 and len(value) > 2:
+        ref = value[2]
+        if isinstance(ref, str) and ref in blocks:
+            refs.append(ref)
+    return tuple(refs)
+
+
+def _incoming_block_ref_counts(target):
+    """Count serialized input/next references to each block once per target."""
+    blocks = target.get("blocks") or {}
+    refs = Counter()
+    for block in blocks.values():
+        if not isinstance(block, dict):
+            continue
+        nxt = block.get("next")
+        if isinstance(nxt, str) and nxt in blocks:
+            refs[nxt] += 1
+        for value in (block.get("inputs") or {}).values():
+            for bid in _input_block_ids(value, blocks):
+                refs[bid] += 1
+    return refs
+
+
+def _exclusive_input_block_subtree_fast(value, blocks, owner_id, incoming_refs):
+    """Find an exclusively owned input subtree without scanning all blocks."""
+    roots = _direct_input_block_refs(value, blocks)
+    if not roots:
+        return set()
+
+    candidate = set()
+    stack = list(roots)
+    while stack:
+        bid = stack.pop()
+        if bid in candidate:
+            continue
+        block = blocks.get(bid)
+        if not isinstance(block, dict) or block.get("topLevel") is True:
+            return None
+        if incoming_refs.get(bid, 0) != 1:
+            return None
+        candidate.add(bid)
+        nxt = block.get("next")
+        if isinstance(nxt, str) and nxt in blocks:
+            stack.append(nxt)
+        for value2 in (block.get("inputs") or {}).values():
+            stack.extend(_input_block_ids(value2, blocks))
+
+    roots_set = set(roots)
+    for bid in candidate:
+        block = blocks.get(bid)
+        parent = block.get("parent") if isinstance(block, dict) else None
+        if bid in roots_set:
+            if parent != owner_id:
+                return None
+        elif parent not in candidate:
+            return None
+    return candidate
+
+
 def _constant_to_scratch_input(constant, blocks, parent_id):
-	kind, value = constant
-	if kind == "number":
-		number = int(value) if isinstance(value, float) and value.is_integer() else value
-		return [1, [4, number]], set()
-	if kind == "string":
-		return [1, [10, value]], set()
-	if kind == "bool":
-		return [1, [10, "true" if value else "false"]], set()
-	return None, set()
+    kind, value = constant
+    if kind == "number":
+        number = int(value) if isinstance(value, float) and value.is_integer() else value
+        return [1, [4, number]], set()
+    if kind == "string":
+        return [1, [10, value]], set()
+    if kind == "bool":
+        return [1, [10, "true" if value else "false"]], set()
+    return None, set()
 
 
 def _fold_ids_have_external_refs(folded_ids, blocks, owner_id):
-	folded_ids = set(folded_ids)
-	for bid, block in blocks.items():
-		if bid in folded_ids or bid == owner_id or not isinstance(block, dict):
-			continue
-		nxt = block.get("next")
-		if isinstance(nxt, str) and nxt in folded_ids:
-			return True
-		for value in (block.get("inputs") or {}).values():
-			if _input_block_ids(value, blocks) & folded_ids:
-				return True
-	return False
+    folded_ids = set(folded_ids)
+    for bid, block in blocks.items():
+        if bid in folded_ids or bid == owner_id or not isinstance(block, dict):
+            continue
+        nxt = block.get("next")
+        if isinstance(nxt, str) and nxt in folded_ids:
+            return True
+        for value in (block.get("inputs") or {}).values():
+            if _input_block_ids(value, blocks) & folded_ids:
+                return True
+    return False
+
+
+def _demorgan_boolean_input(value, blocks, owner_id=None, incoming_refs=None):
+    """
+    Apply De Morgan's law in exactly one direction:
+
+        (not a) and (not b) -> not (a or b)
+        (not a) or  (not b) -> not (a and b)
+
+    The reverse direction is deliberately never attempted.
+    """
+    if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
+        return None
+
+    logic_id = value[1]
+    if not isinstance(logic_id, str) or logic_id not in blocks:
+        return None
+    logic = blocks[logic_id]
+    if not isinstance(logic, dict) or logic.get("opcode") not in ("operator_and", "operator_or"):
+        return None
+
+    if owner_id is None or incoming_refs is None:
+        return None
+    if owner_id == logic_id or logic.get("parent") != owner_id:
+        return None
+    if incoming_refs.get(logic_id, 0) != 1:
+        return None
+
+    inputs = logic.get("inputs") or {}
+    left_raw = inputs.get("OPERAND1")
+    right_raw = inputs.get("OPERAND2")
+    for raw in (left_raw, right_raw):
+        if not (
+            isinstance(raw, list)
+            and len(raw) > 1
+            and raw[0] in (2, 3)
+            and isinstance(raw[1], str)
+        ):
+            return None
+
+    left_not_id = left_raw[1]
+    right_not_id = right_raw[1]
+    if (
+        left_not_id == right_not_id
+        or left_not_id in (logic_id, owner_id)
+        or right_not_id in (logic_id, owner_id)
+    ):
+        return None
+    if incoming_refs.get(left_not_id, 0) != 1 or incoming_refs.get(right_not_id, 0) != 1:
+        return None
+
+    left_not = blocks.get(left_not_id)
+    right_not = blocks.get(right_not_id)
+    if not (
+        isinstance(left_not, dict)
+        and isinstance(right_not, dict)
+        and left_not.get("opcode") == "operator_not"
+        and right_not.get("opcode") == "operator_not"
+    ):
+        return None
+    if (
+        logic.get("next") is not None
+        or left_not.get("next") is not None
+        or right_not.get("next") is not None
+    ):
+        return None
+    if left_not.get("parent") != logic_id or right_not.get("parent") != logic_id:
+        return None
+
+    left_operand = (left_not.get("inputs") or {}).get("OPERAND")
+    right_operand = (right_not.get("inputs") or {}).get("OPERAND")
+    if not (
+        isinstance(left_operand, list)
+        and len(left_operand) > 1
+        and isinstance(right_operand, list)
+        and len(right_operand) > 1
+    ):
+        return None
+
+    left_owned = _exclusive_input_block_subtree_fast(
+        left_operand, blocks, left_not_id, incoming_refs
+    )
+    right_owned = _exclusive_input_block_subtree_fast(
+        right_operand, blocks, right_not_id, incoming_refs
+    )
+    if left_owned is None or right_owned is None:
+        return None
+
+    left_root = left_operand[1] if isinstance(left_operand[1], str) else None
+    right_root = right_operand[1] if isinstance(right_operand[1], str) else None
+    if left_root and left_root == right_root:
+        return None
+    for root in (left_root, right_root):
+        if root in (logic_id, left_not_id, right_not_id, owner_id):
+            return None
+
+    # The containing block retains its input/shadow representation, but now
+    # points to the surviving left NOT.
+    new_owner_input = copy.deepcopy(value)
+    new_owner_input[1] = left_not_id
+
+    # The outer NOT receives the repurposed logical block. Primary-only avoids
+    # sharing the left operand's shadow block between two inputs.
+    new_outer_input = [2, logic_id]
+
+    return {
+        "logic_id": logic_id,
+        "left_not_id": left_not_id,
+        "right_not_id": right_not_id,
+        "old_logic_parent": logic.get("parent"),
+        "new_owner_input": new_owner_input,
+        "new_outer_input": new_outer_input,
+        "new_inner_left": copy.deepcopy(left_operand),
+        "new_inner_right": copy.deepcopy(right_operand),
+        "new_inner_opcode": (
+            "operator_or"
+            if logic.get("opcode") == "operator_and"
+            else "operator_and"
+        ),
+        "changed_ids": {logic_id, left_not_id, right_not_id} | left_owned | right_owned,
+    }
 
 
 def fold_constant_expressions(project, stats, opts):
-	targets = project.get("targets", [])
-	opts.folded_constant_expression_link_edits = {}
-	opts.folded_constant_expression_inputs = {}
-	opts.folded_constant_expression_blocks = [set() for _ in targets]
-	opts.folded_constant_expression_new_blocks = [set() for _ in targets]
-	folded = 0
+    targets = project.get("targets", [])
+    opts.folded_constant_expression_link_edits = {}
+    opts.folded_constant_expression_inputs = {}
+    opts.folded_constant_expression_opcode_edits = {}
+    opts.folded_constant_expression_blocks = [set() for _ in targets]
+    opts.folded_constant_expression_new_blocks = [set() for _ in targets]
+    folded = 0
 
-	for ti, target in enumerate(targets):
-		blocks = target.get("blocks") or {}
-		commented_ids = {
-			c.get("blockId")
-			for c in (target.get("comments") or {}).values()
-			if isinstance(c, dict) and c.get("blockId") is not None
-		}
+    for ti, target in enumerate(targets):
+        blocks = target.get("blocks") or {}
+        incoming_refs = _incoming_block_ref_counts(target)
+        commented_ids = {
+            c.get("blockId")
+            for c in (target.get("comments") or {}).values()
+            if isinstance(c, dict) and c.get("blockId") is not None
+        }
 
-		while True:
-			changed = False
-			for block_id, block in list(blocks.items()):
-				if not isinstance(block, dict) or block_id not in blocks:
-					continue
-				for input_name, input_val in list((block.get("inputs") or {}).items()):
-					identity = _simplify_boolean_identity_input(
-						input_val, blocks, parent_id=block_id
-					)
-					if identity is not None:
-						replacement, folded_ids = identity
-						if _fold_blocked_by_comment(
-							folded_ids, blocks, commented_ids
-						) or _fold_ids_have_external_refs(
-							folded_ids, blocks, block_id
-						):
-							continue
-						if block_id not in blocks:
-							continue
-						inputs = blocks[block_id].get("inputs") or {}
-						if input_name not in inputs:
-							continue
-						if isinstance(replacement, list):
-							new_input = copy.deepcopy(replacement)
-							new_ids = set()
-						else:
-							new_input, new_ids = _constant_to_scratch_input(
-								replacement, blocks, block_id
-							)
-						if new_input is None:
-							continue
-						if isinstance(replacement, list):
-							for child_id in _input_block_ids(new_input, blocks):
-								child = blocks.get(child_id)
-								if isinstance(child, dict) and child.get("parent") != block_id:
-									opts.folded_constant_expression_link_edits[(ti, child_id, "parent")] = block_id
-							_reparent_serialized_input(new_input, blocks, block_id)
-						inputs[input_name] = new_input
-						opts.folded_constant_expression_inputs[
-							(ti, block_id, input_name)
-						] = copy.deepcopy(new_input)
-						opts.folded_constant_expression_blocks[ti].update(
-							folded_ids
-						)
-						opts.folded_constant_expression_new_blocks[ti].update(
-							new_ids
-						)
-						for remove_id in folded_ids:
-							blocks.pop(remove_id, None)
-						folded += 1
-						changed = True
-						break
+        while True:
+            changed = False
+            for block_id, block in list(blocks.items()):
+                if not isinstance(block, dict) or block_id not in blocks:
+                    continue
 
-					res = _constant_expression_from_input(input_val, blocks)
-					if res is None:
-						continue
-					constant, folded_ids = res
-					if not folded_ids:
-						continue
-					if _fold_blocked_by_comment(
-						folded_ids, blocks, commented_ids
-					) or _fold_ids_have_external_refs(
-						folded_ids, blocks, block_id
-					):
-						continue
-					if block_id not in blocks:
-						continue
-					inputs = blocks[block_id].get("inputs") or {}
-					if input_name not in inputs:
-						continue
-					new_input, new_ids = _constant_to_scratch_input(
-						constant, blocks, block_id
-					)
-					if new_input is None:
-						continue
-					inputs[input_name] = new_input
-					opts.folded_constant_expression_inputs[(ti, block_id, input_name)] = (
-						copy.deepcopy(new_input)
-					)
-					opts.folded_constant_expression_blocks[ti].update(folded_ids)
-					opts.folded_constant_expression_new_blocks[ti].update(new_ids)
-					for remove_id in folded_ids:
-						blocks.pop(remove_id, None)
-					folded += 1
-					changed = True
-					break
-				if changed:
-					break
-			if not changed:
-				break
+                for input_name, input_val in list((block.get("inputs") or {}).items()):
+                    demorgan = _demorgan_boolean_input(
+                        input_val,
+                        blocks,
+                        owner_id=block_id,
+                        incoming_refs=incoming_refs,
+                    )
+                    if demorgan is not None and not _fold_blocked_by_comment(
+                        demorgan["changed_ids"], blocks, commented_ids
+                    ):
+                        logic_id = demorgan["logic_id"]
+                        left_not_id = demorgan["left_not_id"]
+                        right_not_id = demorgan["right_not_id"]
+                        logic = blocks[logic_id]
+                        left_not = blocks[left_not_id]
 
-	stats["constant_expressions_folded"] += folded
+                        logic["opcode"] = demorgan["new_inner_opcode"]
+                        logic_inputs = logic.get("inputs") or {}
+                        logic_inputs["OPERAND1"] = demorgan["new_inner_left"]
+                        logic_inputs["OPERAND2"] = demorgan["new_inner_right"]
+                        logic["inputs"] = logic_inputs
+
+                        left_not_inputs = left_not.get("inputs") or {}
+                        left_not_inputs["OPERAND"] = demorgan["new_outer_input"]
+                        left_not["inputs"] = left_not_inputs
+                        left_not["parent"] = demorgan["old_logic_parent"]
+                        logic["parent"] = left_not_id
+
+                        block_inputs = block.get("inputs") or {}
+                        block_inputs[input_name] = copy.deepcopy(
+                            demorgan["new_owner_input"]
+                        )
+                        block["inputs"] = block_inputs
+
+                        for raw, old_parent in (
+                            (demorgan["new_inner_left"], left_not_id),
+                            (demorgan["new_inner_right"], right_not_id),
+                        ):
+                            for ref in _direct_input_block_refs(raw, blocks):
+                                blocks[ref]["parent"] = logic_id
+                                opts.folded_constant_expression_link_edits[(
+                                    ti, ref, "parent"
+                                )] = logic_id
+
+                        opts.folded_constant_expression_link_edits[(
+                            ti, left_not_id, "parent"
+                        )] = demorgan["old_logic_parent"]
+                        opts.folded_constant_expression_link_edits[(
+                            ti, logic_id, "parent"
+                        )] = left_not_id
+                        opts.folded_constant_expression_opcode_edits[(
+                            ti, logic_id
+                        )] = demorgan["new_inner_opcode"]
+                        opts.folded_constant_expression_inputs[(
+                            ti, block_id, input_name
+                        )] = copy.deepcopy(demorgan["new_owner_input"])
+                        opts.folded_constant_expression_inputs[(
+                            ti, logic_id, "OPERAND1"
+                        )] = copy.deepcopy(demorgan["new_inner_left"])
+                        opts.folded_constant_expression_inputs[(
+                            ti, logic_id, "OPERAND2"
+                        )] = copy.deepcopy(demorgan["new_inner_right"])
+                        opts.folded_constant_expression_inputs[(
+                            ti, left_not_id, "OPERAND"
+                        )] = copy.deepcopy(demorgan["new_outer_input"])
+                        opts.folded_constant_expression_blocks[ti].add(right_not_id)
+                        blocks.pop(right_not_id, None)
+                        incoming_refs.pop(right_not_id, None)
+                        changed = True
+                        stats["demorgan_rewrites"] += 1
+                        break
+
+                    if changed:
+                        break
+
+                    identity = _simplify_boolean_identity_input(
+                        input_val, blocks, parent_id=block_id
+                    )
+                    if identity is not None:
+                        replacement, folded_ids = identity
+                        if _fold_blocked_by_comment(
+                            folded_ids, blocks, commented_ids
+                        ) or _fold_ids_have_external_refs(
+                            folded_ids, blocks, block_id
+                        ):
+                            continue
+                        if block_id not in blocks:
+                            continue
+                        inputs = blocks[block_id].get("inputs") or {}
+                        if input_name not in inputs:
+                            continue
+                        if isinstance(replacement, list):
+                            new_input = copy.deepcopy(replacement)
+                            new_ids = set()
+                        else:
+                            new_input, new_ids = _constant_to_scratch_input(
+                                replacement, blocks, block_id
+                            )
+                        if new_input is None:
+                            continue
+                        if isinstance(replacement, list):
+                            for child_id in _input_block_ids(new_input, blocks):
+                                child = blocks.get(child_id)
+                                if isinstance(child, dict) and child.get("parent") != block_id:
+                                    opts.folded_constant_expression_link_edits[(
+                                        ti, child_id, "parent"
+                                    )] = block_id
+                            _reparent_serialized_input(new_input, blocks, block_id)
+                        inputs[input_name] = new_input
+                        opts.folded_constant_expression_inputs[(
+                            ti, block_id, input_name
+                        )] = copy.deepcopy(new_input)
+                        opts.folded_constant_expression_blocks[ti].update(folded_ids)
+                        opts.folded_constant_expression_new_blocks[ti].update(new_ids)
+                        for remove_id in folded_ids:
+                            blocks.pop(remove_id, None)
+                        folded += 1
+                        changed = True
+                        break
+
+                    res = _constant_expression_from_input(input_val, blocks)
+                    if res is None:
+                        continue
+                    constant, folded_ids = res
+                    if not folded_ids:
+                        continue
+                    if _fold_blocked_by_comment(
+                        folded_ids, blocks, commented_ids
+                    ) or _fold_ids_have_external_refs(
+                        folded_ids, blocks, block_id
+                    ):
+                        continue
+                    if block_id not in blocks:
+                        continue
+                    inputs = blocks[block_id].get("inputs") or {}
+                    if input_name not in inputs:
+                        continue
+                    new_input, new_ids = _constant_to_scratch_input(
+                        constant, blocks, block_id
+                    )
+                    if new_input is None:
+                        continue
+                    inputs[input_name] = new_input
+                    opts.folded_constant_expression_inputs[(
+                        ti, block_id, input_name
+                    )] = copy.deepcopy(new_input)
+                    opts.folded_constant_expression_blocks[ti].update(folded_ids)
+                    opts.folded_constant_expression_new_blocks[ti].update(new_ids)
+                    for remove_id in folded_ids:
+                        blocks.pop(remove_id, None)
+                    folded += 1
+                    changed = True
+                    break
+
+                if changed:
+                    break
+
+            if not changed:
+                break
+
+    stats["constant_expressions_folded"] += folded
 
 
 def prompt_for_constant_variables(project, candidates) -> dict:
@@ -5194,6 +5592,7 @@ class Options:
 
 		self.folded_constant_expression_link_edits = {}
 		self.folded_constant_expression_inputs = {}
+		self.folded_constant_expression_opcode_edits = {}
 		self.folded_constant_expression_blocks = []
 		self.folded_constant_expression_new_blocks = []
 
@@ -5854,6 +6253,10 @@ def _check_blocks(
 		if k not in m:
 			continue
 		if k == "opcode":
+			folded_opcodes = getattr(opts, "folded_constant_expression_opcode_edits", {}) or {}
+			expected_opcode = folded_opcodes.get((target_index, block_id))
+			if expected_opcode is not None and m[k] == expected_opcode:
+				continue
 			simplified_opcodes = getattr(opts, "simplified_block_opcode_edits", {}) or {}
 			expected_opcode = simplified_opcodes.get((target_index, block_id))
 			if expected_opcode is not None and m[k] == expected_opcode:
@@ -7069,7 +7472,10 @@ STAT_GROUPS = [
 	(
 		"12.",
 		"Fold constant expressions",
-		[("constant_expressions_folded", "constant expressions folded")],
+		[
+			("constant_expressions_folded", "constant expressions folded"),
+			("demorgan_rewrites", "De Morgan rewrites"),
+		],
 	),
 	(
 		"13.",
