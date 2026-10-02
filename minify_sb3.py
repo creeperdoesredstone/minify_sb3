@@ -4888,7 +4888,7 @@ if __name__ == "__main__":
 		"--keep-positions",
 		"--keep-covered",
 		"--keep-monitors",
-		"--keep-lists",
+		"--clear-large-lists",
 		"--rename-block-ids",
 		"--rename-variable-ids",
 		"--rename-list-ids",
@@ -4972,7 +4972,7 @@ if __name__ == "__main__":
 		positions=("--keep-positions" not in flags),
 		covered=("--keep-covered" not in flags),
 		monitors=("--keep-monitors" not in flags),
-		lists=False if ("--keep-lists" in flags or all_optimizations) else True,
+		lists=("--clear-large-lists" in flags),
 		rename_block_ids=all_optimizations
 		or "--rename-block-ids" in flags
 		or "--frequency-block-ids" in flags

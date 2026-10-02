@@ -1,5 +1,6 @@
 # minify_sb3
 
+
 `minify_sb3.py` shrinks Scratch 3 project archives (`.sb3`) by removing redundant metadata and dead data while preserving project behavior, editor compatibility, and asset integrity. It targets the Scratch VM, the Scratch block editor, and TurboWarp-style editors, and it checks its own output before leaving it on disk.
 
 - [Requirements](#requirements)
@@ -23,17 +24,20 @@
 
 ## Requirements
 
-- **Python 3.10 or newer.** The script uses only the standard library (`copy`, `hashlib`, `json`, `math`, `os`, `subprocess`, `sys`, `zipfile`, `zlib`, `collections`). It relies on `X | None` annotations, which need 3.10+.
+- **Python 3.10 or newer.** The script uses only the standard library (`collections`, `copy`, `hashlib`, `json`, `math`, `os`, `subprocess`, `sys`, `uuid`, `zipfile`, `zlib`). It relies on `X | None` annotations, which need 3.10+.
 - **`ffmpeg` with `libmp3lame` (optional).** Only needed for `--convert-wav-to-mp3` (and `--all-optimizations`, which enables it).
 - Enough RAM to hold the whole archive: every asset is read into memory before the output is written.
 
 ## Quick start
 
 ```bash
-# Safe defaults, prompts before clearing any large lists
+# Safe defaults; large lists are not scanned unless requested
 python minify_sb3.py my_project.sb3
 
-# Explicit output path, enable every non-interactive optimizations
+# Scan large lists and prompt before clearing any
+python minify_sb3.py my_project.sb3 --clear-large-lists
+
+# Explicit output path, enable the batch of non-interactive optimizations
 python minify_sb3.py my_project.sb3 my_project_small.sb3 --all-optimizations
 
 # Keep comments and monitors, canonicalize key order
@@ -58,8 +62,13 @@ Flags starting with `--` may appear anywhere. Anything not starting with `--` is
 | `--keep-positions` | Do not round block, comment, or costume-rotation-center coordinates. |
 | `--keep-covered` | Do not reset covered shadow values. |
 | `--keep-monitors` | Do not clean monitors. |
-| `--keep-lists` | Skip the large-list scan and prompt entirely (nothing is cleared). |
 | `--keep-sound-metadata` | Keep `rate` and `sampleCount` on sounds. |
+
+### Interactive list prompt
+
+| Flag | Effect |
+| --- | --- |
+| `--clear-large-lists` | Scan for large lists and prompt for optional clearing. Off by default and skipped by `--all-optimizations`. |
 
 ### ID renaming
 
@@ -93,8 +102,8 @@ Flags starting with `--` may appear anywhere. Anything not starting with `--` is
 | `--compact-field-ids` | Remove explicit `null` ID slots from block fields. |
 | `--compact-mutation-hasnext` | Remove `mutation.hasnext` when it is explicitly false. |
 | `--compact-mutation-metadata` | Canonicalize the JSON strings in custom-block mutations. Not included in `--all-optimizations`. |
-| `--fold-constant-expressions` | Fold arithmetic reporters whose operands are all numeric literals. |
-| `--fold-constant-variables` | Interactively replace reporters of write-once variables with their initial value. Not included in `--all-optimizations`. |
+| `--fold-constant-expressions` | Fold supported arithmetic, comparison, boolean, text-length, and math-function reporters whose inputs are constant. Included in `--all-optimizations`. |
+| `--fold-constant-variables` | Interactively replace reporters of eligible write-once variables with their initial value. May also remove a matching setter block. Not included in `--all-optimizations`. |
 
 ### Structural trimming
 
@@ -142,7 +151,7 @@ A list qualifies if it is non-empty and meets **either** threshold.
 ## How the pipeline works
 
 1. `project.json` is parsed (UTF-8 JSON) and every other archive entry is read into memory as an asset.
-2. Unless disabled, the large-list prompt runs, then (if `--fold-constant-variables` was given) the constant-variable prompt. Both happen before anything is written. Aborting with Ctrl-C at either prompt exits with status 130 and writes nothing.
+2. If `--clear-large-lists` is given, the large-list prompt runs. If `--fold-constant-variables` is given, the constant-variable prompt runs. Both happen before anything is written. Aborting with Ctrl-C at either prompt exits with status 130 and writes nothing. Neither prompt runs by default or with `--all-optimizations` alone.
 3. Transforms are applied in this fixed order:
    1. Drop `topLevel: false` and `shadow: false`; normalize `mutation.warp` to booleans.
    2. WAV to MP3 conversion (if enabled).
@@ -150,21 +159,21 @@ A list qualifies if it is non-empty and meets **either** threshold.
    4. Round positions (default).
    5. Reset covered shadow values (default).
    6. Clean monitors (default).
-   7. Clear the lists chosen at the prompt.
+  7. Clear any lists chosen at the prompt.
    8. Remove unreachable blocks.
    9. Remove unused procedures.
    10. Remove unreachable blocks again (to sweep anything the procedure pass orphaned).
-   11. Fold constant variables.
-   12. Fold constant expressions.
-   13. Remove unused variables and lists.
-   14. Repair dangling broadcast references.
-   15. Remove unused broadcasts.
-   16. Rename variable and list IDs, then broadcast IDs, then argument IDs, then block IDs.
-   17. Compact numeric inputs, field IDs, mutation `hasnext`, mutation metadata.
-   18. Normalize numbers.
-   19. Remove sound `rate` and `sampleCount` (unless `--keep-sound-metadata`).
-   20. Remove empty fields, empty inputs, costume metadata, default target properties, empty containers, and project meta.
-   21. Repair any dangling block links ([always-on](#always-on-behavior)).
+  11. Fold selected constant variable reporters, then remove safe matching setter blocks.
+  12. Fold constant expressions.
+  13. Remove unused variables and lists.
+  14. Repair dangling broadcast references.
+  15. Remove unused broadcasts.
+  16. Rename variable and list IDs, then broadcast IDs, then argument IDs, then block IDs.
+  17. Compact numeric inputs, field IDs, and mutation `hasnext`/metadata.
+  18. Normalize numbers.
+  19. Remove sound `rate` and `sampleCount` (unless `--keep-sound-metadata`).
+  20. Remove empty fields, empty inputs, costume metadata, default target properties, empty containers, and project meta.
+  21. Repair any dangling block links ([always-on](#always-on-behavior)).
 4. `project.json` is serialized compactly (`separators=(",", ":")`, `ensure_ascii=False`), then written first into a new ZIP, followed by the assets.
 5. Per-transform counters and size totals are printed.
 6. The original and output archives are independently reloaded and compared. On any mismatch, the output file is deleted and the script exits with status 2.
@@ -236,13 +245,13 @@ Disable with `--keep-monitors`.
 
 ### Large-list prompt
 
-See [Interactive prompts](#interactive-prompts). Disable with `--keep-lists` (or implicitly with `--all-optimizations`).
+See [Interactive prompts](#interactive-prompts). Enable it with `--clear-large-lists`; it is off by default and skipped by `--all-optimizations`.
 
 ## Interactive prompts
 
-Both prompts read from standard input. If stdin is closed or hits EOF, the safe answer ("keep everything") is assumed. Ctrl-C aborts the entire run with exit status 130 and nothing is written. Pressing Enter keeps everything. Output is colored only when stdout is a terminal.
+The large-list prompt runs only with `--clear-large-lists`; the constant-variable prompt runs only with `--fold-constant-variables`. Both read from standard input. If stdin is closed or hits EOF, the safe answer ("keep everything") is assumed. Ctrl-C aborts the entire run with exit status 130 and nothing is written. Pressing Enter keeps everything. Output is colored only when stdout is a terminal.
 
-### Large lists
+### Large lists (`--clear-large-lists`)
 
 The scan finds non-empty lists meeting either threshold (`--list-bytes`, `--list-items`) and prints a table sorted largest first:
 
@@ -282,9 +291,9 @@ Candidates are variables that satisfy **all** of these:
 - not a cloud variable;
 - an initial value that is a finite number or a string (booleans are skipped).
 
-Variable names are resolved with Scratch's local-then-Stage scope rule. Folding replaces each reporter use (`[12, name, id]`) with `[4, value]` for numbers or `[10, value]` for strings, using the variable's **initial value stored in `project.json`**, which can differ from the value the setter assigns at runtime. The setter block and the variable definition remain.
+Variable names are resolved with Scratch's local-then-Stage scope rule. Folding replaces each reporter use (`[12, name, id]`) with `[4, value]` for numbers or `[10, value]` for strings, using the variable's **initial value stored in `project.json`**, which can differ from the value the setter assigns at runtime. After folding, the setter block is removed only if it assigns the same value as the initial value and has no attached comment; otherwise it remains. The variable definition remains.
 
-The table shows scope, name, reporter-use count, and an estimated byte change per candidate; candidates where folding would grow the file are marked `LOSS`, and those with `change variable by` blocks are annotated.
+The table shows scope, name, reporter-use count, and an estimated byte change per candidate. Candidates where folding would grow the file are marked `LOSS`; variables with `change variable by` blocks are excluded by the finder.
 
 | Input | Action |
 | --- | --- |
@@ -294,7 +303,7 @@ The table shows scope, name, reporter-use count, and an estimated byte change pe
 | `a`, `all` | Fold every candidate. |
 | `1,3,5-7` | Fold those numbers. |
 
-Selecting any `LOSS` or `change variable by` candidate requires typing `yes` to confirm. `--all-optimizations` does **not** enable this transform.
+Selecting any `LOSS` candidate requires typing `yes` to confirm. `--all-optimizations` does **not** enable this transform.
 
 ## Optional transforms
 
@@ -332,7 +341,7 @@ These can change behavior if a project relies on data or scripts that are only r
 - **`--compact-field-ids`**: field tuples serialized as `[value, null]` become `[value]`. Only an explicit `null` slot is removed; empty-string and non-null IDs are preserved.
 - **`--compact-mutation-hasnext`**: removes `mutation.hasnext` when it is `false` or `"false"`.
 - **`--compact-mutation-metadata`**: re-serializes the JSON-encoded `argumentids`, `argumentnames`, and `argumentdefaults` strings in mutations without whitespace, with decoded values unchanged. `tagName` and `children` are never removed.
-- **`--fold-constant-expressions`**: for `operator_add`, `operator_subtract`, `operator_multiply`, `operator_divide`, and `operator_mod`, when both operands are numeric literals or nested foldable expressions, replaces the outermost expression in each input with a single numeric literal and deletes the blocks it consumed. Operands may be numbers or numeric strings (decimal, or `0b`/`0o`/`0x` integers; surrounding whitespace is ignored). Expressions are left alone if any operand is not a finite numeric literal, an operator is unsupported, a divisor is zero, or the result is not finite. Integral results are stored as integers.
+- **`--fold-constant-expressions`**: folds nested `+`, `-`, `*`, `/`, `%`, `=`, `<`, `>`, `and`, `or`, `not`, `length`, and `mathop` reporters for `abs`, `floor`, `ceiling`, `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `ln`, `log`, `e ^`, and `10 ^` when their inputs are constant. Numeric strings may be decimal or prefixed with `0b`, `0o`, or `0x`; surrounding whitespace is ignored. Booleans are implicitly converted to `1` or `0` when used numerically. Expressions involving variables, unsupported math operations, division/modulo by zero, or non-finite results are left unchanged. Folded booleans are encoded according to their destination: false becomes the empty input `[2, null]`, true becomes a `not <>` reporter with an empty operand, and booleans in other sockets become text literals `"true"` or `"false"`. The transform avoids folding expressions with attached comments and verifies the exact input rewrites and any inserted reporter blocks.
 - **`--remove-empty-fields`** / **`--remove-empty-inputs`**: delete empty `fields`/`inputs` objects. The default keeps these containers.
 - **`--remove-costume-metadata`**: removes a costume's `md5ext` only when it equals `<assetId>.<dataFormat>` and that asset exists in the archive; removes `bitmapResolution` only from SVG costumes when it equals `1`. Bitmap costumes are never changed.
 - **`--remove-default-target-properties`**: removes properties exactly equal (value and type) to Scratch's defaults.
@@ -353,16 +362,17 @@ These can change behavior if a project relies on data or scripts that are only r
 | Compaction | `--compact-numeric-inputs`, `--compact-field-ids`, `--compact-mutation-hasnext`, `--fold-constant-expressions`, `--normalize-numbers` |
 | Trimming | `--remove-empty-fields`, `--remove-empty-inputs`, `--remove-costume-metadata`, `--remove-default-target-properties`, `--remove-empty-containers`, `--remove-project-meta` |
 | Archive | `--convert-wav-to-mp3`, `--preserve-asset-compression` (and the no-op `--compress-assets`) |
-| Prompts | the large-list prompt is **skipped**, so nothing is cleared |
+| Prompts | neither interactive prompt runs; large lists are not scanned or cleared |
 
 It does **not** enable:
 
+- `--clear-large-lists` (not part of the batch; lists are not scanned or cleared)
 - `--fold-constant-variables` (needs your selection)
 - `--compact-mutation-metadata`
 - `--sort-keys`
 - `--keep-sound-metadata` (sound `rate`/`sampleCount` are still removed)
 
-`--keep-*` flags, `--compression-level=N`, `--normalize-epsilon=N`, and the list thresholds still apply on top of it. Because `--all-optimizations` includes lossy WAV conversion and aggressive removals, review the result for projects that use unusual patterns.
+`--keep-*` flags, `--compression-level=N`, and `--normalize-epsilon=N` still apply on top of it. The list thresholds are used only with `--clear-large-lists`. Because `--all-optimizations` includes lossy WAV conversion and aggressive removals, review the result for projects that use unusual patterns.
 
 ## Archive and asset handling
 
@@ -393,7 +403,7 @@ Some fields cannot be removed without breaking the editor, loader, or VM. The sc
 - Sound and costume `md5ext`/`assetId` values stay consistent with the archive's asset names and actual MD5 hashes.
 - Variable, list, comment, costume, sound, monitor, and target entries are not removed wholesale unless a transform explicitly says so.
 - Numeric strings are preserved unless you request `--compact-numeric-inputs` or `--fold-constant-expressions`, which operate only on the specific shapes described above.
-- Variable values, broadcast names, and list contents are unchanged unless you explicitly clear lists, fold constants, or normalize numbers.
+- Variable definitions and values, broadcast names, and list contents are unchanged unless a transform explicitly changes them. Constant-variable folding can replace reporters and may remove a setter that exactly matches the initial value; constant-expression folding rewrites only the selected constant input trees.
 - Stage comments and `_twconfig_` metadata are untouched.
 
 ## Verification
@@ -424,22 +434,50 @@ After the output is written, the script reloads both archives and checks the fol
 ## Output report
 
 The script prints the input and output paths, then one line per transform with its count, for example:
-
 ```
 Input : "my_project.sb3"
 Output: "my_project_minified.sb3"
-
 Transforms applied:
   topLevel:false dropped                       12,340
   shadow:false dropped                          9,121
   sprite comments removed                          14
   position values rounded                       4,882
   ...
-project.json : 812.3 KiB -> 301.7 KiB  (-510.6 KiB, 62.9%)
-archive      : 1.84 MiB -> 1.27 MiB
+project.json : 812.3000 KiB -> 301.7000 KiB  (-510.6000 KiB, 62.9%)
+archive      : 1.8400 MiB -> 1.2700 MiB
 ```
 
-Counters appear in this order: `topLevel`, `shadow`, `warp`, comments, comment links, rounded positions, covered values, monitor changes, large lists cleared and items removed, block IDs, dangling-reference repairs, broadcast repairs and conflicts, variable/list/broadcast/argument ID renames, removed variables/lists/broadcasts, removed blocks and procedures, normalized numbers, empty fields/inputs, costume metadata, default target properties, empty containers, project meta, numeric inputs, field IDs, `hasnext`, mutation JSON, constant variable reporters and bytes saved, and constant expressions folded. Each prints even when it is zero. The sizes shown are for `project.json` and for the whole archive.
+Counters appear in this order:
+- `topLevel`,
+- `shadow`,
+- `warp`
+- comments
+- comment links
+- rounded positions
+- covered values
+- monitor changes,
+- large lists cleared and items removed
+- block IDs
+- dangling-reference repairs
+- broadcast repairs and conflicts
+- variable/list/broadcast/argument ID renames
+- removed variables/lists/broadcasts
+- removed blocks and procedures
+- normalized numbers
+- empty fields/inputs
+- costume metadata
+- default target properties
+- empty containers
+- project meta
+- numeric inputs
+- field IDs
+- `hasnext`
+- mutation JSON
+- constant variable reporters and bytes saved
+- constant-variable setters removed/kept
+- constant expressions folded
+
+Each prints even when it is zero. The sizes shown are for `project.json` and for the whole archive.
 
 ## Exit codes
 
@@ -454,9 +492,9 @@ Counters appear in this order: `topLevel`, `shadow`, `warp`, comments, comment l
 
 | Risk | Flags |
 | --- | --- |
-| Cosmetic only (editor/layout metadata, redundant encoding) | defaults (except list clearing); `--compact-field-ids`, `--compact-mutation-hasnext`, `--compact-mutation-metadata`, `--remove-empty-fields`, `--remove-empty-inputs`, `--remove-costume-metadata`, `--remove-empty-containers`, `--remove-project-meta`, `--sort-keys`, all `--rename-*` and `--frequency-*` flags |
+| Cosmetic only (editor/layout metadata, redundant encoding) | default transforms; `--compact-field-ids`, `--compact-mutation-hasnext`, `--compact-mutation-metadata`, `--remove-empty-fields`, `--remove-empty-inputs`, `--remove-costume-metadata`, `--remove-empty-containers`, `--remove-project-meta`, `--sort-keys`, all `--rename-*` and `--frequency-*` flags |
 | Low risk, depends on project contents | `--compact-numeric-inputs`, `--remove-default-target-properties`, `--fold-constant-expressions`, `--remove-unused-variables`, `--remove-unused-lists`, `--remove-unused-broadcasts` |
-| Can change behavior | clearing lists at the prompt, `--remove-unreachable`, `--remove-unused-procedures`, `--normalize-numbers` (near-integer snapping), `--fold-constant-variables`, `--convert-wav-to-mp3` (lossy audio) |
+| Can change behavior | clearing lists with `--clear-large-lists`, `--remove-unreachable`, `--remove-unused-procedures`, `--normalize-numbers` (near-integer snapping), `--fold-constant-variables`, `--fold-constant-expressions` (constant-evaluation semantics), `--convert-wav-to-mp3` (lossy audio) |
 
 ## Known caveats and limitations
 
@@ -465,7 +503,8 @@ These come from reading the code; test the minified project when any of them mig
 - `--compact-numeric-inputs` is textual and does not bound magnitude, so a very long integer string could become a JSON number that loses precision when parsed by a JS-based tool.
 - `--remove-unreachable` and `--remove-unused-procedures` only model `topLevel`, `next`, input references, and `parent` links; scripts that exist but never run (for example, hats nothing triggers) are kept, and unusual hand-edited projects may be pruned more than expected.
 - `--normalize-numbers` rounds floats in any location, including variable values and list items.
-- `--fold-constant-variables` uses the stored initial value, not the value the setter assigns.
+- `--fold-constant-variables` uses the stored initial value, not necessarily the value the setter assigns. A setter is removed only when the script can prove it matches that initial value and has no comment.
+- `--fold-constant-expressions` implements only the listed Scratch operators and a conservative subset of their coercion behavior; review projects using unusual literal types or editor extensions.
 - Missing `ffmpeg` is silent in the transform table; the WAVs are simply retained.
 - `--compress-assets` is parsed but performs no transform.
 - Running with no arguments prints the script's module docstring, which is empty, so see this README for usage.
@@ -480,7 +519,7 @@ The module exposes an `Options` class and `minify_sb3(src, dst, opts=None)`. The
 from minify_sb3 import Options, minify_sb3
 
 opts = Options(
-    lists=False,  # no interactive large-list prompt
+    lists=False,  # do not scan/prompt for large lists
     rename_block_ids=True,
     remove_unreachable=True,
     normalize_numbers=True,
@@ -491,7 +530,7 @@ status = minify_sb3("in.sb3", "out.sb3", opts)
 
 Notes:
 
-- `Options` defaults mirror the CLI defaults: `comments`, `positions`, `covered`, `monitors`, and `lists` are `True`; everything optional is `False`; `compression_level=9`, `list_bytes=4096`, `list_items=1000`, `normalize_epsilon=1e-8`. Note that `lists=True` means the interactive prompt will run, so pass `lists=False` for unattended use.
+- `Options` defaults differ from CLI list behavior: `comments`, `positions`, `covered`, `monitors`, and `lists` are `True` on a directly constructed `Options()` object, so programmatic use scans/prompts for large lists unless `lists=False`. The CLI enables this scan only with `--clear-large-lists`; its ordinary default and `--all-optimizations` do not scan lists. Other defaults include `compression_level=9`, `list_bytes=4096`, `list_items=1000`, and `normalize_epsilon=1e-8`.
 - `fold_constant_variables=True` always prompts interactively.
 - Available keyword arguments: `comments`, `positions`, `covered`, `monitors`, `lists`, `rename_block_ids`, `rename_variable_ids`, `rename_list_ids`, `rename_broadcast_ids`, `rename_argument_ids`, `remove_unused_variables`, `remove_unused_lists`, `remove_unused_broadcasts`, `remove_unreachable`, `remove_unused_procedures`, `normalize_numbers`, `remove_empty_fields`, `remove_empty_inputs`, `remove_costume_metadata`, `remove_default_target_properties`, `remove_empty_containers` (or `remove_empty_target_containers`), `remove_project_meta`, `convert_wav_to_mp3`, `compress_assets`, `sort_keys`, `compression_level`, `list_bytes`, `list_items`, `normalize_epsilon`, `keep_sound_metadata`, `preserve_asset_compression`, `frequency_block_ids`, `frequency_data_ids`, `compact_numeric_inputs`, `compact_field_ids`, `compact_mutation_hasnext`, `compact_mutation_metadata`, `fold_constant_variables`, `fold_constant_expressions`.
 - Frequency ordering is selected by `frequency_block_ids`/`frequency_data_ids` **together with** the corresponding `rename_*` flag; on the CLI the `--frequency-*` flags set both for you.
@@ -501,8 +540,11 @@ Notes:
 ## Example workflows
 
 ```bash
-# Defaults; interactive large-list prompt
+# Defaults; large-list scan is off
 python minify_sb3.py my_project.sb3
+
+# Opt in to scanning and prompting about large lists
+python minify_sb3.py my_project.sb3 --clear-large-lists
 
 # Every non-interactive optimization
 python minify_sb3.py my_project.sb3 my_project_minified.sb3 --all-optimizations
