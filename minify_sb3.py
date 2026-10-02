@@ -1992,6 +1992,7 @@ def _find_constant_variables(project):
 	reporter_counts = Counter()
 	change_counts = Counter()
 	setter_ids = {}
+	setter_locations = {}
 	literal_setters = set()
 
 	def scan_input(value, ti):
@@ -2020,6 +2021,7 @@ def _find_constant_variables(project):
 					if block.get("opcode") == "data_setvariableto":
 						set_blocks[owner] = set_blocks.get(owner, 0) + 1
 						setter_ids.setdefault(owner, []).append(bid)
+						setter_locations.setdefault(owner, (ti, bid))
 						if _is_literal_value((block.get("inputs") or {}).get("VALUE")):
 							literal_setters.add(owner)
 					elif block.get("opcode") == "data_changevariableby":
@@ -2069,6 +2071,7 @@ def _find_constant_variables(project):
 				"per_use": per_use,
 				"changes": change_counts.get(owner, 0),
 				"setter": setter_ids[owner][0],
+				"setter_ti": setter_locations[owner][0],
 				"literal": literal,
 			}
 		)
@@ -2119,6 +2122,121 @@ def fold_constant_variables(project, selected, stats):
 					value, ti, selected_map, project, stats
 				)
 	return changed
+
+
+def _literal_key(value):
+	"""Comparable form of a Scratch literal: numbers compare numerically ("5" == 5)."""
+	if isinstance(value, bool):
+		return None
+	if isinstance(value, (int, float)):
+		return ("n", float(value)) if math.isfinite(value) else None
+	if isinstance(value, str):
+		try:
+			num = float(value.strip())
+		except ValueError:
+			return ("s", value)
+		if value.strip() and math.isfinite(num):
+			return ("n", num)
+		return ("s", value)
+	return None
+
+
+def _setter_matches_initial(block, initial):
+	"""True if `set variable to <literal>` stores exactly the variable's initial value."""
+	value = (block.get("inputs") or {}).get("VALUE")
+	if not _is_literal_value(value):
+		return False
+	a, b = _literal_key(value[1][1]), _literal_key(initial)
+	return a is not None and a == b
+
+
+def remove_constant_variable_setters(project, setters, stats, opts):
+	targets = project.get("targets", [])
+	opts.removed_variable_setter_blocks = [set() for _ in targets]
+	opts.variable_setter_link_edits = {}   # (ti, block, "next"|"parent") -> new value
+	opts.variable_setter_input_edits = {}  # (ti, block, input name) -> new value
+	removed = kept = 0
+
+	for (owner_ti, vid), (ti, bid) in setters.items():
+		target = targets[ti]
+		blocks = target.get("blocks") or {}
+		block = blocks.get(bid)
+		entry = (targets[owner_ti].get("variables") or {}).get(vid)
+		commented = {
+			c.get("blockId")
+			for c in (target.get("comments") or {}).values()
+			if isinstance(c, dict)
+		}
+		if (
+			not isinstance(block, dict)
+			or block.get("opcode") != "data_setvariableto"
+			or not isinstance(entry, list)
+			or len(entry) < 2
+			or not _setter_matches_initial(block, entry[1])
+			or "comment" in block
+			or bid in commented
+		):
+			kept += 1
+			continue
+
+		parent, nxt = block.get("parent"), block.get("next")
+		if nxt is not None and not isinstance(blocks.get(nxt), dict):
+			kept += 1
+			continue
+
+		input_edit = None  # (parent block id, input name, new value)
+		if parent is None:
+			if nxt is not None:
+				kept += 1
+				continue
+		else:
+			pblock = blocks.get(parent)
+			if not isinstance(pblock, dict):
+				kept += 1
+				continue
+			if pblock.get("next") != bid:
+				found = None
+				for name, value in (pblock.get("inputs") or {}).items():
+					if (
+						isinstance(value, list)
+						and len(value) > 1
+						and value[0] in (1, 2, 3)
+						and value[1] == bid
+					):
+						found = (name, value)
+						break
+				if found is None:
+					kept += 1
+					continue
+				name, value = found
+				if nxt is None:
+					new_value = [2, None]  # empty substack
+				else:
+					new_value = copy.deepcopy(value)
+					new_value[1] = nxt
+				input_edit = (name, new_value)
+
+		if parent is not None:
+			pblock = blocks[parent]
+			if input_edit is None:
+				pblock["next"] = nxt
+				opts.variable_setter_link_edits[(ti, parent, "next")] = nxt
+			else:
+				pblock["inputs"][input_edit[0]] = input_edit[1]
+				opts.variable_setter_input_edits[(ti, parent, input_edit[0])] = (
+					copy.deepcopy(input_edit[1])
+				)
+			if nxt is not None:
+				blocks[nxt]["parent"] = parent
+				opts.variable_setter_link_edits[(ti, nxt, "parent")] = parent
+
+		del blocks[bid]
+		opts.removed_variable_setter_blocks[ti].add(bid)
+		removed += 1
+
+	stats["constant_variable_setters_removed"] += removed
+	stats["constant_variable_setters_kept"] += kept
+	return removed
 
 
 def _numeric_primitive_value(value):
@@ -2536,6 +2654,7 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 		Ansi.warning(
 			"  This replaces every serialized variable reporter with the variable's "
 			"initial value from project.json. Variables with change-by blocks are marked."
+			" Each folded variable's set block is deleted too (kept if it sets a different value)."
 		)
 	)
 	print(
@@ -2903,6 +3022,10 @@ class Options:
 		self.keep_sound_metadata = keep_sound_metadata
 		self.folded_constant_variables = {}
 		self.folded_constant_variable_literals = {}
+		self.folded_constant_variable_setters = {}
+		self.removed_variable_setter_blocks = []
+		self.variable_setter_link_edits = {}
+		self.variable_setter_input_edits = {}
 		self.folded_constant_expression_inputs = {}
 		self.folded_constant_expression_blocks = []
 		self.folded_constant_expression_new_blocks = []
@@ -2930,6 +3053,9 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_unreachable_blocks(project, stats)
 	if opts.folded_constant_variables:
 		fold_constant_variables(project, opts.folded_constant_variables, stats)
+		remove_constant_variable_setters(
+			project, opts.folded_constant_variable_setters, stats, opts
+		)
 	if opts.fold_constant_expressions:
 		fold_constant_expressions(project, stats, opts)
 	if opts.remove_unused_variables or opts.remove_unused_lists:
@@ -3557,6 +3683,15 @@ def _check_blocks(
 				return f"{where} (opcode: {o.get('opcode')}): input names changed. Original inputs: {sorted(o['inputs'])}, minified inputs: {sorted(m['inputs'])}"
 			for name in set(o["inputs"]) & set(m["inputs"]):
 				oi, mi = o["inputs"][name], m["inputs"][name]
+				setter_inputs = getattr(opts, "variable_setter_input_edits", None) or {}
+				setter_input = setter_inputs.get((target_index, block_id, name))
+				if setter_input is not None and (
+					setter_input == mi
+					or _check_inputs_match(
+						setter_input, mi, opts, original_blocks, remaining_blocks, target_index
+					)
+				):
+					continue
 				folded_inputs = getattr(opts, "folded_constant_expression_inputs", {})
 				folded_input = folded_inputs.get((target_index, block_id, name))
 				if folded_input is not None and (
@@ -3576,6 +3711,10 @@ def _check_blocks(
 				):
 					return f"{where} (opcode: {o.get('opcode')}): input {name!r} changed from original {oi!r} to minified {mi!r}"
 		else:
+			link_edits = getattr(opts, "variable_setter_link_edits", None) or {}
+			if k in ("next", "parent") and (target_index, block_id, k) in link_edits:
+				if m[k] == link_edits[(target_index, block_id, k)]:
+					continue
 			if (
 				allow_repairs
 				and k in ("next", "parent")
@@ -3966,6 +4105,9 @@ def _expected_removed_blocks(project, opts):
 		folded_blocks = getattr(opts, "folded_constant_expression_blocks", ())
 		if ti < len(folded_blocks):
 			ids.update(folded_blocks[ti])
+		setter_blocks = getattr(opts, "removed_variable_setter_blocks", ())
+		if ti < len(setter_blocks):
+			ids.update(setter_blocks[ti])
 		allowed.append(ids)
 	return allowed
 
@@ -4570,8 +4712,8 @@ def _check_monitors(orig, mini, opts):
 	return None
 
 
-def human(n):
-	return f"{n/1048576:.2f} MiB" if n >= 1048576 else f"{n/1024:.1f} KiB"
+def humanize(n):
+	return f"{n/1048576:.4f} MiB" if n >= 1048576 else f"{n/1024:.4f} KiB"
 
 
 STAT_ORDER = [
@@ -4615,6 +4757,8 @@ STAT_ORDER = [
 	("mutation_metadata_compacted", "mutation JSON compacted"),
 	("constant_variable_reporters", "constant variable reporters folded"),
 	("constant_variable_bytes_saved", "constant-variable JSON bytes saved"),
+	("constant_variable_setters_removed", "constant-variable set blocks removed"),
+	("constant_variable_setters_kept", "constant-variable set blocks kept"),
 	("constant_expressions_folded", "constant numeric expressions folded"),
 ]
 
@@ -4645,6 +4789,11 @@ def minify_sb3(src, dst, opts=None):
 				return 130
 			opts.folded_constant_variables = picked
 			opts.folded_constant_variable_literals = dict(picked)
+			opts.folded_constant_variable_setters = {
+					(c["ti"], c["id"]): (c["setter_ti"], c["setter"])
+					for c in candidates
+					if (c["ti"], c["id"]) in picked
+				}
 
 		asset_infos = {
 			item.filename: item
@@ -4712,10 +4861,10 @@ def minify_sb3(src, dst, opts=None):
 		print(Ansi.muted(f"  {label:40} {stats[k]:>8,}"))
 	b, a = len(raw), len(out_json)
 	print(
-		f"\n{Ansi.heading('project.json')} : {human(b)} -> {human(a)}  (-{human(b-a)}, {(b-a)/b*100:.1f}%)"
+		f"\n{Ansi.heading('project.json')} : {humanize(b)} -> {humanize(a)}  (-{humanize(b-a)}, {(b-a)/b*100:.1f}%)"
 	)
 	print(
-		f"archive      : {human(os.path.getsize(src))} -> {human(os.path.getsize(dst))}"
+		f"archive      : {humanize(os.path.getsize(src))} -> {humanize(os.path.getsize(dst))}"
 	)
 
 	print(Ansi.heading("\nVerifying (independent original-vs-result check)..."))
