@@ -4322,20 +4322,26 @@ def _variable_reporter_id(value, blocks):
 	if not isinstance(value, list) or not value:
 		return None
 
-	if value[0] == 12 and len(value) > 2 and isinstance(value[2], str):
-		return value[2]
-
-	if isinstance(value[1], list) and value[1][0] == 12 and isinstance(value[1][2], str):
-		return value[1][2]
-
-	block_id = _sequence_primary_input_block_id(value, blocks)
-	if block_id is None:
+	tag = value[0]
+	if tag == 12:
+		if len(value) > 2 and isinstance(value[2], str) and value[2]:
+			return value[2]
 		return None
-	block = blocks.get(block_id)
+
+	if tag not in (1, 2, 3) or len(value) <= 1:
+		return None
+
+	primary = value[1]
+	if isinstance(primary, list):
+		return _variable_reporter_id(primary, blocks)
+	if not isinstance(primary, str):
+		return None
+
+	block = blocks.get(primary)
 	if not isinstance(block, dict) or block.get("opcode") != "data_variable":
 		return None
 	field = (block.get("fields") or {}).get("VARIABLE")
-	if isinstance(field, list) and len(field) > 1 and isinstance(field[1], str):
+	if isinstance(field, list) and len(field) > 1 and isinstance(field[1], str) and field[1]:
 		return field[1]
 	return None
 
