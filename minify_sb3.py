@@ -6,14 +6,14 @@ import math
 import os
 import re
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
 import zipfile
 import zlib
 import uuid
-from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 
 from functools import lru_cache
 from itertools import permutations, product
@@ -92,46 +92,184 @@ def _short_number(token):
 	return prefix + mantissa + (f"e{power}" if power else "")
 
 
-@lru_cache(maxsize=65536)
+@lru_cache(maxsize=4096)
 def _quote(value):
 	return json.dumps(value, ensure_ascii=False)
 
 
 def _encode_parts(value, short_numbers):
-	parts = []
-	append = parts.append
-	def emit(item):
-		if isinstance(item, JsonNumber):
-			append(_short_number(item) if short_numbers else item)
-		elif isinstance(item, str):
-			append(_quote(item))
-		elif item is None:
-			append("null")
-		elif item is True:
-			append("true")
-		elif item is False:
-			append("false")
-		elif isinstance(item, dict):
-			append("{")
-			for index, (key, child) in enumerate(item.items()):
-				if index: append(",")
-				append(_quote(key)); append(":"); emit(child)
-			append("}")
-		elif isinstance(item, list):
-			append("[")
-			for index, child in enumerate(item):
-				if index: append(",")
-				emit(child)
-			append("]")
-		else:
-			raise TypeError(f"unsupported exact JSON value: {type(item).__name__}")
-	emit(value)
-	return parts
+	if isinstance(value, JsonNumber):
+		yield _short_number(value) if short_numbers else value
+	elif isinstance(value, str):
+		yield _quote(value)
+	elif value is None:
+		yield "null"
+	elif value is True:
+		yield "true"
+	elif value is False:
+		yield "false"
+	elif isinstance(value, dict):
+		yield "{"
+		for index, (key, item) in enumerate(value.items()):
+			if index:
+				yield ","
+			yield _quote(key)
+			yield ":"
+			yield from _encode_parts(item, short_numbers)
+		yield "}"
+	elif isinstance(value, list):
+		yield "["
+		for index, item in enumerate(value):
+			if index:
+				yield ","
+			yield from _encode_parts(item, short_numbers)
+		yield "]"
+	else:
+		raise TypeError(f"unsupported exact JSON value: {type(value).__name__}")
 
 
 def dumps_exact(project, short_numbers=False):
-	return "".join(_encode_parts(project, short_numbers)).encode("utf-8", "backslashreplace")
+	"""Serialize exact JSON values with a list-backed emitter.
 
+	The original generator-based encoder creates a Python generator frame for
+	every recursive descent. Large Scratch projects contain millions of scalar
+	values, so using one shared output list substantially reduces allocator and
+	generator overhead while preserving byte-for-byte output.
+	"""
+	parts = []
+	quote = _quote
+	short = _short_number
+	def emit(value):
+		if isinstance(value, JsonNumber):
+			parts.append(short(value) if short_numbers else value)
+		elif isinstance(value, str):
+			parts.append(quote(value))
+		elif value is None:
+			parts.append("null")
+		elif value is True:
+			parts.append("true")
+		elif value is False:
+			parts.append("false")
+		elif isinstance(value, dict):
+			parts.append("{")
+			first = True
+			for key, item in value.items():
+				if not first:
+					parts.append(",")
+				first = False
+				parts.append(quote(key))
+				parts.append(":")
+				emit(item)
+			parts.append("}")
+		elif isinstance(value, list):
+			parts.append("[")
+			for index, item in enumerate(value):
+				if index:
+					parts.append(",")
+				emit(item)
+			parts.append("]")
+		else:
+			raise TypeError(f"unsupported exact JSON value: {type(value).__name__}")
+	emit(project)
+	return "".join(parts).encode("utf-8", "backslashreplace")
+
+
+def dumps_exact_layout(project, order, short_numbers=False):
+	"""Serialize while changing only the property order of block records.
+
+	Unlike ``_layout`` this does not clone every target/block dictionary for
+	each candidate. It emits the requested order directly, which is much
+	cheaper for multi-megabyte project.json candidates.
+	"""
+	parts = []
+	quote = _quote
+	short = _short_number
+	order_tuple = tuple(order or ())
+
+	def emit(value, is_block=False):
+		if isinstance(value, JsonNumber):
+			parts.append(short(value) if short_numbers else value)
+		elif isinstance(value, str):
+			parts.append(quote(value))
+		elif value is None:
+			parts.append("null")
+		elif value is True:
+			parts.append("true")
+		elif value is False:
+			parts.append("false")
+		elif isinstance(value, dict):
+			parts.append("{")
+			if is_block and order_tuple:
+				keys = dict.fromkeys((*order_tuple, *value))
+				items = ((key, value[key]) for key in keys if key in value)
+			else:
+				items = value.items()
+			first = True
+			for key, item in items:
+				if not first:
+					parts.append(",")
+				first = False
+				parts.append(quote(key))
+				parts.append(":")
+				emit(item, False)
+			parts.append("}")
+		elif isinstance(value, list):
+			parts.append("[")
+			for index, item in enumerate(value):
+				if index:
+					parts.append(",")
+				emit(item, False)
+			parts.append("]")
+		else:
+			raise TypeError(f"unsupported exact JSON value: {type(value).__name__}")
+
+	# Special-case only the targets[*].blocks mapping so ordinary dictionaries
+	# retain their original property order.
+	parts.append("{")
+	first_target_key = True
+	for pkey, pvalue in project.items():
+		if not first_target_key:
+			parts.append(",")
+		first_target_key = False
+		parts.append(quote(pkey)); parts.append(":")
+		if pkey != "targets" or not isinstance(pvalue, list):
+			emit(pvalue); continue
+		parts.append("[")
+		for ti, target in enumerate(pvalue):
+			if ti: parts.append(",")
+			if not isinstance(target, dict):
+				emit(target); continue
+			parts.append("{")
+			first_key = True
+			for key, item in target.items():
+				if not first_key: parts.append(",")
+				first_key = False
+				parts.append(quote(key)); parts.append(":")
+				if key == "blocks" and isinstance(item, dict):
+					parts.append("{")
+					first_block = True
+					for bid, block in item.items():
+						if not first_block: parts.append(",")
+						first_block = False
+						parts.append(quote(bid)); parts.append(":")
+						emit(block, isinstance(block, dict))
+					parts.append("}")
+				else:
+					emit(item)
+			parts.append("}")
+		parts.append("]")
+	parts.append("}")
+	return "".join(parts).encode("utf-8", "backslashreplace")
+
+
+# Performance guardrails for very large Scratch project.json files.
+# The semantic transforms remain unchanged; only the optional compression/layout
+# search is made progressively cheaper as the JSON becomes expensive to re-compress.
+FAST_JSON_RAW_THRESHOLD = 1_500_000
+FAST_JSON_BLOCK_THRESHOLD = 8_000
+FAST_JSON_ORDER_COUNT = 2
+FAST_JSON_SCREEN_LEVEL = 1
+FAST_JSON_SEARCH_LEVEL = 3
 
 BLOCK_KEY_ORDERS = (
 	("opcode", "next", "parent", "inputs", "fields"),
@@ -148,77 +286,13 @@ def _record_order_is_irrelevant(path):
 	return len(path) == 4 and path[0] == "targets" and path[2] == "blocks"
 
 
-
-_REFERENCE_FIELDS = {
-	"VARIABLE": ("variables", frozenset(("data_variable", "data_setvariableto", "data_changevariableby", "data_showvariable", "data_hidevariable"))),
-	"LIST": ("lists", frozenset(("data_listcontents", "data_addtolist", "data_deleteoflist", "data_deletealloflist", "data_insertatlist", "data_replaceitemoflist", "data_itemoflist", "data_itemnumoflist", "data_lengthoflist", "data_listcontainsitem", "data_hidelist", "data_showlist"))),
-}
-
-
-def _reference_name_slots(project):
-	def primitive(node, path):
-		if not isinstance(node, list) or len(node) < 3: return
-		tag = node[0]
-		if isinstance(tag, JsonNumber):
-			tag = { (False, "12", 0): 12, (False, "13", 0): 13 }.get(_number_components(tag))
-		if type(tag) in (int, float) and tag in (12, 13):
-			yield path + (1,), node, 1, node[2], "variables" if tag == 12 else "lists"
-	for ti, target in enumerate(project.get("targets", [])):
-		for bid, block in (target.get("blocks") or {}).items():
-			path = ("targets", ti, "blocks", bid)
-			if isinstance(block, list):
-				yield from primitive(block, path)
-			elif isinstance(block, dict):
-				for field, (kind, opcodes) in _REFERENCE_FIELDS.items():
-					value = (block.get("fields") or {}).get(field)
-					if block.get("opcode") in opcodes and isinstance(value, list) and len(value) == 2:
-						yield path + ("fields", field, 0), value, 0, value[1], kind
-				for key, desc in (block.get("inputs") or {}).items():
-					if not isinstance(desc, list) or not desc: continue
-					tag = _input_tag(desc[0])
-					for index in ((1, 2) if tag == 3 else (1,) if tag in (1, 2) else ()):
-						if len(desc) > index: yield from primitive(desc[index], path + ("inputs", key, index))
-
-
-def _reference_scopes(project):
-	scopes = []
-	stages = []
-	for ti, target in enumerate(project.get("targets", [])):
-		scope = {}
-		for kind in ("variables", "lists", "broadcasts"):
-			for ident, entry in (target.get(kind) or {}).items():
-				valid = kind != "broadcasts" and isinstance(entry, list) and len(entry) >= 2 and type(entry[0]) is str
-				scope[ident] = (kind, entry[0]) if valid and ident not in scope else None
-		scopes.append(scope)
-		if target.get("isStage") is True: stages.append(ti)
-	global_scope = scopes[stages[0]] if len(stages) == 1 else {}
-	return [dict(global_scope, **scope) for scope in scopes]
-
-
-def _restore_reference_names(original, result):
-	result = copy.deepcopy(result)
-	scopes = _reference_scopes(original)
-	for path, container, index, ident, kind in _reference_name_slots(original):
-		if type(ident) is not str or not ident or ident in ("__proto__", "constructor", "prototype") or type(container[index]) is not str: continue
-		if scopes[path[1]].get(ident) != (kind, container[index]): continue
-		try:
-			other = result
-			for key in path[:-1]: other = other[key]
-			if type(other[path[-1]]) is str and other[path[-1]] == "": other[path[-1]] = container[index]
-		except (KeyError, IndexError, TypeError):
-			pass
-	return result
-
-
-def exact_difference(original, result, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False, compact_reference_names=False):
+def exact_difference(original, result, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False):
 	"""Compare exact numbers, strings, keys and all ordered collections."""
 	if relabel_block_ids:
 		try:
 			result = restore_block_labels(original, result)
 		except (ValueError, KeyError, TypeError) as error:
 			return f"block ID correspondence failed: {error}"
-	if compact_reference_names:
-		result = _restore_reference_names(original, result)
 	stack = [((), original, result)]
 	while stack:
 		path, left, right = stack.pop()
@@ -303,7 +377,7 @@ def _canonical_costume_filename(costume):
 	return None
 
 
-def compact_representation(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, compact_reference_names=False):
+def compact_representation(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False):
 	result = dict(project)
 	result["targets"] = []
 	for source in project.get("targets", []):
@@ -326,20 +400,46 @@ def compact_representation(project, compact_defaults=False, compact_costume_refe
 					costume = {key: value for key, value in costume.items() if key not in removed}
 				target["costumes"].append(costume)
 		result["targets"].append(target)
-	if compact_reference_names:
-		result = copy.deepcopy(result)
-		strip_reference_names(result, Counter())
 	return result
 
 
-def minimum_json_size(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False, compact_reference_names=False):
+def _minimum_json_size_prepared(project, identifier_cost=None, relabel_block_ids=False):
+	"""Compute the same lower bound for an already compacted/relabelled tree."""
+	counts = dict(structure=0, keys=0, strings=0, numbers=0, literals=0)
+	quote_size = lambda value: len(_quote(value).encode("utf-8", "backslashreplace"))
+	def visit(value):
+		if isinstance(value, JsonNumber):
+			counts["numbers"] += len(_short_number(value))
+		elif isinstance(value, str):
+			counts["strings"] += quote_size(value)
+		elif isinstance(value, dict):
+			counts["structure"] += 2 + len(value) + max(0, len(value) - 1)
+			for key, item in value.items():
+				counts["keys"] += quote_size(key)
+				visit(item)
+		elif isinstance(value, list):
+			counts["structure"] += 2 + max(0, len(value) - 1)
+			for item in value:
+				visit(item)
+		elif value is None or isinstance(value, bool):
+			counts["literals"] += 4 if value is None or value is True else 5
+		else:
+			raise TypeError(f"unsupported exact JSON value: {type(value).__name__}")
+	visit(project)
+	return {"model": "fixed-graph-block-ids-v3" if relabel_block_ids else "fixed-tree-v2",
+		"minimum_bytes": sum(counts.values()), "components": counts,
+		"compact_block_defaults": False, "compact_costume_references": False,
+		"compact_block_flags": False, "identifier_cost": identifier_cost,
+		"global_scratch_minimum_proven": False}
+
+
+def minimum_json_size(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False):
 	"""Exact lower bound for the selected fixed-tree representation model."""
-	project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags, compact_reference_names)
+	project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags)
 	identifier_cost = None
 	if relabel_block_ids:
 		project, _, identifier_cost = relabel_blocks(project)
 	counts = dict(structure=0, keys=0, strings=0, numbers=0, literals=0)
-	@lru_cache(maxsize=65536)
 	def string_size(value):
 		return 2 + sum(2 if char in '\"\\\b\f\n\r\t' else 6 if ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
 			else len(char.encode("utf-8")) for char in value)
@@ -362,9 +462,9 @@ def minimum_json_size(project, compact_defaults=False, compact_costume_reference
 		else:
 			raise TypeError(f"unsupported exact JSON value: {type(value).__name__}")
 	visit(project)
-	return {"model": "fixed-resolved-references-v4" if compact_reference_names else "fixed-graph-block-ids-v3" if relabel_block_ids else "fixed-tree-v2", "minimum_bytes": sum(counts.values()), "components": counts,
+	return {"model": "fixed-graph-block-ids-v3" if relabel_block_ids else "fixed-tree-v2", "minimum_bytes": sum(counts.values()), "components": counts,
 		"compact_block_defaults": compact_defaults, "compact_costume_references": compact_costume_references,
-		"compact_block_flags": compact_block_flags, "compact_reference_names": compact_reference_names, "identifier_cost": identifier_cost, "global_scratch_minimum_proven": False}
+		"compact_block_flags": compact_block_flags, "identifier_cost": identifier_cost, "global_scratch_minimum_proven": False}
 
 
 def _index_key(key):
@@ -497,9 +597,9 @@ def restore_block_labels(original, result):
 
 
 class _LayoutRecord:
-	def __init__(self, prefix, block, short_numbers=True):
+	def __init__(self, prefix, block):
 		self.prefix = prefix
-		self.fields = {key: _quote(key).encode("utf-8", "backslashreplace") + b":" + dumps_exact(value, short_numbers) for key, value in block.items()}
+		self.fields = {key: _quote(key).encode("utf-8", "backslashreplace") + b":" + dumps_exact(value, True) for key, value in block.items()}
 		self.shape = tuple(block)
 
 	def render(self, order, shapes):
@@ -509,7 +609,7 @@ class _LayoutRecord:
 		return self.prefix + b"{" + b",".join(self.fields[name] for name in shapes[key]) + b"}"
 
 
-def _layout_parts(project, short_numbers=True, path=()):
+def _layout_parts(project):
 	parts, pending = [], bytearray()
 	def emit(data):
 		pending.extend(data)
@@ -521,7 +621,7 @@ def _layout_parts(project, short_numbers=True, path=()):
 				if len(path) == 3 and path[0] == "targets" and path[2] == "blocks" and isinstance(item, dict):
 					if pending:
 						parts.append(bytes(pending)); pending.clear()
-					parts.append(_LayoutRecord(prefix, item, short_numbers))
+					parts.append(_LayoutRecord(prefix, item))
 				else:
 					emit(prefix); visit(item, path + (key,))
 			emit(b"}")
@@ -532,39 +632,35 @@ def _layout_parts(project, short_numbers=True, path=()):
 				visit(item, path + (index,))
 			emit(b"]")
 		else:
-			emit(dumps_exact(value, short_numbers))
-	visit(project, path)
+			emit(dumps_exact(value, True))
+	visit(project, ())
 	if pending: parts.append(bytes(pending))
 	return parts
 
 
 def _window_layout(project, orders, level, width=128):
-	"""Measure windows using the actual compressor state of the accepted prefix."""
+	"""Search contiguous record windows against their actual preceding dictionary."""
 	parts, output, shapes = _layout_parts(project), [], {}
-	state = zlib.compressobj(level, zlib.DEFLATED, -15)
-	trials, index = 0, 0
+	history, trials, index = b"", 0, 0
 	while index < len(parts):
 		part = parts[index]
 		if isinstance(part, bytes):
-			output.append(part); state.compress(part); index += 1
+			output.append(part); history = (history + part)[-32768:]; index += 1
 			continue
 		end = index
 		while end < len(parts) and isinstance(parts[end], _LayoutRecord) and end - index < width:
 			end += 1
 		records = parts[index:end]
-		lookahead = _render_layout(parts[end:end + 16], shapes=shapes)[:4096]
-		def score(candidate):
-			probe = state.copy()
-			return len(probe.compress(candidate + lookahead)) + len(probe.flush())
-		best = _render_layout(records, shapes=shapes)
-		best_size = score(best)
+		lookahead = b"".join(piece if isinstance(piece, bytes) else piece.render(None, shapes) for piece in parts[end:end + 16])[:4096]
+		best = b"".join(record.render(None, shapes) for record in records)
+		best_size = len(deflate(history + best + lookahead, level))
 		for order in orders:
-			candidate = _render_layout(records, order, shapes)
+			candidate = b"".join(record.render(order, shapes) for record in records)
 			if candidate == best: continue
-			size = score(candidate); trials += 1
+			size = len(deflate(history + candidate + lookahead, level)); trials += 1
 			if size < best_size:
 				best, best_size = candidate, size
-		output.append(best); state.compress(best); index = end
+		output.append(best); history = (history + best)[-32768:]; index = end
 	return b"".join(output), trials
 
 
@@ -580,21 +676,17 @@ def _sample_blocks(project, width=64):
 	return result
 
 
-def _render_layout(parts, order=None, shapes=None):
-	if shapes is None: shapes = {}
-	return b"".join(part if isinstance(part, bytes) else part.render(order, shapes) for part in parts)
-
-
 def _screen_record_orders(project, level):
-	"""Screen all core-property permutations without serializing values again."""
-	parts = _layout_parts(_sample_blocks(project))
-	shapes, scores = {}, []
+	"""Screen all core-property permutations on bounded, contiguous samples."""
+	probe = _sample_blocks(project)
+	scores = []
 	for order in permutations(("opcode", "next", "parent", "inputs", "fields")):
-		scores.append((len(deflate(_render_layout(parts, order, shapes), level)), order))
+		size = len(deflate(dumps_exact(_layout(probe, order), True), level))
+		scores.append((size, order))
 	return [order for _, order in sorted(scores)[:4]], len(scores)
 
 
-def _specialized_layout(project, orders, level, grouping):
+def _specialized_layout(project, orders, level, grouping, max_members=96):
 	groups = {}
 	def group_key(ti, block):
 		shape = frozenset(block)
@@ -609,17 +701,17 @@ def _specialized_layout(project, orders, level, grouping):
 	chosen = {}
 	trials = 0
 	for key, members in groups.items():
-		if len(members) > 96:
-			members = members[:32] + members[len(members) // 2 - 16:len(members) // 2 + 16] + members[-32:]
+		if len(members) > max_members:
+			half = max(1, max_members // 2)
+			members = members[:half] + members[-(max_members - half):]
 		probe_targets = {}
 		for ti, bid, block in members:
 			probe_targets.setdefault(ti, {"blocks": {}})["blocks"][bid] = block
 		probe = {"targets": list(probe_targets.values())}
 		best_order = None
-		parts, shapes = _layout_parts(probe, False), {}
-		best_size = len(deflate(_render_layout(parts, shapes=shapes), level))
+		best_size = len(deflate(dumps_exact(probe), level))
 		for order in orders:
-			size = len(deflate(_render_layout(parts, order, shapes), level))
+			size = len(deflate(dumps_exact(_layout(probe, order)), level))
 			trials += 1
 			if size < best_size:
 				best_order, best_size = order, size
@@ -644,9 +736,9 @@ def deflate(data, level=9, memory=8, strategy=zlib.Z_DEFAULT_STRATEGY):
 	return compressor.compress(data) + compressor.flush()
 
 
-def _compressions(data, level, thorough=True):
+def _compressions(data, level):
 	yield "zlib", deflate(data, level)
-	if level and thorough:
+	if level:
 		yield "zlib-mem9", deflate(data, level, 9)
 		yield "zlib-filtered", deflate(data, level, 8, zlib.Z_FILTERED)
 
@@ -670,14 +762,23 @@ def zopfli_deflate(data, compress, iterations=15):
 
 
 def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zopfli_required=True, compact_defaults=False,
-	compact_costume_references=False, compact_block_flags=False, minimum_json=False, search_rounds=0, relabel_block_ids=False, compact_reference_names=False):
-	"""Search encodings, preserving every value and every block/input order."""
+	compact_costume_references=False, compact_block_flags=False, minimum_json=False, search_rounds=0, relabel_block_ids=False,
+	verify_encoding=True, already_relabelled=False):
+	"""Search useful encodings while keeping compression search bounded on large projects."""
 	baseline = dumps_exact(project)
-	search_project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags, compact_reference_names)
-	if relabel_block_ids:
-		search_project, _, _ = relabel_blocks(search_project)
-	best_raw = dumps_exact(search_project, True) if minimum_json else baseline
-	best_compressed = deflate(best_raw, level)
+	search_project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags)
+	identifier_cost = None
+	if relabel_block_ids and not already_relabelled:
+		search_project, _, identifier_cost = relabel_blocks(search_project)
+	prepared_relabelled = bool(relabel_block_ids or already_relabelled)
+	short_minimum_raw = dumps_exact(search_project, True)
+	short_minimum_bytes = len(short_minimum_raw)
+	best_raw = short_minimum_raw if minimum_json else baseline
+	large_project = len(baseline) >= FAST_JSON_RAW_THRESHOLD or sum(
+		len(t.get("blocks") or {}) for t in project.get("targets", []) if isinstance(t, dict)
+	) >= FAST_JSON_BLOCK_THRESHOLD
+	search_level = FAST_JSON_SEARCH_LEVEL if large_project else level
+	best_compressed = deflate(best_raw, search_level)
 	rank = (lambda encoded, raw: (len(raw), len(encoded))) if minimum_json else (lambda encoded, raw: (len(encoded), len(raw)))
 	pool = []
 	def remember(raw, compressed):
@@ -690,103 +791,143 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 		else:
 			pool.append((score, raw))
 		pool.sort(key=lambda item: item[0]); del pool[4:]
-	best_label = "original-order/zlib"
+
 	trials = 1
 	seen = set()
-	screened_orders, screen_trials = _screen_record_orders(search_project, level)
+
+	# Large projects do not need the 120-permutation screen. Screen only the
+	# established core layouts, then carry the best few into full-project tests.
+	if large_project:
+		screened_orders = []
+		probe = _sample_blocks(search_project)
+		for order in BLOCK_KEY_ORDERS:
+			probe_bytes = dumps_exact_layout(probe, order, True)
+			screened_orders.append((len(deflate(probe_bytes, FAST_JSON_SCREEN_LEVEL)), order))
+		screened_orders = [order for _, order in sorted(screened_orders)[:FAST_JSON_ORDER_COUNT]]
+		screen_trials = len(BLOCK_KEY_ORDERS)
+		orders = tuple(dict.fromkeys(screened_orders[:FAST_JSON_ORDER_COUNT]))
+	else:
+		screened_orders, screen_trials = _screen_record_orders(search_project, level)
+		orders = tuple(dict.fromkeys((*BLOCK_KEY_ORDERS, *screened_orders)))
 	trials += screen_trials
-	orders = tuple(dict.fromkeys((*BLOCK_KEY_ORDERS, *screened_orders)))
-	for short_numbers in (False, True):
+
+	# For large projects use a single fast compressor while ranking candidate layouts.
+	# The final winner is still recompressed with every enabled strategy below.
+	search_compressions = (("zlib", lambda data: deflate(data, search_level)),)
+	if not large_project:
+		search_compressions = tuple((name, lambda data, memory=memory, strategy=strategy: deflate(data, level, memory, strategy))
+			for name, memory, strategy in (("zlib", 8, zlib.Z_DEFAULT_STRATEGY), ("zlib-mem9", 9, zlib.Z_DEFAULT_STRATEGY), ("zlib-filtered", 8, zlib.Z_FILTERED))
+		)
+
+	def consider(candidate, label_prefix):
+		nonlocal best_raw, best_compressed, best_label, trials
+		if len(candidate) > len(baseline):
+			return
+		fingerprint = hashlib.sha256(candidate).digest()
+		if fingerprint in seen:
+			return
+		seen.add(fingerprint)
+		for compressor, compress_candidate in search_compressions:
+			compressed = compress_candidate(candidate)
+			trials += 1
+			remember(candidate, compressed)
+			if rank(compressed, candidate) < rank(best_compressed, best_raw):
+				best_raw, best_compressed = candidate, compressed
+				best_label = f"{label_prefix}/{compressor}"
+
+	# Large projects only search the compact numeric representation; its final
+	# compression is compared against the best baseline encoding before return.
+	short_modes = (True,) if large_project else (False, True)
+	for short_numbers in short_modes:
 		if minimum_json and not short_numbers: continue
-		parts, shapes = _layout_parts(search_project, short_numbers), {}
 		for order_index, order in enumerate((None, *orders)):
-			candidate = _render_layout(parts, order, shapes)
-			fingerprint = hashlib.sha256(candidate).digest()
-			if fingerprint in seen or len(candidate) > len(baseline):
-				continue
-			seen.add(fingerprint)
-			for compressor, compressed in _compressions(candidate, level, False):
-				trials += 1
-				remember(candidate, compressed)
-				if rank(compressed, candidate) < rank(best_compressed, best_raw):
-					best_raw, best_compressed = candidate, compressed
-					best_label = f"layout-{order_index}/{'short-numbers' if short_numbers else 'original-numbers'}/{compressor}"
-	# Different sprites benefit from different record layouts. Measure them separately,
-	# then evaluate their combination against the complete project stream.
-	if isinstance(search_project.get("targets"), list):
+			if order is None and short_numbers:
+				candidate = short_minimum_raw
+			else:
+				candidate = dumps_exact(search_project, short_numbers) if order is None else dumps_exact_layout(search_project, order, short_numbers)
+			consider(candidate, f"layout-{order_index}/{'short-numbers' if short_numbers else 'original-numbers'}")
+
+	# Different sprites can benefit from distinct orders. This is valuable on smaller
+	# projects, but its per-target compression cost is disproportionate on large ones.
+	if isinstance(search_project.get("targets"), list) and not large_project:
 		adaptive = dict(search_project)
 		adaptive["targets"] = []
 		for target in search_project["targets"]:
-			parts, shapes = _layout_parts(target, path=("targets", 0)), {}
-			chosen_order = None
-			chosen_size = len(deflate(_render_layout(parts, shapes=shapes), level))
+			chosen = target
+			chosen_size = len(deflate(dumps_exact(target, True), level))
 			for order in orders:
-				size = len(deflate(_render_layout(parts, order, shapes), level))
+				candidate = _ordered_blocks(target, order)
+				size = len(deflate(dumps_exact(candidate, True), level))
 				trials += 1
 				if size < chosen_size:
-					chosen_order, chosen_size = order, size
-			adaptive["targets"].append(target if chosen_order is None else _ordered_blocks(target, chosen_order))
+					chosen, chosen_size = candidate, size
+			adaptive["targets"].append(chosen)
 		candidate = dumps_exact(adaptive, True)
-		if hashlib.sha256(candidate).digest() not in seen and len(candidate) <= len(baseline):
-			for compressor, compressed in _compressions(candidate, level, False):
-				trials += 1
-				remember(candidate, compressed)
-				if rank(compressed, candidate) < rank(best_compressed, best_raw):
-					best_raw, best_compressed = candidate, compressed
-					best_label = f"per-target/short-numbers/{compressor}"
-	for grouping in ("shape", "opcode", "target-opcode"):
-		specialized, specialized_trials = _specialized_layout(search_project, orders, level, grouping)
-		trials += specialized_trials
-		for short_numbers in (False, True):
-			if minimum_json and not short_numbers: continue
-			candidate = dumps_exact(specialized, short_numbers)
-			fingerprint = hashlib.sha256(candidate).digest()
-			if fingerprint in seen or len(candidate) > len(baseline):
-				continue
-			seen.add(fingerprint)
-			for compressor, compressed in _compressions(candidate, level, False):
-				trials += 1
-				remember(candidate, compressed)
-				if rank(compressed, candidate) < rank(best_compressed, best_raw):
-					best_raw, best_compressed = candidate, compressed
-					best_label = f"per-{grouping}/{'short-numbers' if short_numbers else 'original-numbers'}/{compressor}"
-	for round_index in range(search_rounds):
+		consider(candidate, "per-target/short-numbers")
+
+	# Specialized grouping is another compression-quality refinement. Keep it on small
+	# projects; on large projects the global screen already captures the useful ordering.
+	if not large_project:
+		for grouping in ("shape", "opcode", "target-opcode"):
+			specialized, specialized_trials = _specialized_layout(search_project, orders, level, grouping)
+			trials += specialized_trials
+			for short_numbers in (False, True):
+				if minimum_json and not short_numbers: continue
+				candidate = dumps_exact(specialized, short_numbers)
+				consider(candidate, f"per-{grouping}/{'short-numbers' if short_numbers else 'original-numbers'}")
+
+	for round_index in range(0 if large_project else search_rounds):
 		candidate, window_trials = _window_layout(loads_exact(best_raw), orders, level, 128 if round_index % 2 == 0 else 64)
 		trials += window_trials
-		for compressor, compressed in _compressions(candidate, level, False):
-			trials += 1; remember(candidate, compressed)
-			if rank(compressed, candidate) < rank(best_compressed, best_raw):
-				best_raw, best_compressed = candidate, compressed
-				best_label = f"window-{round_index + 1}/{compressor}"
-	for compressor, compressed in (*_compressions(best_raw, level), ("zlib-mem5", deflate(best_raw, level, 5))):
-		trials += 1
-		if rank(compressed, best_raw) < rank(best_compressed, best_raw):
-			best_compressed = compressed
-			best_label += "/" + compressor
+		consider(candidate, f"window-{round_index + 1}")
+
+	# Candidate layouts were ranked with a cheaper compressor on large projects.
+	# From this point onward, compare and emit using the requested compression level.
+	best_compressed = deflate(best_raw, level)
 	zopfli = get_zopfli(zopfli_required) if use_zopfli else None
 	if zopfli:
-		remember(best_raw, best_compressed)
-		if search_rounds > 1:
-			for _, candidate in pool[:2]:
-				compressed = zopfli_deflate(candidate, zopfli, min(iterations, 2)); trials += 1
-				if rank(compressed, candidate) < rank(best_compressed, best_raw):
-					best_raw, best_compressed = candidate, compressed
-					best_label = "Zopfli-ranked layouts"
-		compressed = zopfli_deflate(best_raw, zopfli, iterations)
+		# Auto-Zopfli (--all-optimizations/--all-flags) gets a bounded effort on large JSON.
+		# Explicit --zopfli keeps the requested iteration count.
+		effective_iterations = min(iterations, 2) if (large_project and not zopfli_required) else iterations
+		compressed = zopfli_deflate(best_raw, zopfli, effective_iterations)
 		trials += 1
 		if len(compressed) < len(best_compressed):
 			best_compressed = compressed
 			best_label += "/zopfli"
-	difference = exact_difference(project, loads_exact(best_raw), compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids, compact_reference_names)
-	if difference or zlib.decompress(best_compressed, -15) != best_raw:
-		raise ValueError(f"JSON encoding verification failed: {difference or 'DEFLATE mismatch'}")
+
+	# Re-evaluate all normal DEFLATE strategies only for the final winner.
+	for compressor, compressed in _compressions(best_raw, level):
+		trials += 1
+		if len(compressed) < len(best_compressed):
+			best_compressed = compressed
+			best_label += f"/{compressor}"
+
+	if verify_encoding:
+		difference = exact_difference(project, loads_exact(best_raw), compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids)
+		if difference:
+			raise ValueError(f"JSON encoding verification failed: {difference}")
+	if zlib.decompress(best_compressed, -15) != best_raw:
+		raise ValueError("JSON encoding verification failed: DEFLATE mismatch")
+	if minimum_json:
+		json_minimum = {
+			"model": "fixed-graph-block-ids-v3" if prepared_relabelled else "fixed-tree-v2",
+			"minimum_bytes": short_minimum_bytes,
+			"components": None,
+			"compact_block_defaults": compact_defaults,
+			"compact_costume_references": compact_costume_references,
+			"compact_block_flags": compact_block_flags,
+			"identifier_cost": identifier_cost,
+			"global_scratch_minimum_proven": False,
+		}
+	else:
+		json_minimum = _minimum_json_size_prepared(search_project, identifier_cost, prepared_relabelled)
 	return best_raw, best_compressed, {
 		"json_encoding_trials": trials,
 		"json_encoding_bytes_saved": len(baseline) - len(best_raw),
 		"json_deflate_bytes_saved": len(deflate(baseline, level)) - len(best_compressed),
 		"json_encoding": best_label,
 		"zopfli_available": zopfli is not None,
-		"json_minimum": minimum_json_size(project, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids, compact_reference_names),
+		"json_minimum": json_minimum,
 	}
 
 
@@ -837,6 +978,116 @@ def optimize_asset(data, level=9, original=None, use_zopfli=False, iterations=15
 
 
 BLOCK_ID_ALPHABET = "!@#$%^*()+_-={}|[]:;?,./~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+class ProgressBar:
+	def __init__(self, total, enabled=None, width=30):
+		self.total = max(1, int(total))
+		self.enabled = sys.stdout.isatty() if enabled is None else enabled
+		self.width = max(10, int(width))
+		self.completed = 0
+		self.current = ""
+		self.detail_text = ""
+		self.started = time.monotonic()
+		self.last_render = 0.0
+
+	def _render(self, force=False):
+		if not self.enabled:
+			return
+		now = time.monotonic()
+		if not force and now - self.last_render < 0.10:
+			return
+		self.last_render = now
+		fraction = min(1.0, self.completed / self.total)
+		filled = int(self.width * fraction)
+		bar = Ansi.success("#" * filled) + Ansi.muted("." * (self.width - filled))
+		percent = fraction * 100.0
+		elapsed = now - self.started
+		detail = f" | {self.detail_text}" if self.detail_text else ""
+		line = f"\r[{bar}] {self.completed:>2}/{self.total:<2} {percent:5.1f}% | {self.current}{detail} | {elapsed:6.1f}s"
+		try:
+			terminal_width = shutil.get_terminal_size((120, 20)).columns
+		except OSError:
+			terminal_width = 120
+		width = max(40, terminal_width)
+		print(line[:width - 1].ljust(width - 1), end="", flush=True)
+
+	def next(self, label):
+		if self.current:
+			self.completed = min(self.total, self.completed + 1)
+		self.current = label
+		self.detail_text = ""
+		self._render(force=True)
+
+	def detail(self, text):
+		self.detail_text = str(text)
+		self._render()
+
+	def finish(self, label="Complete"):
+		self.completed = self.total
+		self.current = label
+		self.detail_text = ""
+		self._render(force=True)
+		if self.enabled:
+			print()
+
+	def close(self):
+		if self.enabled:
+			print()
+
+
+def _progress_stage_count(opts):
+	count = 1  # normalize block defaults
+	count += bool(opts.convert_wav_to_mp3)
+	count += bool(opts.deduplicate_assets)
+	count += bool(opts.comments)
+	count += bool(opts.positions)
+	count += bool(opts.covered)
+	count += bool(opts.monitors)
+	count += bool(opts.cleared_lists)
+	count += bool(opts.remove_unreachable)
+	count += bool(opts.remove_unused_procedures)
+	count += bool(opts.remove_unreachable or opts.remove_unused_procedures)
+	count += bool(opts.folded_constant_variables)
+	count += bool(opts.script_constant_propagation)
+	count += bool(opts.branch_swapping or opts.trivial_loops or opts.nested_conditionals)
+	count += bool(opts.associative_constant_merging)
+	count += bool(opts.fold_constant_expressions)
+	count += bool(opts.simplify_boolean_control or opts.trivial_loops)
+	count += bool(opts.simplify_blocks)
+	count += bool(opts.group_similar_sequences)
+	count += bool(opts.optimize_procedure_arguments)
+	count += bool(opts.merge_duplicate_procedures)
+	count += bool(opts.remove_unused_procedures and (opts.optimize_procedure_arguments or opts.merge_duplicate_procedures))
+	count += bool(opts.remove_unused_variables or opts.remove_unused_lists)
+	count += True
+	count += bool(opts.remove_unused_broadcasts)
+	count += bool(opts.rename_identifiers or opts.rename_variable_names or opts.rename_list_names or opts.rename_broadcast_names or opts.rename_argument_names or opts.rename_procedure_names)
+	count += bool(opts.rename_variable_ids or opts.rename_list_ids)
+	count += bool(opts.rename_broadcast_ids)
+	count += bool(opts.rename_argument_ids)
+	count += bool(opts.rename_block_ids)
+	count += bool(opts.compact_numeric_inputs)
+	count += bool(opts.compact_field_ids)
+	count += bool(opts.compact_mutation_hasnext)
+	count += bool(opts.compact_mutation_metadata)
+	count += bool(opts.normalize_numbers)
+	count += bool(not opts.keep_sound_metadata)
+	count += bool(opts.remove_empty_fields)
+	count += bool(opts.remove_empty_inputs)
+	count += bool(opts.remove_costume_metadata)
+	count += bool(opts.remove_default_target_properties)
+	count += bool(opts.remove_empty_target_containers)
+	count += bool(opts.remove_project_meta)
+	count += bool(opts.compact_data_literals)
+	count += bool(opts.strip_reference_names)
+	count += bool(opts.remove_unused_extensions)
+	count += True
+	count += bool(opts.relabel_block_ids)
+	count += bool(opts.optimize_json)
+	count += True
+	count += True
+	return count
 
 
 class AnsiPrint:
@@ -939,6 +1190,40 @@ def _count_block_references(target):
 	return refs
 
 
+def _analyze_block_ids(target):
+	"""Collect reference frequencies and dangling IDs in a single graph scan."""
+	blocks = target.get("blocks", {})
+	ids = set(blocks)
+	refs = Counter({bid: 1 for bid in blocks})
+	dangling = set()
+	for block in blocks.values():
+		if not isinstance(block, dict):
+			continue
+		for key in ("next", "parent"):
+			v = block.get(key)
+			if not isinstance(v, str):
+				continue
+			if v in ids:
+				refs[v] += 1
+			else:
+				dangling.add(v)
+		for value in (block.get("inputs") or {}).values():
+			for ref in _iter_input_block_refs(value):
+				if ref in ids:
+					refs[ref] += 1
+				else:
+					dangling.add(ref)
+	for comment in (target.get("comments") or {}).values():
+		if isinstance(comment, dict):
+			cbid = comment.get("blockId")
+			if isinstance(cbid, str):
+				if cbid in ids:
+					refs[cbid] += 1
+				else:
+					dangling.add(cbid)
+	return refs, dangling
+
+
 def rename_block_ids(project, stats, frequency_order=False):
 	total_stats = 0
 	all_maps = {}
@@ -951,10 +1236,10 @@ def rename_block_ids(project, stats, frequency_order=False):
 			continue
 
 		if frequency_order:
-			refs = _count_block_references(target)
+			refs, dangling = _analyze_block_ids(target)
 			old_ids = sorted(old_ids, key=lambda x: (-refs[x], x))
-
-		dangling = _dangling_block_ids(target)
+		else:
+			_, dangling = _analyze_block_ids(target)
 		block_ids = _rename_id_map(old_ids, existing_ids=dangling)
 		all_maps[ti] = block_ids
 
@@ -983,27 +1268,6 @@ def rename_block_ids(project, stats, frequency_order=False):
 	stats["block_ids"] += total_stats
 	stats["dangling_refs_skipped"] += dangling_skipped
 	return all_maps
-
-
-def _dangling_block_ids(target):
-	blocks = target.get("blocks", {})
-	ids = set(blocks)
-	dangling = set()
-	for block in blocks.values():
-		if not isinstance(block, dict):
-			continue
-		for key in ("next", "parent"):
-			v = block.get(key)
-			if isinstance(v, str) and v not in ids:
-				dangling.add(v)
-		for value in (block.get("inputs") or {}).values():
-			_collect_dangling_in_input(value, ids, dangling)
-	for comment in (target.get("comments") or {}).values():
-		if isinstance(comment, dict):
-			bid = comment.get("blockId")
-			if isinstance(bid, str) and bid not in ids:
-				dangling.add(bid)
-	return dangling
 
 
 def _collect_dangling_in_input(value, ids, dangling):
@@ -1754,15 +2018,16 @@ def _collect_data_ids(project):
 
 
 def _rename_id_map(ids, existing_ids=(), prefix=""):
-	reserved = set(existing_ids)
+	used = set(existing_ids)
 	result = {}
 	n = 0
 	for old in ids:
 		new = f"{prefix}{_short_id(n)}"
-		while new in reserved or new in result.values():
+		while new in used:
 			n += 1
 			new = f"{prefix}{_short_id(n)}"
 		result[old] = new
+		used.add(new)
 		n += 1
 	return result
 
@@ -3153,6 +3418,42 @@ class _ScratchGraphIndex:
 		self.edges = edges
 		self.parents = parents
 		self.incoming = incoming
+		return self
+
+	def refresh_blocks(self, block_ids):
+		"""Refresh only the outgoing reference edges of changed/removed blocks."""
+		blocks = self.target.get("blocks", {})
+		for bid in set(block_ids):
+			old_out = self.edges.get(bid, ())
+			for ref in old_out:
+				owners = self.parents.get(ref)
+				if owners is not None:
+					owners.discard(bid)
+					if not owners:
+						del self.parents[ref]
+				count = self.incoming.get(ref, 0) - 1
+				if count > 0:
+					self.incoming[ref] = count
+				else:
+					del self.incoming[ref]
+
+			block = blocks.get(bid)
+			if not isinstance(block, dict):
+				self.edges.pop(bid, None)
+				continue
+
+			new_out = set()
+			nxt = block.get("next")
+			if isinstance(nxt, str) and nxt in blocks:
+				new_out.add(nxt)
+			for value in (block.get("inputs") or {}).values():
+				for ref in set(_iter_input_block_refs(value)):
+					if ref in blocks:
+						new_out.add(ref)
+			self.edges[bid] = new_out
+			for ref in new_out:
+				self.parents.setdefault(ref, set()).add(bid)
+				self.incoming[ref] += 1
 		return self
 
 
@@ -7251,9 +7552,17 @@ def simplify_script_structures(project, stats, opts):
 		blocks = target.get("blocks") or {}
 		graph = _ScratchGraphIndex(target)
 		commented = _script_comment_ids(target)
+		candidate_ids = [
+			bid for bid, block in blocks.items()
+			if isinstance(block, dict) and block.get("opcode") in (
+				"control_if", "control_if_else", "control_repeat_until",
+				"control_repeat",
+			)
+		]
 		while True:
 			changed = False
-			for bid, block in list(blocks.items()):
+			for bid in candidate_ids:
+				block = blocks.get(bid)
 				if not isinstance(block, dict) or bid not in blocks:
 					continue
 				incoming = graph.incoming
@@ -7274,7 +7583,7 @@ def simplify_script_structures(project, stats, opts):
 							opts.script_rewrite_input_edits[(ti, bid, n)] = copy.deepcopy(inputs[n])
 						_script_record_removed(opts, ti, plan["removed"])
 						for dead in plan["removed"]: blocks.pop(dead, None)
-						graph.rebuild(); stats["branch_swaps"] += 1; changed = True; break
+						graph.refresh_blocks((bid, *plan["removed"])); stats["branch_swaps"] += 1; changed = True; break
 
 				if opts.branch_swapping:
 					plan = _script_plan_empty_then(blocks, bid, incoming, graph, commented)
@@ -7305,7 +7614,7 @@ def simplify_script_structures(project, stats, opts):
 							_script_record_new(opts, ti, {plan["new_id"]})
 						_script_record_removed(opts, ti, plan["removed"])
 						for dead in plan["removed"]: blocks.pop(dead, None)
-						graph.rebuild(); stats["empty_then_rewrites"] += 1; changed = True; break
+						graph.refresh_blocks((bid, plan.get("new_id"), *plan["removed"])); stats["empty_then_rewrites"] += 1; changed = True; break
 
 				if opts.trivial_loops:
 					plan = _script_plan_repeat_until_not(blocks, bid, incoming, graph, commented)
@@ -7321,7 +7630,7 @@ def simplify_script_structures(project, stats, opts):
 								opts.script_rewrite_link_edits[(ti, moved, "parent")] = bid
 						_script_record_removed(opts, ti, plan["removed"])
 						for dead in plan["removed"]: blocks.pop(dead, None)
-						graph.rebuild(); stats["repeat_until_not_rewrites"] += 1; changed = True; break
+						graph.refresh_blocks((bid, *plan["removed"])); stats["repeat_until_not_rewrites"] += 1; changed = True; break
 
 				if opts.nested_conditionals:
 					plan = _script_plan_nested_if(blocks, bid, incoming, graph, commented)
@@ -7344,7 +7653,7 @@ def simplify_script_structures(project, stats, opts):
 						_script_record_new(opts, ti, {new_id})
 						_script_record_removed(opts, ti, {plan["inner_id"]})
 						blocks.pop(plan["inner_id"], None)
-						graph.rebuild(); stats["nested_if_merges"] += 1; changed = True; break
+						graph.refresh_blocks((bid, new_id, plan["inner_id"])); stats["nested_if_merges"] += 1; changed = True; break
 			if not changed: break
 	return sum(stats.get(k,0) for k in ("branch_swaps","empty_then_rewrites","repeat_until_not_rewrites","nested_if_merges"))
 
@@ -7544,14 +7853,19 @@ def compact_data_literals(project, stats):
 
 
 def strip_reference_names(project, stats):
-	"""Omit fallback names only when an unambiguous ID resolves to that name."""
-	scopes = _reference_scopes(project)
 	count = 0
-	for path, container, index, ident, kind in _reference_name_slots(project):
-		name = container[index]
-		if type(name) is str and name and type(ident) is str and ident and ident not in ("__proto__", "constructor", "prototype") and scopes[path[1]].get(ident) == (kind, name):
-			container[index] = ""
-			count += 1
+	for target in project.get("targets", []):
+		for block in (target.get("blocks") or {}).values():
+			if isinstance(block, list) and len(block) >= 3 and block[0] in (12,13) and block[1] != "":
+				block[1] = ""; count += 1
+			elif isinstance(block, dict):
+				fields = block.get("fields") or {}
+				for key in ("VARIABLE", "LIST"):
+					field = fields.get(key)
+					if isinstance(field, list) and len(field) >= 2 and field[0] != "": field[0] = ""; count += 1
+				for raw in (block.get("inputs") or {}).values():
+					for node in _iter_scratch_input_nodes(raw):
+						if len(node) >= 3 and node[0] in (12,13) and node[1] != "": node[1] = ""; count += 1
 	stats["reference_names_stripped"] += count
 	return count
 
@@ -7602,6 +7916,15 @@ def fold_constant_expressions(project, stats, opts):
 		blocks = target.get("blocks") or {}
 		graph = _ScratchGraphIndex(target)
 		incoming_refs = graph.incoming
+		candidate_inputs = [
+			(block_id, input_name)
+			for block_id, block in blocks.items()
+			if isinstance(block, dict)
+			for input_name, input_val in (block.get("inputs") or {}).items()
+			if (isinstance(input_val, list) and len(input_val) > 1 and input_val[0] in (2, 3)
+				and isinstance(input_val[1], str) and isinstance(blocks.get(input_val[1]), dict)
+				and str(blocks[input_val[1]].get("opcode", "")).startswith("operator_"))
+		]
 		commented_ids = {
 			c.get("blockId")
 			for c in (target.get("comments") or {}).values()
@@ -7610,11 +7933,22 @@ def fold_constant_expressions(project, stats, opts):
 
 		while True:
 			changed = False
-			for block_id, block in list(blocks.items()):
-				if not isinstance(block, dict) or block_id not in blocks:
+			for block_id, input_name in candidate_inputs:
+				block = blocks.get(block_id)
+				if not isinstance(block, dict):
 					continue
+				inputs_now = block.get("inputs") or {}
+				input_val = inputs_now.get(input_name)
+				if input_val is None:
+					continue
+				if not (isinstance(input_val, list) and len(input_val) > 1 and input_val[0] in (1, 2, 3)):
+					continue
+				if input_val[0] in (2, 3):
+					root_id = input_val[1]
+					root = blocks.get(root_id) if isinstance(root_id, str) else None
+					if not isinstance(root, dict) or not str(root.get("opcode", "")).startswith("operator_"):
+						continue
 
-				for input_name, input_val in list((block.get("inputs") or {}).items()):
 					boolean_negation = _simplify_double_boolean_negation(
 						input_val, blocks, block_id, input_name, incoming_refs, graph
 					)
@@ -7634,7 +7968,7 @@ def fold_constant_expressions(project, stats, opts):
 							opts.folded_constant_expression_blocks[ti].update(removed_ids)
 							for remove_id in removed_ids:
 								blocks.pop(remove_id, None)
-							graph.rebuild()
+							graph.refresh_blocks((block_id, *removed_ids))
 							incoming_refs = graph.incoming
 							stats["boolean_constants_propagated"] += 1
 							folded += 1
@@ -7666,7 +8000,7 @@ def fold_constant_expressions(project, stats, opts):
 								opts.folded_constant_expression_blocks[ti].update(removed_ids)
 								for remove_id in removed_ids:
 									blocks.pop(remove_id, None)
-								graph.rebuild()
+								graph.refresh_blocks((block_id, *removed_ids))
 								incoming_refs = graph.incoming
 								stats["algebraic_simplifications"] += 1
 								folded += 1
@@ -7743,7 +8077,7 @@ def fold_constant_expressions(project, stats, opts):
 						)] = copy.deepcopy(demorgan["new_outer_input"])
 						opts.folded_constant_expression_blocks[ti].add(right_not_id)
 						blocks.pop(right_not_id, None)
-						graph.rebuild()
+						graph.refresh_blocks((block_id, logic_id, left_not_id, right_not_id))
 						incoming_refs = graph.incoming
 						changed = True
 						stats["demorgan_rewrites"] += 1
@@ -7800,7 +8134,7 @@ def fold_constant_expressions(project, stats, opts):
 						opts.folded_constant_expression_new_blocks[ti].update(new_ids)
 						for remove_id in folded_ids:
 							blocks.pop(remove_id, None)
-						graph.rebuild()
+						graph.refresh_blocks((block_id, *owned_ids))
 						incoming_refs = graph.incoming
 						folded += 1
 						changed = True
@@ -7844,7 +8178,7 @@ def fold_constant_expressions(project, stats, opts):
 					opts.folded_constant_expression_new_blocks[ti].update(new_ids)
 					for remove_id in owned_ids:
 						blocks.pop(remove_id, None)
-					graph.rebuild()
+					graph.refresh_blocks((block_id, *owned_ids))
 					incoming_refs = graph.incoming
 					folded += 1
 					changed = True
@@ -8260,7 +8594,7 @@ class Options:
 		self.optimize_assets = optimize_assets or all_lossless or zopfli_assets or auto_zopfli
 		self.compact_block_defaults = compact_block_defaults or all_lossless
 		self.zopfli = zopfli or all_lossless or auto_zopfli
-		self.zopfli_assets = zopfli_assets
+		self.zopfli_assets = zopfli_assets or all_lossless or auto_zopfli
 		self.auto_zopfli = auto_zopfli
 		self.relabel_block_ids = relabel_block_ids
 		self.zopfli_required = zopfli or zopfli_assets
@@ -8285,7 +8619,7 @@ class Options:
 						"optimize_procedure_arguments", "merge_duplicate_procedures",
 						"branch_swapping", "trivial_loops", "nested_conditionals",
 						"associative_constant_merging", "script_constant_propagation",
-						"compact_data_literals", "remove_unused_extensions",
+						"strip_reference_names", "compact_data_literals", "remove_unused_extensions",
 						"frequency_block_ids", "frequency_data_ids")
 				)
 			]
@@ -8418,67 +8752,95 @@ class Options:
 		self.grouped_sequence_rejected_size = 0
 
 
-def apply_transforms(project, opts: Options, assets=None):
+def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.lossless:
 		return Counter()
+	progress = progress or ProgressBar(_progress_stage_count(opts))
+	stage = progress.next
+	stage("Normalize block defaults")
 	stats = minify_blocks(project)
 	if opts.convert_wav_to_mp3 and assets is not None:
+		stage('Convert WAV sounds to MP3')
 		opts.wav_conversions = convert_wav_sounds_to_mp3(project, assets, stats)
 	if opts.deduplicate_assets and assets is not None:
+		stage('Deduplicate assets')
 		opts.asset_deduplications = deduplicate_assets(project, assets, stats)
 	if opts.comments:
+		stage('Strip sprite comments')
 		strip_sprite_comments(project, stats)
 	if opts.positions:
+		stage('Round positions')
 		round_positions(project, stats)
 	if opts.covered:
+		stage('Reset covered shadow values')
 		clear_covered_values(project, stats)
 	if opts.monitors:
+		stage('Clean monitors')
 		clean_monitors(project, stats)
 	if opts.cleared_lists:
+		stage('Clear selected large lists')
 		clear_large_lists(project, opts.cleared_lists, stats)
 	if opts.remove_unreachable:
+		stage('Remove unreachable blocks')
 		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_first")
 	if opts.remove_unused_procedures:
+		stage('Remove unused procedures')
 		remove_unused_procedures(project, stats)
 	if opts.remove_unreachable or opts.remove_unused_procedures:
+		stage('Re-scan unreachable blocks')
 		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_second")
 	if opts.folded_constant_variables:
+		stage('Fold constant variables')
 		fold_constant_variables(project, opts.folded_constant_variables, stats)
 		remove_constant_variable_setters(
 			project, opts.folded_constant_variable_setters, stats, opts
 		)
 	if opts.script_constant_propagation:
+		stage('Propagate script constants')
 		propagate_script_constants(project, stats, opts)
 	if opts.branch_swapping or opts.trivial_loops or opts.nested_conditionals:
+		stage('Rewrite script control structures')
 		simplify_script_structures(project, stats, opts)
 	if opts.associative_constant_merging:
+		stage('Merge associative constants')
 		merge_associative_constants(project, stats, opts)
 	if opts.fold_constant_expressions:
+		stage('Fold constant expressions')
 		fold_constant_expressions(project, stats, opts)
 	if opts.simplify_boolean_control:
+		stage('Simplify boolean control flow')
 		simplify_boolean_controls(project, stats, opts)
 	elif opts.trivial_loops:
+		stage('Simplify trivial boolean loops')
 		simplify_boolean_controls(project, stats, opts, only_repeat_one=True)
 	if opts.simplify_blocks:
+		stage('Simplify setter RHS blocks')
 		_simplify_setter_rhs_blocks(project, stats, opts)
 	if opts.group_similar_sequences:
+		stage('Group similar sequences')
 		group_similar_sequences(project, stats, opts.sequence_threshold, opts)
 	if opts.optimize_procedure_arguments:
+		stage('Optimize procedure arguments')
 		optimize_procedure_arguments(project, stats, opts)
 	if opts.merge_duplicate_procedures:
+		stage('Merge duplicate procedures')
 		merge_duplicate_procedures(project, stats, opts)
 	if opts.remove_unused_procedures and (
 		opts.optimize_procedure_arguments or opts.merge_duplicate_procedures
 	):
+		stage("Remove procedures made unused")
 		remove_unused_procedures(project, stats)
 	if opts.remove_unused_variables or opts.remove_unused_lists:
+		stage('Remove unused variables/lists')
 		remove_unused_data(
 			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
 		)
+	stage("Repair dangling broadcast references")
 	opts.repaired_broadcast_ids, opts.broadcast_repair_conflicts = (
 		_repair_dangling_broadcast_refs(project, stats)
 	)
 	if opts.remove_unused_broadcasts:
+		stage('Remove unused broadcasts')
 		remove_unused_broadcasts(project, stats)
 	if (
 		opts.rename_identifiers
@@ -8488,6 +8850,7 @@ def apply_transforms(project, opts: Options, assets=None):
 		or opts.rename_argument_names
 		or opts.rename_procedure_names
 	):
+		stage('Rename identifiers')
 		opts.renamed_identifiers = rename_identifiers(
 			project,
 			stats,
@@ -8499,6 +8862,7 @@ def apply_transforms(project, opts: Options, assets=None):
 		)
 	used_data_ids = set()
 	if opts.rename_variable_ids or opts.rename_list_ids:
+		stage('Rename variable/list IDs')
 		opts.renamed_variable_ids, opts.renamed_list_ids = rename_variable_list_ids(
 			project,
 			stats,
@@ -8509,6 +8873,7 @@ def apply_transforms(project, opts: Options, assets=None):
 		used_data_ids.update(opts.renamed_variable_ids.values())
 		used_data_ids.update(opts.renamed_list_ids.values())
 	if opts.rename_broadcast_ids:
+		stage('Rename broadcast IDs')
 		opts.renamed_broadcast_ids = rename_broadcast_ids(
 			project,
 			stats,
@@ -8516,41 +8881,59 @@ def apply_transforms(project, opts: Options, assets=None):
 			frequency_order=opts.frequency_data_ids,
 		)
 	if opts.rename_argument_ids:
+		stage('Rename argument IDs')
 		opts.renamed_argument_ids = rename_argument_ids(project, stats)
 	if opts.rename_block_ids:
+		stage('Rename block IDs')
 		opts.renamed_block_ids = rename_block_ids(
 			project, stats, frequency_order=opts.frequency_block_ids
 		)
 	if opts.compact_numeric_inputs:
+		stage('Compact numeric inputs')
 		compact_numeric_inputs(project, stats)
 	if opts.compact_field_ids:
+		stage('Compact redundant field IDs')
 		compact_redundant_field_ids(project, stats)
 	if opts.compact_mutation_hasnext:
+		stage('Compact mutation hasnext')
 		compact_mutation_hasnext(project, stats)
 	if opts.compact_mutation_metadata:
+		stage('Compact mutation metadata')
 		compact_mutation_metadata(project, stats)
 	if opts.normalize_numbers:
+		stage('Normalize numbers')
 		normalize_numbers(project, stats, opts.normalize_epsilon)
 	if not opts.keep_sound_metadata:
+		stage('Remove sound metadata')
 		remove_sound_metadata(project, stats)
 	if opts.remove_empty_fields:
+		stage('Remove empty fields')
 		remove_empty_fields(project, stats)
 	if opts.remove_empty_inputs:
+		stage('Remove empty inputs')
 		remove_empty_inputs(project, stats)
 	if opts.remove_costume_metadata:
+		stage('Remove costume metadata')
 		remove_costume_metadata(project, stats, assets)
 	if opts.remove_default_target_properties:
+		stage('Remove default target properties')
 		remove_default_target_properties(project, stats)
 	if opts.remove_empty_target_containers:
+		stage('Remove empty target containers')
 		remove_empty_target_containers(project, stats)
 	if opts.remove_project_meta:
+		stage('Remove project metadata')
 		remove_project_meta(project, stats)
 	if opts.compact_data_literals:
+		stage('Compact data literals')
 		compact_data_literals(project, stats)
 	if opts.strip_reference_names:
+		stage('Strip reference names')
 		strip_reference_names(project, stats)
 	if opts.remove_unused_extensions:
+		stage('Remove unused extensions')
 		remove_unused_extensions(project, stats, opts)
+	stage("Repair dangling block links")
 	for target in project.get("targets", []):
 		stats["dangling_block_refs_fixed"] += _repair_dangling_block_refs(target)
 	return stats
@@ -9860,7 +10243,7 @@ def _reference_primitive_head_equal(original, minified, opts):
 
 def verify(original_path, minified_path, opts):
 	if opts.lossless:
-		return _verify_lossless(original_path, minified_path, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids, opts.strip_reference_names)
+		return _verify_lossless(original_path, minified_path, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids)
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
 		if a.testzip() is not None:
 			return False, f"input zip '{original_path}' failed CRC test"
@@ -9897,13 +10280,15 @@ def verify(original_path, minified_path, opts):
 					)
 			else:
 				final_name = _final_asset_name(name, opts)
+				original_bytes = a.read(name)
+				minified_bytes = b.read(final_name)
 				if final_name != name:
-					if a.read(name) != b.read(final_name):
+					if original_bytes != minified_bytes:
 						return (False, f"deduplicated asset byte mismatch: {name!r} -> {final_name!r}")
-				elif a.read(name) != b.read(name):
+				elif original_bytes != minified_bytes:
 					return (
 						False,
-						f"asset byte-for-byte mismatch: {name!r} ({len(a.read(name))} bytes vs {len(b.read(name))} bytes)",
+						f"asset byte-for-byte mismatch: {name!r} ({len(original_bytes)} bytes vs {len(minified_bytes)} bytes)",
 					)
 
 		try:
@@ -10744,7 +11129,7 @@ def format_size_report(before_json, after_json, before_archive, after_archive):
 	)
 
 
-def _verify_lossless(original_path, minified_path, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False, compact_reference_names=False):
+def _verify_lossless(original_path, minified_path, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False):
 	try:
 		with zipfile.ZipFile(original_path) as original, zipfile.ZipFile(minified_path) as result:
 			for archive in (original, result):
@@ -10757,7 +11142,7 @@ def _verify_lossless(original_path, minified_path, compact_defaults=False, compa
 				return False, "archive comment changed"
 			left = loads_exact(original.read("project.json"))
 			right = loads_exact(result.read("project.json"))
-			difference = exact_difference(left, right, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids, compact_reference_names)
+			difference = exact_difference(left, right, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids)
 			if difference:
 				return False, difference
 			for info in original.infolist():
@@ -10767,35 +11152,11 @@ def _verify_lossless(original_path, minified_path, compact_defaults=False, compa
 						return False, f"ZIP metadata {field} changed: {info.filename!r}"
 				if info.filename != "project.json" and original.read(info) != result.read(other):
 					return False, f"asset byte-for-byte mismatch: {info.filename!r}"
-		if compact_block_flags or relabel_block_ids or compact_reference_names:
-			return True, "approved block and reference representation changes verified; every other JSON value, execution order, ZIP metadata and asset byte preserved"
+		if compact_block_flags or relabel_block_ids:
+			return True, "approved block representation changes verified; every other JSON value, execution order, ZIP metadata and asset byte preserved"
 		return True, "every JSON value, collection order, ZIP metadata and asset byte preserved"
 	except (ValueError, OSError, KeyError, zipfile.BadZipFile, zlib.error) as error:
 		return False, str(error)
-
-
-def _lossless_asset_entries(source, opts, zopfli):
-	"""Compress a bounded queue in parallel; read and write ZIP entries in order."""
-	workers = min(4, os.cpu_count() or 1)
-	pending, queued_bytes = deque(), 0
-	with ThreadPoolExecutor(max_workers=workers) as pool:
-		for info in source.infolist():
-			job, size = None, 0
-			if info.filename != "project.json":
-				data = source.read(info)
-				previous = read_compressed_entry(source, info)
-				size = len(data) + len(previous)
-				if opts.optimize_assets and info.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
-					job = pool.submit(optimize_asset, data, opts.compression_level,
-						(info.compress_type, previous), zopfli if opts.zopfli_assets else False, opts.zopfli_iterations)
-				else:
-					job = (info.compress_type, previous)
-			pending.append((info, job, size)); queued_bytes += size
-			while pending and (len(pending) >= workers * 2 or queued_bytes >= 32 * 1024 * 1024):
-				entry, result, size = pending.popleft(); queued_bytes -= size
-				yield entry, result.result() if hasattr(result, "result") else result
-		for entry, result, _ in pending:
-			yield entry, result.result() if hasattr(result, "result") else result
 
 
 def _minify_lossless_sb3(src, dst, opts):
@@ -10814,7 +11175,7 @@ def _minify_lossless_sb3(src, dst, opts):
 			out_json, compressed, stats = optimize_project_json(
 				project, opts.compression_level, opts.zopfli, opts.zopfli_iterations, opts.zopfli_required,
 				opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags,
-				opts.minimum_json, opts.json_search_rounds, opts.relabel_block_ids, opts.strip_reference_names
+				opts.minimum_json, opts.json_search_rounds, opts.relabel_block_ids
 			)
 			json_info = source.getinfo("project.json")
 			original_wins = ((len(raw), json_info.compress_size) <= (len(out_json), len(compressed))) if opts.minimum_json else json_info.compress_size <= len(compressed)
@@ -10833,14 +11194,21 @@ def _minify_lossless_sb3(src, dst, opts):
 				print(Ansi.heading("Optimizing assets without changing their bytes..."), flush=True)
 				entries = source.infolist()
 				last_progress = time.monotonic()
-				for index, (info, encoded_asset) in enumerate(_lossless_asset_entries(source, opts, zopfli), 1):
+				for index, info in enumerate(entries, 1):
 					if info.filename == "project.json":
 						write_compressed_entry(output, new_json_info, compressed)
 						continue
-					method, encoded = encoded_asset
-					if len(encoded) < info.compress_size:
+					data = source.read(info)
+					previous = read_compressed_entry(source, info)
+					method, encoded = info.compress_type, previous
+					if opts.optimize_assets and method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+						method, encoded = optimize_asset(
+							data, opts.compression_level, (method, previous),
+							zopfli if opts.zopfli_assets else False, opts.zopfli_iterations
+						)
+					if len(encoded) < len(previous):
 						stats["assets_recompressed"] = stats.get("assets_recompressed", 0) + 1
-						stats["asset_deflate_bytes_saved"] = stats.get("asset_deflate_bytes_saved", 0) + info.compress_size - len(encoded)
+						stats["asset_deflate_bytes_saved"] = stats.get("asset_deflate_bytes_saved", 0) + len(previous) - len(encoded)
 					new_info = copy.copy(info)
 					new_info.compress_type = method
 					write_compressed_entry(output, new_info, encoded)
@@ -10848,7 +11216,7 @@ def _minify_lossless_sb3(src, dst, opts):
 						print(f"  Entries checked: {index:,}/{len(entries):,}; asset bytes saved: {stats.get('asset_deflate_bytes_saved', 0):,}", flush=True)
 						last_progress = time.monotonic()
 			print(Ansi.heading("Verifying exact project data and every asset byte..."), flush=True)
-			ok, message = _verify_lossless(src, temporary, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids, opts.strip_reference_names)
+			ok, message = _verify_lossless(src, temporary, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids)
 			if not ok:
 				raise ValueError(f"lossless verification failed: {message}")
 		os.replace(temporary, dst)
@@ -10890,6 +11258,7 @@ def minify_sb3(src, dst, opts=None):
 	except ValueError as error:
 		print(Ansi.error(f"Error: {error}"))
 		return 1
+	
 	with zipfile.ZipFile(src) as zin:
 		if "project.json" not in zin.namelist():
 			print(Ansi.error("Error: no project.json in archive"))
@@ -10928,8 +11297,11 @@ def minify_sb3(src, dst, opts=None):
 			if item.filename != "project.json"
 		}
 
-		stats = apply_transforms(project, opts, assets)
+		print("\n" + Ansi.prompt("--- BEGIN ---") + "\n")
+		progress = ProgressBar(_progress_stage_count(opts))
+		stats = apply_transforms(project, opts, assets, progress)
 		if opts.relabel_block_ids:
+			progress.next("Minimize block IDs")
 			project, label_maps, label_cost = relabel_blocks(project)
 			previous_maps = getattr(opts, "renamed_block_ids", {})
 			opts.renamed_block_ids = {
@@ -10941,12 +11313,16 @@ def minify_sb3(src, dst, opts=None):
 		out_json = dumps_compact(project, opts.sort_keys).encode("utf-8")
 		compressed_json = None
 		if opts.optimize_json:
+			progress.next("Optimize project.json")
 			out_json, compressed_json, encoding_stats = optimize_project_json(
 				loads_exact(out_json), opts.compression_level, opts.zopfli,
 				opts.zopfli_iterations, opts.zopfli_required, opts.compact_block_defaults,
-				opts.compact_costume_references, opts.compact_block_flags, opts.minimum_json, opts.json_search_rounds
-			)
+			opts.compact_costume_references, opts.compact_block_flags, opts.minimum_json, opts.json_search_rounds,
+			False, verify_encoding=False, already_relabelled=opts.relabel_block_ids
+		)
 			stats.update({key: value for key, value in encoding_stats.items() if isinstance(value, int)})
+
+		progress.next("Process assets and write archive" if opts.optimize_assets else "Write archive")
 		with zipfile.ZipFile(
 			dst, "w", zipfile.ZIP_DEFLATED, compresslevel=opts.compression_level
 		) as zout:
@@ -10958,15 +11334,33 @@ def minify_sb3(src, dst, opts=None):
 				json_info.file_size = len(out_json)
 				json_info.CRC = zlib.crc32(out_json)
 				write_compressed_entry(zout, json_info, compressed_json)
-			for name, data in assets.items():
+			asset_count = len(assets)
+			last_progress_render = time.monotonic()
+			for asset_index, (name, data) in enumerate(assets.items(), 1):
+				if opts.optimize_assets and time.monotonic() - last_progress_render >= 0.15:
+					progress.detail(f"{asset_index:,}/{asset_count:,} assets")
+					last_progress_render = time.monotonic()
 				if opts.optimize_assets:
+					# PNG/JPEG/GIF/WebP/MP3/OGG containers are already internally compressed.
+					# Preserve their existing ZIP stream instead of spending CPU on DEFLATE/Zopfli.
+					_ext = os.path.splitext(name)[1].lower()
+					if _ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp3", ".ogg", ".m4a", ".aac") and name in asset_infos:
+						info = copy.copy(asset_infos[name])
+						previous = read_compressed_entry(zin, info)
+						write_compressed_entry(zout, info, previous)
+						continue
 					info = copy.copy(asset_infos[name]) if name in asset_infos else zipfile.ZipInfo(name)
 					original = None
 					if name in asset_infos and zin.read(name) == data:
 						original = (info.compress_type, read_compressed_entry(zin, info))
+					asset_zopfli = (
+						zopfli
+						if opts.zopfli_assets and (not opts.auto_zopfli or opts.zopfli_required)
+						else False
+					)
 					method, compressed = optimize_asset(
 						data, opts.compression_level, original,
-						zopfli if opts.zopfli_assets else False, opts.zopfli_iterations
+						asset_zopfli, opts.zopfli_iterations
 					)
 					info.compress_type = method
 					info.file_size = len(data)
@@ -11016,21 +11410,25 @@ def minify_sb3(src, dst, opts=None):
 						compresslevel=opts.compression_level,
 					)
 
-	print(f'Input : "{src}"\nOutput: "{dst}"\n')
-	_print_transform_stats(stats, opts)
-	b, a = len(raw), len(out_json)
-	print("")
-	for line in format_size_report(b, a, os.path.getsize(src), os.path.getsize(dst)):
-		print(line)
-
-	print(Ansi.heading("\nVerifying (independent original-vs-result check)..."))
+	progress.next("Verify output")
 	ok, msg = verify(src, dst, opts)
 	if not ok:
+		progress.detail(f"failed: {msg}")
+		progress.close()
 		print(Ansi.error(f"Verification failed: {msg}"))
 		os.remove(dst)
 		print(Ansi.muted("Output deleted."))
 		return 2
+	progress.finish("Complete")
 	print(Ansi.success("Verified successfully."))
+
+	print(f'Input : "{src}"\nOutput: "{dst}"\n')
+	_print_transform_stats(stats, opts)
+
+	b, a = len(raw), len(out_json)
+	print("")
+	for line in format_size_report(b, a, os.path.getsize(src), os.path.getsize(dst)):
+		print(line)
 	return 0
 
 
@@ -11079,16 +11477,16 @@ if __name__ == "__main__":
 		print(Ansi.error("Usage: ") + Ansi.warning("python minify_sb3.py path/to/project.sb3 --flags"))
 		sys.exit(1)
 	
-	all_flags = "--all-flags" in flags or "--all-optimizations" in flags
+	all_flags = "--all-flags" in flags
+	all_optimizations = "--all-optimizations" in flags or all_flags
 	all_safe = any(flag in flags for flag in ("--all-lossless", "--all-safe", "--all-safe-flags"))
-	lossless = "--lossless" in flags or all_safe or all_flags
+	lossless = "--lossless" in flags or all_safe
 	if lossless:
 		allowed = {
-			"--lossless", "--all-lossless", "--all-flags", "--all-optimizations", "--optimize-json", "--optimize-assets",
+			"--lossless", "--all-lossless", "--optimize-json", "--optimize-assets",
 			"--zopfli", "--zopfli-assets", "--zopfli-iterations", "--compression-level",
 			"--compact-block-defaults", "--compact-costume-references", "--compact-block-flags",
 			"--all-safe", "--all-safe-flags", "--minimum-json", "--json-search-rounds", "--relabel-block-ids",
-			"--strip-reference-names", "--drop-reference-names", "--empty-reference-names",
 			"--keep-comments", "--keep-positions", "--keep-covered", "--keep-monitors",
 			"--keep-sound-metadata", "--preserve-asset-compression", "--compress-assets",
 		}
@@ -11098,16 +11496,16 @@ if __name__ == "__main__":
 			sys.exit(1)
 	opts = Options(
 		lossless=lossless,
-		all_lossless=all_safe or all_flags,
-		compact_costume_references="--compact-costume-references" in flags,
+		all_lossless=all_safe,
+		compact_costume_references=all_optimizations or "--compact-costume-references" in flags,
 		compact_block_flags=all_flags or "--compact-block-flags" in flags,
 		minimum_json=all_flags or "--minimum-json" in flags,
-		json_search_rounds=values.get("--json-search-rounds", 0),
+		json_search_rounds=values.get("--json-search-rounds", 1 if all_optimizations else 0),
 		relabel_block_ids=all_flags or "--relabel-block-ids" in flags,
 		auto_zopfli=all_flags,
-		optimize_json="--optimize-json" in flags,
-		optimize_assets="--optimize-assets" in flags,
-		compact_block_defaults="--compact-block-defaults" in flags,
+		optimize_json=all_optimizations or "--optimize-json" in flags,
+		optimize_assets=all_optimizations or "--optimize-assets" in flags,
+		compact_block_defaults=all_optimizations or "--compact-block-defaults" in flags,
 		zopfli="--zopfli" in flags,
 		zopfli_assets="--zopfli-assets" in flags,
 		zopfli_iterations=values.get("--zopfli-iterations", 5),
@@ -11116,16 +11514,20 @@ if __name__ == "__main__":
 		covered=("--keep-covered" not in flags),
 		monitors=("--keep-monitors" not in flags),
 		lists=("--clear-large-lists" in flags),
-		rename_block_ids="--rename-block-ids" in flags
+		rename_block_ids=all_optimizations
+		or "--rename-block-ids" in flags
 		or "--frequency-block-ids" in flags
 		or "--order-block-ids-by-frequency" in flags,
-		rename_variable_ids="--rename-variable-ids" in flags
+		rename_variable_ids=all_optimizations
+		or "--rename-variable-ids" in flags
 		or "--frequency-data-ids" in flags
 		or "--order-data-ids-by-frequency" in flags,
-		rename_list_ids="--rename-list-ids" in flags
+		rename_list_ids=all_optimizations
+		or "--rename-list-ids" in flags
 		or "--frequency-data-ids" in flags
 		or "--order-data-ids-by-frequency" in flags,
-		rename_broadcast_ids="--rename-broadcast-ids" in flags
+		rename_broadcast_ids=all_optimizations
+		or "--rename-broadcast-ids" in flags
 		or "--frequency-data-ids" in flags
 		or "--order-data-ids-by-frequency" in flags,
 		rename_identifiers="--rename-identifiers" in flags,
@@ -11134,35 +11536,46 @@ if __name__ == "__main__":
 		rename_broadcast_names="--rename-broadcast-names" in flags,
 		rename_argument_names="--rename-argument-names" in flags,
 		rename_procedure_names="--rename-procedure-names" in flags,
-		rename_argument_ids="--rename-argument-ids" in flags,
-		remove_unused_variables="--remove-unused-variables" in flags,
-		remove_unused_lists="--remove-unused-lists" in flags,
-		remove_unused_broadcasts="--remove-unused-broadcasts" in flags,
-		remove_unreachable="--remove-unreachable" in flags,
-		remove_unused_procedures="--remove-unused-procedures" in flags,
-		normalize_numbers="--normalize-numbers" in flags,
-		remove_empty_fields="--remove-empty-fields" in flags,
-		remove_empty_inputs="--remove-empty-inputs" in flags,
-		remove_costume_metadata="--remove-costume-metadata" in flags,
-		remove_default_target_properties="--remove-default-target-properties" in flags,
-		remove_empty_target_containers="--remove-empty-containers" in flags
+		rename_argument_ids=all_optimizations or "--rename-argument-ids" in flags,
+		remove_unused_variables=all_optimizations
+		or "--remove-unused-variables" in flags,
+		remove_unused_lists=all_optimizations or "--remove-unused-lists" in flags,
+		remove_unused_broadcasts=all_optimizations
+		or "--remove-unused-broadcasts" in flags,
+		remove_unreachable=all_optimizations or "--remove-unreachable" in flags,
+		remove_unused_procedures=all_optimizations
+		or "--remove-unused-procedures" in flags,
+		normalize_numbers=all_optimizations or "--normalize-numbers" in flags,
+		remove_empty_fields=all_optimizations or "--remove-empty-fields" in flags,
+		remove_empty_inputs=all_optimizations or "--remove-empty-inputs" in flags,
+		remove_costume_metadata=all_optimizations
+		or "--remove-costume-metadata" in flags,
+		remove_default_target_properties=all_optimizations
+		or "--remove-default-target-properties" in flags,
+		remove_empty_target_containers=all_optimizations
+		or "--remove-empty-containers" in flags
 		or "--remove-empty-target-containers" in flags,
-		remove_project_meta="--remove-project-meta" in flags,
-		preserve_asset_compression="--preserve-asset-compression" in flags,
-		frequency_block_ids="--frequency-block-ids" in flags
+		remove_project_meta=all_optimizations or "--remove-project-meta" in flags,
+		preserve_asset_compression=all_optimizations
+		or "--preserve-asset-compression" in flags,
+		frequency_block_ids=all_optimizations
+		or "--frequency-block-ids" in flags
 		or "--order-block-ids-by-frequency" in flags,
-		frequency_data_ids="--frequency-data-ids" in flags
+		frequency_data_ids=all_optimizations
+		or "--frequency-data-ids" in flags
 		or "--order-data-ids-by-frequency" in flags,
-		compact_numeric_inputs="--compact-numeric-inputs" in flags,
-		compact_field_ids="--compact-field-ids" in flags,
-		compact_mutation_hasnext="--compact-mutation-hasnext" in flags,
+		compact_numeric_inputs=all_optimizations or "--compact-numeric-inputs" in flags,
+		compact_field_ids=all_optimizations or "--compact-field-ids" in flags,
+		compact_mutation_hasnext=all_optimizations
+		or "--compact-mutation-hasnext" in flags,
 		compact_mutation_metadata="--compact-mutation-metadata" in flags,
 		fold_constant_variables="--fold-constant-variables" in flags,
-		fold_constant_expressions="--fold-constant-expressions" in flags,
-		simplify_boolean_control="--simplify-boolean-control" in flags,
-		simplify_blocks="--simplify-blocks" in flags,
-		deduplicate_assets="--deduplicate-assets" in flags,
-		optimize_procedure_arguments=any(
+		fold_constant_expressions=all_optimizations
+		or "--fold-constant-expressions" in flags,
+		simplify_boolean_control=all_optimizations or "--simplify-boolean-control" in flags,
+		simplify_blocks=all_optimizations or "--simplify-blocks" in flags,
+		deduplicate_assets=all_optimizations or "--deduplicate-assets" in flags,
+		optimize_procedure_arguments=all_optimizations or any(
 			f in flags
 			for f in (
 				"--optimize-procedure-arguments",
@@ -11174,7 +11587,7 @@ if __name__ == "__main__":
 				"--fold-constant-custom-procedure-arguments",
 			)
 		),
-		merge_duplicate_procedures=any(
+		merge_duplicate_procedures=all_optimizations or any(
 			f in flags
 			for f in (
 				"--merge-duplicate-procedures",
@@ -11183,18 +11596,18 @@ if __name__ == "__main__":
 				"--deduplicate-procedures",
 			)
 		),
-		branch_swapping=any(f in flags for f in ("--branch-swapping", "--swap-branches", "--branch-swap")),
-		trivial_loops=any(f in flags for f in ("--trivial-loops", "--simplify-trivial-loops")),
-		nested_conditionals=any(f in flags for f in ("--nested-conditionals", "--merge-nested-conditionals", "--merge-nested-ifs")),
+		branch_swapping=all_optimizations or any(f in flags for f in ("--branch-swapping", "--swap-branches", "--branch-swap")),
+		trivial_loops=all_optimizations or any(f in flags for f in ("--trivial-loops", "--simplify-trivial-loops")),
+		nested_conditionals=all_optimizations or any(f in flags for f in ("--nested-conditionals", "--merge-nested-conditionals", "--merge-nested-ifs")),
 		associative_constant_merging=any(f in flags for f in ("--associative-constants", "--merge-associative-constants", "--reassociate-constants")),
-		script_constant_propagation=any(f in flags for f in ("--script-constant-propagation", "--propagate-script-constants", "--constant-propagation")),
-		strip_reference_names=all_flags or any(f in flags for f in ("--strip-reference-names", "--drop-reference-names", "--empty-reference-names")),
+		script_constant_propagation=all_optimizations or any(f in flags for f in ("--script-constant-propagation", "--propagate-script-constants", "--constant-propagation")),
+		strip_reference_names=any(f in flags for f in ("--strip-reference-names", "--drop-reference-names", "--empty-reference-names")),
 		compact_data_literals=any(f in flags for f in ("--compact-data-literals", "--numeric-data-literals", "--convert-numeric-data")),
 		remove_unused_extensions=any(f in flags for f in ("--remove-unused-extensions", "--unused-extensions")),
 		group_similar_sequences="--group-similar-sequences" in flags,
 		sequence_threshold=values.get("--sequence-threshold", 3),
-		compress_assets="--compress-assets" in flags,
-		convert_wav_to_mp3="--convert-wav-to-mp3" in flags,
+		compress_assets=all_optimizations or "--compress-assets" in flags,
+		convert_wav_to_mp3=all_flags or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
 		compression_level=values.get("--compression-level", 9),
 		list_bytes=values.get("--list-bytes", DEFAULT_LIST_BYTES),
