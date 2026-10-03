@@ -6,10 +6,749 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 import zipfile
 import zlib
 import uuid
 from collections import Counter
+
+from functools import lru_cache
+from itertools import permutations, product
+
+
+class JsonNumber(str):
+	"""A JSON number token, kept separate from JSON strings and binary floats."""
+
+
+def _unique_object(pairs):
+	result = {}
+	for key, value in pairs:
+		if key in result:
+			raise ValueError(f"duplicate JSON object key: {key!r}")
+		result[key] = value
+	return result
+
+
+def _invalid_constant(value):
+	raise ValueError(f"non-finite JSON number: {value}")
+
+
+def loads_exact(data):
+	if isinstance(data, (bytes, bytearray)):
+		data = data.decode("utf-8-sig")
+	return json.loads(
+		data,
+		parse_int=JsonNumber,
+		parse_float=JsonNumber,
+		parse_constant=_invalid_constant,
+		object_pairs_hook=_unique_object,
+	)
+
+
+@lru_cache(maxsize=8192)
+def _number_components(token):
+	sign = token.startswith("-")
+	mantissa, _, power = (token[1:] if sign else token).lower().partition("e")
+	whole, _, fraction = mantissa.partition(".")
+	digits = (whole + fraction).lstrip("0")
+	if not digits:
+		return sign, "0", 0
+	coefficient = digits.rstrip("0")
+	return sign, coefficient, int(power or "0") - len(fraction) + len(digits) - len(coefficient)
+
+
+@lru_cache(maxsize=8192)
+def _short_number(token):
+	sign, coefficient, exponent = _number_components(token)
+	prefix = "-" if sign else ""
+	if coefficient == "0":
+		return prefix + "0"
+	n = len(coefficient)
+	best_length, best_point = len(token), None
+	# Every irredundant decimal mantissa is a placement of its decimal point
+	# relative to these significant digits. Longer mantissas cannot beat token.
+	lower = min(n, n + 2 + len(prefix) - best_length)
+	upper = max(n, best_length - len(prefix))
+	for point in range(lower, upper + 1):
+		mantissa_length = (n if point == n else n + 1 if 0 < point < n
+			else point if point > n else 2 - point + n)
+		power = exponent + n - point
+		length = len(prefix) + mantissa_length + (1 + len(str(power)) if power else 0)
+		if length < best_length:
+			best_length, best_point = length, point
+	if best_point is None:
+		return token
+	point = best_point
+	if point <= 0:
+		mantissa = "0." + "0" * -point + coefficient
+	elif point < n:
+		mantissa = coefficient[:point] + "." + coefficient[point:]
+	else:
+		mantissa = coefficient + "0" * (point - n)
+	power = exponent + n - point
+	return prefix + mantissa + (f"e{power}" if power else "")
+
+
+@lru_cache(maxsize=4096)
+def _quote(value):
+	return json.dumps(value, ensure_ascii=False)
+
+
+def _encode_parts(value, short_numbers):
+	if isinstance(value, JsonNumber):
+		yield _short_number(value) if short_numbers else value
+	elif isinstance(value, str):
+		yield _quote(value)
+	elif value is None:
+		yield "null"
+	elif value is True:
+		yield "true"
+	elif value is False:
+		yield "false"
+	elif isinstance(value, dict):
+		yield "{"
+		for index, (key, item) in enumerate(value.items()):
+			if index:
+				yield ","
+			yield _quote(key)
+			yield ":"
+			yield from _encode_parts(item, short_numbers)
+		yield "}"
+	elif isinstance(value, list):
+		yield "["
+		for index, item in enumerate(value):
+			if index:
+				yield ","
+			yield from _encode_parts(item, short_numbers)
+		yield "]"
+	else:
+		raise TypeError(f"unsupported exact JSON value: {type(value).__name__}")
+
+
+def dumps_exact(project, short_numbers=False):
+	return "".join(_encode_parts(project, short_numbers)).encode("utf-8", "backslashreplace")
+
+
+BLOCK_KEY_ORDERS = (
+	("opcode", "next", "parent", "inputs", "fields"),
+	("opcode", "fields", "inputs", "next", "parent"),
+	("next", "parent", "opcode", "fields", "inputs"),
+	("inputs", "fields", "opcode", "next", "parent"),
+	("fields", "inputs", "opcode", "next", "parent"),
+	("parent", "next", "opcode", "inputs", "fields"),
+	("fields", "inputs", "mutation", "next", "opcode", "parent", "shadow", "topLevel", "x", "y"),
+)
+
+
+def _record_order_is_irrelevant(path):
+	return len(path) == 4 and path[0] == "targets" and path[2] == "blocks"
+
+
+def exact_difference(original, result, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False):
+	"""Compare exact numbers, strings, keys and all ordered collections."""
+	if relabel_block_ids:
+		try:
+			result = restore_block_labels(original, result)
+		except (ValueError, KeyError, TypeError) as error:
+			return f"block ID correspondence failed: {error}"
+	stack = [((), original, result)]
+	while stack:
+		path, left, right = stack.pop()
+		where = "/".join(map(str, path)) or "project"
+		if type(left) is not type(right):
+			return f"{where}: JSON value type changed"
+		if isinstance(left, JsonNumber):
+			if _number_components(left) != _number_components(right):
+				return f"{where}: exact numeric value changed"
+		elif isinstance(left, dict):
+			if compact_costume_references and len(path) == 4 and path[0] == "targets" and path[2] == "costumes":
+				removed = {}
+				canonical = _canonical_costume_filename(left)
+				if canonical is not None and left.get("md5ext") == canonical and "md5ext" not in right:
+					removed["md5ext"] = canonical
+				if removed:
+					if list(right) != [key for key in left if key not in removed]:
+						return f"{where}: costume keys or their order changed"
+					right = {key: removed[key] if key in removed else right[key] for key in left}
+			if compact_defaults and _record_order_is_irrelevant(path):
+				right = dict(right)
+				for key in ("inputs", "fields"):
+					if left.get(key) == {} and key not in right:
+						right[key] = {}
+			if compact_block_flags and _record_order_is_irrelevant(path):
+				right = dict(right)
+				for key in ("topLevel", "shadow"):
+					if left.get(key) is False and key not in right:
+						right[key] = False
+			if set(left) != set(right):
+				return f"{where}: object keys changed"
+			if not _record_order_is_irrelevant(path) and list(left) != list(right):
+				return f"{where}: collection order changed"
+			stack.extend((path + (key,), left[key], right[key]) for key in left)
+		elif isinstance(left, list):
+			if len(left) != len(right):
+				return f"{where}: array length changed"
+			stack.extend((path + (index,), a, b) for index, (a, b) in enumerate(zip(left, right)))
+		elif left != right:
+			return f"{where}: JSON value changed"
+	return None
+
+
+def _ordered_blocks(target, order):
+	result = dict(target)
+	blocks = target.get("blocks")
+	if isinstance(blocks, dict):
+		result["blocks"] = {
+			bid: ({key: block[key] for key in dict.fromkeys((*order, *block)) if key in block}
+				if isinstance(block, dict) else block)
+			for bid, block in blocks.items()
+		}
+	return result
+
+
+def _layout(project, order):
+	result = dict(project)
+	if isinstance(project.get("targets"), list):
+		result["targets"] = [_ordered_blocks(target, order) for target in project["targets"]]
+	return result
+
+
+def _compact_block_defaults(project):
+	result = dict(project)
+	result["targets"] = []
+	for target in project.get("targets", []):
+		target = dict(target)
+		if isinstance(target.get("blocks"), dict):
+			target["blocks"] = {
+				bid: ({key: value for key, value in block.items() if key not in ("fields", "inputs") or value != {}}
+					if isinstance(block, dict) else block)
+				for bid, block in target["blocks"].items()
+			}
+		result["targets"].append(target)
+	return result
+
+
+def _canonical_costume_filename(costume):
+	aid, fmt = costume.get("assetId"), costume.get("dataFormat")
+	if isinstance(aid, str) and not isinstance(aid, JsonNumber) and isinstance(fmt, str) and not isinstance(fmt, JsonNumber) and aid and fmt:
+		return f"{aid}.{fmt}"
+	return None
+
+
+def compact_representation(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False):
+	result = dict(project)
+	result["targets"] = []
+	for source in project.get("targets", []):
+		target = dict(source)
+		if isinstance(source.get("blocks"), dict) and (compact_defaults or compact_block_flags):
+			target["blocks"] = {}
+			for bid, block in source["blocks"].items():
+				if isinstance(block, dict):
+					block = {key: value for key, value in block.items()
+						if not (compact_defaults and key in ("inputs", "fields") and value == {})
+						and not (compact_block_flags and key in ("topLevel", "shadow") and value is False)}
+				target["blocks"][bid] = block
+		if compact_costume_references and isinstance(source.get("costumes"), list):
+			target["costumes"] = []
+			for costume in source["costumes"]:
+				if isinstance(costume, dict):
+					removed = set()
+					canonical = _canonical_costume_filename(costume)
+					if canonical is not None and costume.get("md5ext") == canonical: removed.add("md5ext")
+					costume = {key: value for key, value in costume.items() if key not in removed}
+				target["costumes"].append(costume)
+		result["targets"].append(target)
+	return result
+
+
+def minimum_json_size(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False):
+	"""Exact lower bound for the fixed-tree model documented in README.md."""
+	project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags)
+	identifier_cost = None
+	if relabel_block_ids:
+		project, _, identifier_cost = relabel_blocks(project)
+	counts = dict(structure=0, keys=0, strings=0, numbers=0, literals=0)
+	def string_size(value):
+		return 2 + sum(2 if char in '\"\\\b\f\n\r\t' else 6 if ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
+			else len(char.encode("utf-8")) for char in value)
+	def visit(value):
+		if isinstance(value, JsonNumber):
+			counts["numbers"] += len(_short_number(value))
+		elif isinstance(value, str):
+			counts["strings"] += string_size(value)
+		elif isinstance(value, dict):
+			counts["structure"] += 2 + len(value) + max(0, len(value) - 1)
+			for key, item in value.items():
+				counts["keys"] += string_size(key)
+				visit(item)
+		elif isinstance(value, list):
+			counts["structure"] += 2 + max(0, len(value) - 1)
+			for item in value:
+				visit(item)
+		elif value is None or isinstance(value, bool):
+			counts["literals"] += 4 if value is None or value is True else 5
+		else:
+			raise TypeError(f"unsupported exact JSON value: {type(value).__name__}")
+	visit(project)
+	return {"model": "fixed-graph-block-ids-v3" if relabel_block_ids else "fixed-tree-v2", "minimum_bytes": sum(counts.values()), "components": counts,
+		"compact_block_defaults": compact_defaults, "compact_costume_references": compact_costume_references,
+		"compact_block_flags": compact_block_flags, "identifier_cost": identifier_cost, "global_scratch_minimum_proven": False}
+
+
+def _index_key(key):
+	return len(key) <= 10 and key.isascii() and key.isdigit() and str(int(key)) == key and int(key) < 4294967295
+
+
+def javascript_keys(mapping):
+	return sorted((key for key in mapping if _index_key(key)), key=int) + [key for key in mapping if not _index_key(key)]
+
+
+def _input_tag(value):
+	if isinstance(value, JsonNumber):
+		components = _number_components(value)
+		return int(components[1]) if not components[0] and components[2] == 0 and components[1] in ("1", "2", "3") else None
+	return value if type(value) in (int, float) and value in (1, 2, 3) else None
+
+
+def _block_slots(target):
+	for block in (target.get("blocks") or {}).values():
+		if not isinstance(block, dict): continue
+		for key in ("next", "parent"):
+			if isinstance(block.get(key), str) and not isinstance(block[key], JsonNumber): yield block, key
+		for desc in (block.get("inputs") or {}).values():
+			if not isinstance(desc, list) or not desc: continue
+			tag = _input_tag(desc[0])
+			positions = (1,) if tag in (1, 2) else (1, 2) if tag == 3 else ()
+			for position in positions:
+				if len(desc) > position and isinstance(desc[position], str) and not isinstance(desc[position], JsonNumber): yield desc, position
+	for comment in (target.get("comments") or {}).values():
+		if isinstance(comment, dict) and isinstance(comment.get("blockId"), str) and not isinstance(comment["blockId"], JsonNumber): yield comment, "blockId"
+
+
+def _identifier_names(reserved):
+	# All admissible names of JSON payload cost 1 or 2 are enumerated. Cost 3+
+	# ties use printable ASCII; see the identifier assignment proof.
+	chars = tuple(chr(value) for value in range(32, 128) if chr(value) not in '\"\\<&')
+	def allowed(name):
+		return name not in reserved and name not in ("__proto__", "constructor", "prototype") and not _index_key(name)
+	for name in chars:
+		if allowed(name): yield name
+	for pair in product(chars, repeat=2):
+		name = "".join(pair)
+		if allowed(name): yield name
+	for name in ('\\', *(chr(value) for value in range(128, 2048))):
+		if allowed(name): yield name
+	length = 3
+	while True:
+		for digits in product(chars, repeat=length):
+			name = "".join(digits)
+			if allowed(name): yield name
+		length += 1
+
+
+def relabel_blocks(project):
+	"""Minimize identifier bytes for a fixed graph; preserve dangling edges."""
+	result = copy.deepcopy(project)
+	maps, cost = {}, dict(before=0, after=0, identifiers=0, occurrences=0)
+	for ti, target in enumerate(result.get("targets", [])):
+		blocks = target.get("blocks")
+		if not isinstance(blocks, dict) or not blocks: continue
+		for block in blocks.values():
+			if not isinstance(block, dict): continue
+			for key in ("next", "parent"):
+				value = block.get(key)
+				if value is not None and (not isinstance(value, str) or isinstance(value, JsonNumber)):
+					raise ValueError("verified block relabeling requires string or null next/parent links")
+			for desc in (block.get("inputs") or {}).values():
+				if not isinstance(desc, list) or not desc or _input_tag(desc[0]) is None:
+					raise ValueError("verified block relabeling requires serialized SB3 input descriptors")
+				for position in ((1, 2) if _input_tag(desc[0]) == 3 else (1,)):
+					if len(desc) <= position:
+						raise ValueError("verified block relabeling rejects truncated input descriptors")
+					value = desc[position]
+					if value is not None and (not isinstance(value, (str, list)) or isinstance(value, JsonNumber)):
+						raise ValueError("verified block relabeling rejects numeric or opaque input references")
+		for comment in (target.get("comments") or {}).values():
+			if isinstance(comment, dict):
+				value = comment.get("blockId")
+				if value is not None and (not isinstance(value, str) or isinstance(value, JsonNumber)):
+					raise ValueError("verified block relabeling requires string or null comment block IDs")
+		ids = javascript_keys(blocks)
+		if any(key in blocks for key in ("__proto__", "constructor", "prototype")):
+			raise ValueError("cannot relabel prototype-sensitive block IDs")
+		frequencies = {bid: 1 for bid in ids}
+		slots = list(_block_slots(target))
+		reserved = set()
+		for container, key in slots:
+			value = container[key]
+			if value in frequencies: frequencies[value] += 1
+			else: reserved.add(value)
+		names = _identifier_names(reserved)
+		ordered = sorted(ids, key=lambda bid: -frequencies[bid])
+		mapping = {bid: next(names) for bid in ordered}
+		# Beyond all cost-3 names this generator omits some UTF-8 ties. Do not
+		# advertise a complete lower-bound certificate beyond that domain.
+		if any(len(_quote(name).encode("utf-8")) - 2 > 3 for name in mapping.values()):
+			raise ValueError("block ID minimum certificate supports names of at most 3 payload bytes")
+		maps[ti] = mapping
+		for container, key in slots:
+			container[key] = mapping.get(container[key], container[key])
+		target["blocks"] = {mapping[bid]: blocks[bid] for bid in ids}
+		for bid in ids:
+			frequency = frequencies[bid]
+			cost["before"] += frequency * (len(_quote(bid).encode("utf-8", "backslashreplace")) - 2)
+			cost["after"] += frequency * (len(_quote(mapping[bid]).encode("utf-8")) - 2)
+			cost["occurrences"] += frequency
+		cost["identifiers"] += len(ids)
+	return result, maps, cost
+
+
+def restore_block_labels(original, result):
+	"""Infer bijections independently from semantic record order, not optimizer maps."""
+	if len(original.get("targets", [])) != len(result.get("targets", [])):
+		raise ValueError("target count changed")
+	result = copy.deepcopy(result)
+	for left, right in zip(original.get("targets", []), result.get("targets", [])):
+		if "blocks" not in left and "blocks" not in right: continue
+		if "blocks" not in left or "blocks" not in right: raise ValueError("block table presence changed")
+		a, b = left.get("blocks", {}), right.get("blocks", {})
+		if len(a) != len(b): raise ValueError("block count changed")
+		if javascript_keys(a) != javascript_keys(b) and any(not bid or _index_key(bid) or bid in ("__proto__", "constructor", "prototype")
+			or any(char in '<&"\t\r\n' or not (0x20 <= ord(char) <= 0xD7FF or 0xE000 <= ord(char) <= 0xFFFD or 0x10000 <= ord(char) <= 0x10FFFF) for char in bid) for bid in b):
+			raise ValueError("output block IDs violate editor XML or property-order contracts")
+		inverse = dict(zip(javascript_keys(b), javascript_keys(a)))
+		for container, key in _block_slots(right):
+			container[key] = inverse.get(container[key], container[key])
+		restored = {inverse[bid]: block for bid, block in b.items()}
+		right["blocks"] = {bid: restored[bid] for bid in a}
+	return result
+
+
+class _LayoutRecord:
+	def __init__(self, prefix, block):
+		self.prefix = prefix
+		self.fields = {key: _quote(key).encode("utf-8", "backslashreplace") + b":" + dumps_exact(value, True) for key, value in block.items()}
+		self.shape = tuple(block)
+
+	def render(self, order, shapes):
+		key = (self.shape, order)
+		if key not in shapes:
+			shapes[key] = tuple(name for name in dict.fromkeys((*(order or ()), *self.shape)) if name in self.fields)
+		return self.prefix + b"{" + b",".join(self.fields[name] for name in shapes[key]) + b"}"
+
+
+def _layout_parts(project):
+	parts, pending = [], bytearray()
+	def emit(data):
+		pending.extend(data)
+	def visit(value, path):
+		if isinstance(value, dict):
+			emit(b"{")
+			for index, (key, item) in enumerate(value.items()):
+				prefix = (b"," if index else b"") + _quote(key).encode("utf-8", "backslashreplace") + b":"
+				if len(path) == 3 and path[0] == "targets" and path[2] == "blocks" and isinstance(item, dict):
+					if pending:
+						parts.append(bytes(pending)); pending.clear()
+					parts.append(_LayoutRecord(prefix, item))
+				else:
+					emit(prefix); visit(item, path + (key,))
+			emit(b"}")
+		elif isinstance(value, list):
+			emit(b"[")
+			for index, item in enumerate(value):
+				if index: emit(b",")
+				visit(item, path + (index,))
+			emit(b"]")
+		else:
+			emit(dumps_exact(value, True))
+	visit(project, ())
+	if pending: parts.append(bytes(pending))
+	return parts
+
+
+def _window_layout(project, orders, level, width=128):
+	"""Search contiguous record windows against their actual preceding dictionary."""
+	parts, output, shapes = _layout_parts(project), [], {}
+	history, trials, index = b"", 0, 0
+	while index < len(parts):
+		part = parts[index]
+		if isinstance(part, bytes):
+			output.append(part); history = (history + part)[-32768:]; index += 1
+			continue
+		end = index
+		while end < len(parts) and isinstance(parts[end], _LayoutRecord) and end - index < width:
+			end += 1
+		records = parts[index:end]
+		lookahead = b"".join(piece if isinstance(piece, bytes) else piece.render(None, shapes) for piece in parts[end:end + 16])[:4096]
+		best = b"".join(record.render(None, shapes) for record in records)
+		best_size = len(deflate(history + best + lookahead, level))
+		for order in orders:
+			candidate = b"".join(record.render(order, shapes) for record in records)
+			if candidate == best: continue
+			size = len(deflate(history + candidate + lookahead, level)); trials += 1
+			if size < best_size:
+				best, best_size = candidate, size
+		output.append(best); history = (history + best)[-32768:]; index = end
+	return b"".join(output), trials
+
+
+def _sample_blocks(project, width=64):
+	result = {"targets": []}
+	for target in project.get("targets", []):
+		blocks = target.get("blocks") or {}
+		items = list(blocks.items())
+		if len(items) > width * 3:
+			starts = (0, len(items) // 2 - width // 2, len(items) - width)
+			items = [item for start in starts for item in items[start:start + width]]
+		result["targets"].append({"blocks": dict(items)})
+	return result
+
+
+def _screen_record_orders(project, level):
+	"""Screen all core-property permutations on bounded, contiguous samples."""
+	probe = _sample_blocks(project)
+	scores = []
+	for order in permutations(("opcode", "next", "parent", "inputs", "fields")):
+		size = len(deflate(dumps_exact(_layout(probe, order), True), level))
+		scores.append((size, order))
+	return [order for _, order in sorted(scores)[:4]], len(scores)
+
+
+def _specialized_layout(project, orders, level, grouping):
+	groups = {}
+	def group_key(ti, block):
+		shape = frozenset(block)
+		if grouping == "shape":
+			return shape
+		key = (shape, block.get("opcode"))
+		return (ti, key) if grouping == "target-opcode" else key
+	for ti, target in enumerate(project.get("targets", [])):
+		for bid, block in (target.get("blocks") or {}).items():
+			if isinstance(block, dict):
+				groups.setdefault(group_key(ti, block), []).append((ti, bid, block))
+	chosen = {}
+	trials = 0
+	for key, members in groups.items():
+		if len(members) > 96:
+			members = members[:32] + members[len(members) // 2 - 16:len(members) // 2 + 16] + members[-32:]
+		probe_targets = {}
+		for ti, bid, block in members:
+			probe_targets.setdefault(ti, {"blocks": {}})["blocks"][bid] = block
+		probe = {"targets": list(probe_targets.values())}
+		best_order = None
+		best_size = len(deflate(dumps_exact(probe), level))
+		for order in orders:
+			size = len(deflate(dumps_exact(_layout(probe, order)), level))
+			trials += 1
+			if size < best_size:
+				best_order, best_size = order, size
+		chosen[key] = best_order
+	result = dict(project)
+	result["targets"] = []
+	for ti, target in enumerate(project.get("targets", [])):
+		target = dict(target)
+		if isinstance(target.get("blocks"), dict):
+			new_blocks = {}
+			for bid, block in target["blocks"].items():
+				order = chosen.get(group_key(ti, block)) if isinstance(block, dict) else None
+				new_blocks[bid] = ({name: block[name] for name in dict.fromkeys((*order, *block)) if name in block}
+					if order is not None else block)
+			target["blocks"] = new_blocks
+		result["targets"].append(target)
+	return result, trials
+
+
+def deflate(data, level=9, memory=8, strategy=zlib.Z_DEFAULT_STRATEGY):
+	compressor = zlib.compressobj(level, zlib.DEFLATED, -15, memory, strategy)
+	return compressor.compress(data) + compressor.flush()
+
+
+def _compressions(data, level):
+	yield "zlib", deflate(data, level)
+	if level:
+		yield "zlib-mem9", deflate(data, level, 9)
+		yield "zlib-filtered", deflate(data, level, 8, zlib.Z_FILTERED)
+
+
+def get_zopfli(required=False):
+	try:
+		import zopfli.zlib
+	except ImportError:
+		if required:
+			raise ValueError("Zopfli is unavailable; install it with: python -m pip install zopfli") from None
+		return None
+	return zopfli.zlib.compress
+
+
+def zopfli_deflate(data, compress, iterations=15):
+	candidates = [
+		compress(data, numiterations=iterations)[2:-4],
+		compress(data, numiterations=iterations, blocksplittingmax=0)[2:-4],
+	]
+	return min(candidates, key=len)
+
+
+def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zopfli_required=True, compact_defaults=False,
+	compact_costume_references=False, compact_block_flags=False, minimum_json=False, search_rounds=0, relabel_block_ids=False):
+	"""Search encodings, preserving every value and every block/input order."""
+	baseline = dumps_exact(project)
+	search_project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags)
+	if relabel_block_ids:
+		search_project, _, _ = relabel_blocks(search_project)
+	best_raw = dumps_exact(search_project, True) if minimum_json else baseline
+	best_compressed = deflate(best_raw, level)
+	rank = (lambda encoded, raw: (len(raw), len(encoded))) if minimum_json else (lambda encoded, raw: (len(encoded), len(raw)))
+	pool = []
+	def remember(raw, compressed):
+		if not search_rounds: return
+		score = rank(compressed, raw)
+		for index, (previous, candidate) in enumerate(pool):
+			if raw == candidate:
+				if score < previous: pool[index] = (score, raw)
+				break
+		else:
+			pool.append((score, raw))
+		pool.sort(key=lambda item: item[0]); del pool[4:]
+	best_label = "original-order/zlib"
+	trials = 1
+	seen = set()
+	screened_orders, screen_trials = _screen_record_orders(search_project, level)
+	trials += screen_trials
+	orders = tuple(dict.fromkeys((*BLOCK_KEY_ORDERS, *screened_orders)))
+	for short_numbers in (False, True):
+		if minimum_json and not short_numbers: continue
+		for order_index, order in enumerate((None, *orders)):
+			candidate = dumps_exact(search_project if order is None else _layout(search_project, order), short_numbers)
+			fingerprint = hashlib.sha256(candidate).digest()
+			if fingerprint in seen or len(candidate) > len(baseline):
+				continue
+			seen.add(fingerprint)
+			for compressor, compressed in _compressions(candidate, level):
+				trials += 1
+				remember(candidate, compressed)
+				if rank(compressed, candidate) < rank(best_compressed, best_raw):
+					best_raw, best_compressed = candidate, compressed
+					best_label = f"layout-{order_index}/{'short-numbers' if short_numbers else 'original-numbers'}/{compressor}"
+	# Different sprites benefit from different record layouts. Measure them separately,
+	# then evaluate their combination against the complete project stream.
+	if isinstance(search_project.get("targets"), list):
+		adaptive = dict(search_project)
+		adaptive["targets"] = []
+		for target in search_project["targets"]:
+			chosen = target
+			chosen_size = len(deflate(dumps_exact(target, True), level))
+			for order in orders:
+				candidate = _ordered_blocks(target, order)
+				size = len(deflate(dumps_exact(candidate, True), level))
+				trials += 1
+				if size < chosen_size:
+					chosen, chosen_size = candidate, size
+			adaptive["targets"].append(chosen)
+		candidate = dumps_exact(adaptive, True)
+		if hashlib.sha256(candidate).digest() not in seen and len(candidate) <= len(baseline):
+			for compressor, compressed in _compressions(candidate, level):
+				trials += 1
+				remember(candidate, compressed)
+				if rank(compressed, candidate) < rank(best_compressed, best_raw):
+					best_raw, best_compressed = candidate, compressed
+					best_label = f"per-target/short-numbers/{compressor}"
+	for grouping in ("shape", "opcode", "target-opcode"):
+		specialized, specialized_trials = _specialized_layout(search_project, orders, level, grouping)
+		trials += specialized_trials
+		for short_numbers in (False, True):
+			if minimum_json and not short_numbers: continue
+			candidate = dumps_exact(specialized, short_numbers)
+			fingerprint = hashlib.sha256(candidate).digest()
+			if fingerprint in seen or len(candidate) > len(baseline):
+				continue
+			seen.add(fingerprint)
+			for compressor, compressed in _compressions(candidate, level):
+				trials += 1
+				remember(candidate, compressed)
+				if rank(compressed, candidate) < rank(best_compressed, best_raw):
+					best_raw, best_compressed = candidate, compressed
+					best_label = f"per-{grouping}/{'short-numbers' if short_numbers else 'original-numbers'}/{compressor}"
+	for round_index in range(search_rounds):
+		candidate, window_trials = _window_layout(loads_exact(best_raw), orders, level, 128 if round_index % 2 == 0 else 64)
+		trials += window_trials
+		for compressor, compressed in _compressions(candidate, level):
+			trials += 1; remember(candidate, compressed)
+			if rank(compressed, candidate) < rank(best_compressed, best_raw):
+				best_raw, best_compressed = candidate, compressed
+				best_label = f"window-{round_index + 1}/{compressor}"
+	zopfli = get_zopfli(zopfli_required) if use_zopfli else None
+	if zopfli:
+		remember(best_raw, best_compressed)
+		if search_rounds:
+			for _, candidate in pool:
+				compressed = zopfli_deflate(candidate, zopfli, min(iterations, 3)); trials += 1
+				if rank(compressed, candidate) < rank(best_compressed, best_raw):
+					best_raw, best_compressed = candidate, compressed
+					best_label = "Zopfli-ranked layouts"
+		compressed = zopfli_deflate(best_raw, zopfli, iterations)
+		trials += 1
+		if len(compressed) < len(best_compressed):
+			best_compressed = compressed
+			best_label += "/zopfli"
+	difference = exact_difference(project, loads_exact(best_raw), compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids)
+	if difference or zlib.decompress(best_compressed, -15) != best_raw:
+		raise ValueError(f"JSON encoding verification failed: {difference or 'DEFLATE mismatch'}")
+	return best_raw, best_compressed, {
+		"json_encoding_trials": trials,
+		"json_encoding_bytes_saved": len(baseline) - len(best_raw),
+		"json_deflate_bytes_saved": len(deflate(baseline, level)) - len(best_compressed),
+		"json_encoding": best_label,
+		"zopfli_available": zopfli is not None,
+		"json_minimum": minimum_json_size(project, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids),
+	}
+
+
+def read_compressed_entry(archive, info):
+	archive.fp.seek(info.header_offset)
+	header = archive.fp.read(30)
+	if len(header) != 30 or header[:4] != b"PK\x03\x04":
+		raise ValueError(f"invalid ZIP local header: {info.filename!r}")
+	offset = int.from_bytes(header[26:28], "little") + int.from_bytes(header[28:30], "little")
+	archive.fp.seek(offset, 1)
+	compressed = archive.fp.read(info.compress_size)
+	if len(compressed) != info.compress_size:
+		raise ValueError(f"truncated ZIP entry: {info.filename!r}")
+	return compressed
+
+
+def write_compressed_entry(archive, info, compressed):
+	"""Write a checked raw stream using the same ZIP bookkeeping as ZipFile."""
+	info = copy.copy(info)
+	info.flag_bits &= ~0x08
+	info.compress_size = len(compressed)
+	info.header_offset = archive.fp.tell()
+	archive._didModify = True
+	archive.fp.write(info.FileHeader())
+	archive.fp.write(compressed)
+	archive.filelist.append(info)
+	archive.NameToInfo[info.filename] = info
+	archive.start_dir = archive.fp.tell()
+
+
+def optimize_asset(data, level=9, original=None, use_zopfli=False, iterations=15):
+	if original is not None and original[0] in (0, 8):
+		method, best = original
+	else:
+		method, best = 8, deflate(data, level)
+	if len(data) < len(best):
+		method, best = 0, data
+	for _, compressed in _compressions(data, level):
+		if len(compressed) < len(best):
+			method, best = 8, compressed
+	if use_zopfli:
+		compressed = zopfli_deflate(data, use_zopfli, iterations)
+		if len(compressed) < len(best):
+			method, best = 8, compressed
+	if (zlib.decompress(best, -15) if method == 8 else best) != data:
+		raise ValueError("lossless asset compression verification failed")
+	return method, best
+
 
 BLOCK_ID_ALPHABET = "!@#$%^*()+_-={}|[]:;?,./~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
@@ -6828,7 +7567,57 @@ class Options:
 		merge_duplicate_procedures=False,
 		group_similar_sequences=False,
 		sequence_threshold=3,
+		lossless=False,
+		all_lossless=False,
+		optimize_json=False,
+		optimize_assets=False,
+		compact_block_defaults=False,
+		zopfli=False,
+		zopfli_assets=False,
+		zopfli_iterations=5,
+		compact_costume_references=False,
+		compact_block_flags=False,
+		minimum_json=False,
+		json_search_rounds=0,
+		relabel_block_ids=False,
+		auto_zopfli=False,
 	):
+		self.lossless = lossless or all_lossless
+		self.all_lossless = all_lossless
+		self.optimize_json = optimize_json or self.lossless or zopfli or auto_zopfli or compact_block_defaults or compact_costume_references or compact_block_flags or minimum_json or bool(json_search_rounds) or relabel_block_ids
+		self.optimize_assets = optimize_assets or all_lossless or zopfli_assets or auto_zopfli
+		self.compact_block_defaults = compact_block_defaults or all_lossless
+		self.zopfli = zopfli or all_lossless or auto_zopfli
+		self.zopfli_assets = zopfli_assets or all_lossless or auto_zopfli
+		self.auto_zopfli = auto_zopfli
+		self.relabel_block_ids = relabel_block_ids
+		self.zopfli_required = zopfli or zopfli_assets
+		self.zopfli_iterations = int(zopfli_iterations)
+		self.compact_costume_references = compact_costume_references or all_lossless
+		self.compact_block_flags = compact_block_flags
+		self.minimum_json = minimum_json or all_lossless
+		self.json_search_rounds = int(json_search_rounds) or (1 if all_lossless else 0)
+		if self.json_search_rounds < 0:
+			raise ValueError("json_search_rounds must be nonnegative")
+		if self.zopfli_iterations < 1:
+			raise ValueError("zopfli_iterations must be positive")
+		if self.lossless:
+			conflicts = [
+				name for name, enabled in locals().copy().items()
+				if enabled is True and (
+					name.startswith("rename_") or name.startswith("remove_")
+					or name.startswith("fold_") or name.startswith("simplify_")
+					or name in ("normalize_numbers", "convert_wav_to_mp3", "sort_keys",
+						"compact_numeric_inputs", "compact_field_ids", "compact_mutation_hasnext",
+						"compact_mutation_metadata", "deduplicate_assets", "group_similar_sequences",
+						"optimize_procedure_arguments", "merge_duplicate_procedures",
+						"frequency_block_ids", "frequency_data_ids")
+				)
+			]
+			if conflicts:
+				raise ValueError(f"lossless mode is incompatible with: {', '.join(conflicts)}")
+			comments = positions = covered = monitors = lists = False
+			keep_sound_metadata = preserve_asset_compression = True
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
 			positions,
@@ -6939,6 +7728,8 @@ class Options:
 
 
 def apply_transforms(project, opts: Options, assets=None):
+	if opts.lossless:
+		return Counter()
 	stats = minify_blocks(project)
 	if opts.convert_wav_to_mp3 and assets is not None:
 		opts.wav_conversions = convert_wav_sounds_to_mp3(project, assets, stats)
@@ -8026,8 +8817,9 @@ def _check_costumes(original_target, minified_target, opts, zf):
 
 		allowed_removed = set()
 		if (
-			opts.remove_costume_metadata
-			and co.get("md5ext") == f"{co.get('assetId')}.{co.get('dataFormat')}"
+			(opts.remove_costume_metadata or opts.compact_costume_references)
+			and _canonical_costume_filename(co) is not None
+			and co.get("md5ext") == _canonical_costume_filename(co)
 		):
 			allowed_removed.add("md5ext")
 		if (
@@ -8191,6 +8983,8 @@ def _target_default_properties(target):
 
 
 def verify(original_path, minified_path, opts):
+	if opts.lossless:
+		return _verify_lossless(original_path, minified_path, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids)
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
 		if a.testzip() is not None:
 			return False, f"input zip '{original_path}' failed CRC test"
@@ -9039,10 +9833,145 @@ def _print_transform_stats(stats, opts):
 
 
 
+def format_size_report(before_json, after_json, before_archive, after_archive):
+	mib = 1024 * 1024
+	saving = before_json - after_json
+	percent = saving / max(1, before_json) * 100
+	sign = "-" if saving >= 0 else "+"
+	return (
+		f"project.json : {before_json / mib:.4f} MiB -> {after_json / mib:.4f} MiB  ({sign}{abs(saving) / mib:.4f} MiB, {percent:.1f}%)",
+		f"archive      : {before_archive / mib:.4f} MiB -> {after_archive / mib:.4f} MiB",
+	)
+
+
+def _verify_lossless(original_path, minified_path, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False):
+	try:
+		with zipfile.ZipFile(original_path) as original, zipfile.ZipFile(minified_path) as result:
+			for archive in (original, result):
+				_, error = _zip_entry_names(archive)
+				if error:
+					return False, error
+			if original.namelist() != result.namelist():
+				return False, "archive entries or their order changed"
+			if original.comment != result.comment:
+				return False, "archive comment changed"
+			left = loads_exact(original.read("project.json"))
+			right = loads_exact(result.read("project.json"))
+			difference = exact_difference(left, right, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids)
+			if difference:
+				return False, difference
+			for info in original.infolist():
+				other = result.getinfo(info.filename)
+				for field in ("date_time", "comment", "extra", "external_attr", "internal_attr", "create_system"):
+					if getattr(info, field) != getattr(other, field):
+						return False, f"ZIP metadata {field} changed: {info.filename!r}"
+				if info.filename != "project.json" and original.read(info) != result.read(other):
+					return False, f"asset byte-for-byte mismatch: {info.filename!r}"
+		if compact_block_flags or relabel_block_ids:
+			return True, "approved block representation changes verified; every other JSON value, execution order, ZIP metadata and asset byte preserved"
+		return True, "every JSON value, collection order, ZIP metadata and asset byte preserved"
+	except (ValueError, OSError, KeyError, zipfile.BadZipFile, zlib.error) as error:
+		return False, str(error)
+
+
+def _minify_lossless_sb3(src, dst, opts):
+	temporary = None
+	try:
+		zopfli = get_zopfli(opts.zopfli_required) if (opts.zopfli or opts.zopfli_assets) else None
+		with zipfile.ZipFile(src) as source:
+			_, error = _zip_entry_names(source)
+			if error:
+				raise ValueError(error)
+			raw = source.read("project.json")
+			project = loads_exact(raw)
+			if not isinstance(project, dict) or not isinstance(project.get("targets"), list):
+				raise ValueError("project.json must contain a project object with a targets array")
+			print(Ansi.heading("Optimizing project.json (exact values and collection order preserved)..."), flush=True)
+			out_json, compressed, stats = optimize_project_json(
+				project, opts.compression_level, opts.zopfli, opts.zopfli_iterations, opts.zopfli_required,
+				opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags,
+				opts.minimum_json, opts.json_search_rounds, opts.relabel_block_ids
+			)
+			json_info = source.getinfo("project.json")
+			original_wins = ((len(raw), json_info.compress_size) <= (len(out_json), len(compressed))) if opts.minimum_json else json_info.compress_size <= len(compressed)
+			if json_info.compress_type == zipfile.ZIP_DEFLATED and original_wins:
+				out_json = raw
+				compressed = read_compressed_entry(source, json_info)
+				stats["json_encoding"] = "original entry (already smaller)"
+			new_json_info = copy.copy(json_info)
+			new_json_info.compress_type = zipfile.ZIP_DEFLATED
+			new_json_info.file_size = len(out_json)
+			new_json_info.CRC = zlib.crc32(out_json)
+			with tempfile.NamedTemporaryFile(prefix=".minify-", suffix=".sb3", dir=os.path.dirname(os.path.abspath(dst)), delete=False) as handle:
+				temporary = handle.name
+			with zipfile.ZipFile(temporary, "w") as output:
+				output.comment = source.comment
+				print(Ansi.heading("Optimizing assets without changing their bytes..."), flush=True)
+				entries = source.infolist()
+				last_progress = time.monotonic()
+				for index, info in enumerate(entries, 1):
+					if info.filename == "project.json":
+						write_compressed_entry(output, new_json_info, compressed)
+						continue
+					data = source.read(info)
+					previous = read_compressed_entry(source, info)
+					method, encoded = info.compress_type, previous
+					if opts.optimize_assets and method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+						method, encoded = optimize_asset(
+							data, opts.compression_level, (method, previous),
+							zopfli if opts.zopfli_assets else False, opts.zopfli_iterations
+						)
+					if len(encoded) < len(previous):
+						stats["assets_recompressed"] = stats.get("assets_recompressed", 0) + 1
+						stats["asset_deflate_bytes_saved"] = stats.get("asset_deflate_bytes_saved", 0) + len(previous) - len(encoded)
+					new_info = copy.copy(info)
+					new_info.compress_type = method
+					write_compressed_entry(output, new_info, encoded)
+					if time.monotonic() - last_progress >= 20:
+						print(f"  Entries checked: {index:,}/{len(entries):,}; asset bytes saved: {stats.get('asset_deflate_bytes_saved', 0):,}", flush=True)
+						last_progress = time.monotonic()
+			print(Ansi.heading("Verifying exact project data and every asset byte..."), flush=True)
+			ok, message = _verify_lossless(src, temporary, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids)
+			if not ok:
+				raise ValueError(f"lossless verification failed: {message}")
+		os.replace(temporary, dst)
+		temporary = None
+		print(f'Input : "{src}"\nOutput: "{dst}"')
+		print(f"JSON encoding: {stats['json_encoding']} ({stats['json_encoding_trials']} measured trials)")
+		for line in format_size_report(len(raw), len(out_json), os.path.getsize(src), os.path.getsize(dst)):
+			print(line)
+		print(f"JSON DEFLATE : {json_info.compress_size:,} -> {len(compressed):,} bytes")
+		floor = stats["json_minimum"]["minimum_bytes"]
+		print(f"JSON lower bound under selected model: {floor:,} bytes; gap: {len(out_json) - floor:,} bytes (see README.md, JSON minimum proofs)")
+		print(f"asset DEFLATE: {stats.get('asset_deflate_bytes_saved', 0):,} bytes saved across {stats.get('assets_recompressed', 0):,} assets")
+		if opts.all_lossless and not zopfli:
+			print("Optional Zopfli was unavailable; all built-in lossless methods ran. Install zopfli for stronger compression.")
+		print(Ansi.success(f"Verified successfully: {message}."))
+		return 0
+	except (ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile, zlib.error) as error:
+		print(Ansi.error(f"Error: {error}"))
+		return 1
+	finally:
+		if temporary and os.path.exists(temporary):
+			os.remove(temporary)
+
+
 def minify_sb3(src, dst, opts=None):
 	opts = opts or Options()
+	if os.path.normcase(os.path.realpath(src)) == os.path.normcase(os.path.realpath(dst)) or (
+		os.path.exists(src) and os.path.exists(dst) and os.path.samefile(src, dst)
+	):
+		print(Ansi.error("Error: output path must differ from input path."))
+		return 1
 	if not os.path.isfile(src):
 		print(Ansi.error(f'Error: file not found: "{src}"'))
+		return 1
+	if opts.lossless:
+		return _minify_lossless_sb3(src, dst, opts)
+	try:
+		zopfli = get_zopfli(opts.zopfli_required) if (opts.zopfli or opts.zopfli_assets) else None
+	except ValueError as error:
+		print(Ansi.error(f"Error: {error}"))
 		return 1
 	with zipfile.ZipFile(src) as zin:
 		if "project.json" not in zin.namelist():
@@ -9083,12 +10012,50 @@ def minify_sb3(src, dst, opts=None):
 		}
 
 		stats = apply_transforms(project, opts, assets)
+		if opts.relabel_block_ids:
+			project, label_maps, label_cost = relabel_blocks(project)
+			previous_maps = getattr(opts, "renamed_block_ids", {})
+			opts.renamed_block_ids = {
+				ti: {old: label_maps.get(ti, {}).get(new, new) for old, new in previous_maps[ti].items()}
+				if ti in previous_maps else mapping for ti, mapping in label_maps.items()
+			}
+			opts.rename_block_ids = True
+			stats["block_id_bytes_saved"] = label_cost["before"] - label_cost["after"]
 		out_json = dumps_compact(project, opts.sort_keys).encode("utf-8")
+		compressed_json = None
+		if opts.optimize_json:
+			out_json, compressed_json, encoding_stats = optimize_project_json(
+				loads_exact(out_json), opts.compression_level, opts.zopfli,
+				opts.zopfli_iterations, opts.zopfli_required, opts.compact_block_defaults,
+				opts.compact_costume_references, opts.compact_block_flags, opts.minimum_json, opts.json_search_rounds
+			)
+			stats.update({key: value for key, value in encoding_stats.items() if isinstance(value, int)})
 		with zipfile.ZipFile(
 			dst, "w", zipfile.ZIP_DEFLATED, compresslevel=opts.compression_level
 		) as zout:
-			zout.writestr("project.json", out_json)
+			if compressed_json is None:
+				zout.writestr("project.json", out_json)
+			else:
+				json_info = zipfile.ZipInfo("project.json")
+				json_info.compress_type = zipfile.ZIP_DEFLATED
+				json_info.file_size = len(out_json)
+				json_info.CRC = zlib.crc32(out_json)
+				write_compressed_entry(zout, json_info, compressed_json)
 			for name, data in assets.items():
+				if opts.optimize_assets:
+					info = copy.copy(asset_infos[name]) if name in asset_infos else zipfile.ZipInfo(name)
+					original = None
+					if name in asset_infos and zin.read(name) == data:
+						original = (info.compress_type, read_compressed_entry(zin, info))
+					method, compressed = optimize_asset(
+						data, opts.compression_level, original,
+						zopfli if opts.zopfli_assets else False, opts.zopfli_iterations
+					)
+					info.compress_type = method
+					info.file_size = len(data)
+					info.CRC = zlib.crc32(data)
+					write_compressed_entry(zout, info, compressed)
+					continue
 				written = False
 				if (
 					opts.preserve_asset_compression
@@ -9135,12 +10102,9 @@ def minify_sb3(src, dst, opts=None):
 	print(f'Input : "{src}"\nOutput: "{dst}"\n')
 	_print_transform_stats(stats, opts)
 	b, a = len(raw), len(out_json)
-	print(
-		f"\n{Ansi.heading('project.json')} : {humanize(b)} -> {humanize(a)}  (-{humanize(b-a)}, {(b-a)/b*100:.1f}%)"
-	)
-	print(
-		f"archive      : {humanize(os.path.getsize(src))} -> {humanize(os.path.getsize(dst))}"
-	)
+	print("")
+	for line in format_size_report(b, a, os.path.getsize(src), os.path.getsize(dst)):
+		print(line)
 
 	print(Ansi.heading("\nVerifying (independent original-vs-result check)..."))
 	ok, msg = verify(src, dst, opts)
@@ -9189,7 +10153,7 @@ if __name__ == "__main__":
 		print(Ansi.error(f"Unknown or malformed option(s): {bad}"))
 		print(
 			Ansi.muted(
-				f"Valid: {sorted(toggles)} and --list-bytes=N --list-items=N --sequence-threshold=N (positive), --compression-level=N (0-9), --normalize-epsilon=N (positive)"
+				f"Valid: {sorted(toggles)} and --list-bytes=N --list-items=N --sequence-threshold=N --zopfli-iterations=N --json-search-rounds=N (positive), --compression-level=N (0-9), --normalize-epsilon=N (positive)"
 			)
 		)
 		sys.exit(1)
@@ -9198,8 +10162,38 @@ if __name__ == "__main__":
 		print(Ansi.error("Usage: ") + Ansi.warning("python minify_sb3.py path/to/project.sb3 --flags"))
 		sys.exit(1)
 	
-	all_optimizations = "--all-optimizations" in flags or "--all-flags" in flags
+	all_flags = "--all-flags" in flags
+	all_optimizations = "--all-optimizations" in flags or all_flags
+	all_safe = any(flag in flags for flag in ("--all-lossless", "--all-safe", "--all-safe-flags"))
+	lossless = "--lossless" in flags or all_safe
+	if lossless:
+		allowed = {
+			"--lossless", "--all-lossless", "--optimize-json", "--optimize-assets",
+			"--zopfli", "--zopfli-assets", "--zopfli-iterations", "--compression-level",
+			"--compact-block-defaults", "--compact-costume-references", "--compact-block-flags",
+			"--all-safe", "--all-safe-flags", "--minimum-json", "--json-search-rounds", "--relabel-block-ids",
+			"--keep-comments", "--keep-positions", "--keep-covered", "--keep-monitors",
+			"--keep-sound-metadata", "--preserve-asset-compression", "--compress-assets",
+		}
+		conflicts = [flag for flag in flags if flag.partition("=")[0] not in allowed]
+		if conflicts:
+			print(Ansi.error(f"Lossless mode is incompatible with: {', '.join(conflicts)}"))
+			sys.exit(1)
 	opts = Options(
+		lossless=lossless,
+		all_lossless=all_safe,
+		compact_costume_references=all_optimizations or "--compact-costume-references" in flags,
+		compact_block_flags=all_flags or "--compact-block-flags" in flags,
+		minimum_json=all_flags or "--minimum-json" in flags,
+		json_search_rounds=values.get("--json-search-rounds", 1 if all_optimizations else 0),
+		relabel_block_ids=all_flags or "--relabel-block-ids" in flags,
+		auto_zopfli=all_flags,
+		optimize_json=all_optimizations or "--optimize-json" in flags,
+		optimize_assets=all_optimizations or "--optimize-assets" in flags,
+		compact_block_defaults=all_optimizations or "--compact-block-defaults" in flags,
+		zopfli="--zopfli" in flags,
+		zopfli_assets="--zopfli-assets" in flags,
+		zopfli_iterations=values.get("--zopfli-iterations", 5),
 		comments=("--keep-comments" not in flags),
 		positions=("--keep-positions" not in flags),
 		covered=("--keep-covered" not in flags),
@@ -9290,7 +10284,7 @@ if __name__ == "__main__":
 		group_similar_sequences="--group-similar-sequences" in flags,
 		sequence_threshold=values.get("--sequence-threshold", 3),
 		compress_assets=all_optimizations or "--compress-assets" in flags,
-		convert_wav_to_mp3=all_optimizations or "--convert-wav-to-mp3" in flags,
+		convert_wav_to_mp3=all_flags or "--convert-wav-to-mp3" in flags,
 		sort_keys="--sort-keys" in flags,
 		compression_level=values.get("--compression-level", 9),
 		list_bytes=values.get("--list-bytes", DEFAULT_LIST_BYTES),

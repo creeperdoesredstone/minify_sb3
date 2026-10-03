@@ -1,4 +1,17 @@
 toggles = {
+	"--lossless",
+	"--all-lossless",
+	"--all-safe",
+	"--all-safe-flags",
+	"--minimum-json",
+	"--compact-costume-references",
+	"--compact-block-flags",
+	"--relabel-block-ids",
+	"--optimize-json",
+	"--optimize-assets",
+	"--compact-block-defaults",
+	"--zopfli",
+	"--zopfli-assets",
 	"--all-optimizations",
 	"--all-flags",
 	"--keep-comments",
@@ -62,6 +75,8 @@ toggles = {
 	"--deduplicate-procedures",
 }
 valued = {
+	"--zopfli-iterations",
+	"--json-search-rounds",
 	"--list-bytes",
 	"--list-items",
 	"--compression-level",
