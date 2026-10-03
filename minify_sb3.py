@@ -6652,6 +6652,7 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 	  repeat until true    -> delete loop + body
 	  wait until true      -> delete wait
 	  repeat 0             -> delete loop + body
+	  repeat 1             -> splice the body once
 
 	The plan does not mutate `blocks`; callers can therefore reject a plan due
 	to comments or other invariants without having to roll it back.
@@ -6688,15 +6689,15 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 
 	if opcode == "control_repeat":
 		n = _constant_to_number(constant[0])
-		if n is None or not math.isfinite(n) or n != 0:
+		if n is None or not math.isfinite(n) or n not in (0, 1):
 			return None
 		condition_closure = _exclusive_input_block_subtree_fast(
 			condition_raw, blocks, control_id, incoming_refs, graph=graph
 		) if condition_raw is not None else set()
 		if condition_closure is None:
 			return None
-		selected_raw = None
-		dead_raws = [inputs.get("SUBSTACK")]
+		selected_raw = inputs.get("SUBSTACK") if n == 1 else None
+		dead_raws = [] if n == 1 else [inputs.get("SUBSTACK")]
 	elif opcode == "control_wait_until":
 		if not _constant_to_bool(constant[0]):
 			return None
@@ -6809,7 +6810,7 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 	}
 
 
-def simplify_boolean_controls(project, stats, opts):
+def simplify_boolean_controls(project, stats, opts, only_repeat_one=False):
 	"""Structurally eliminate constant control-flow constructs."""
 	targets = project.get("targets", [])
 	removed_sets = getattr(opts, "constant_control_removed_blocks", None)
@@ -6847,13 +6848,16 @@ def simplify_boolean_controls(project, stats, opts):
 			for control_id, block in list(blocks.items()):
 				if not isinstance(block, dict):
 					continue
-				if block.get("opcode") not in (
+				opcode = block.get("opcode")
+				if opcode not in (
 					"control_if",
 					"control_if_else",
 					"control_repeat_until",
 					"control_wait_until",
 					"control_repeat",
 				):
+					continue
+				if only_repeat_one and opcode != "control_repeat":
 					continue
 
 				plan = _constant_control_plan(
@@ -6870,9 +6874,6 @@ def simplify_boolean_controls(project, stats, opts):
 				if not isinstance(owner, dict):
 					continue
 
-				# Validate every touched block before mutating anything. The plan is
-				# already derived from the same graph, but this makes the operation
-				# robust against a stale/deferred mutation by another pass.
 				if any(
 					not isinstance(blocks.get(bid), dict)
 					for bid in (
@@ -6925,6 +6926,588 @@ def simplify_boolean_controls(project, stats, opts):
 				break
 
 	return total
+
+
+_SCRIPT_PURE_REPORTERS = {
+	"data_variable", "data_itemoflist", "data_itemnumoflist",
+	"data_lengthoflist", "data_listcontainsitem", "data_listcontents",
+	"looks_costumenumbername", "looks_backdropnumbername", "looks_size",
+	"sound_volume", "motion_xposition", "motion_yposition", "motion_direction",
+	"sensing_answer", "sensing_timer", "sensing_dayssince2000", "sensing_username",
+	"sensing_current", "sensing_mousedown", "sensing_mousex", "sensing_mousey",
+	"sensing_loudness",
+}
+
+
+def _script_input_root(value, blocks):
+	if not isinstance(value, list) or len(value) <= 1 or value[0] not in (1, 2, 3):
+		return None
+	ref = value[1]
+	return ref if isinstance(ref, str) and ref in blocks else None
+
+
+def _script_condition_is_pure(value, blocks, graph):
+	"""Conservatively prove that a condition has no observable side effects."""
+	seen = set()
+	stack = list(_input_block_ids(value, blocks))
+	while stack:
+		bid = stack.pop()
+		if bid in seen or bid not in blocks:
+			continue
+		seen.add(bid)
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		op = block.get("opcode", "")
+		if op == "operator_random" or op.startswith(("event_", "control_", "procedures_")):
+			return False
+		if op.startswith("operator_") or op.startswith("argument_reporter_"):
+			if op == "operator_random":
+				return False
+		elif op not in _SCRIPT_PURE_REPORTERS:
+			return False
+		stack.extend(graph.edges.get(bid, ()))
+	return True
+
+
+def _script_comment_ids(target):
+	ids = {
+		c.get("blockId")
+		for c in (target.get("comments") or {}).values()
+		if isinstance(c, dict) and isinstance(c.get("blockId"), str)
+	}
+	ids.update(
+		bid for bid, block in (target.get("blocks") or {}).items()
+		if isinstance(block, dict) and "comment" in block
+	)
+	return ids
+
+
+def _script_prepare_maps(opts, targets):
+	for name in ("script_rewrite_removed_blocks", "script_rewrite_new_blocks"):
+		value = getattr(opts, name, None)
+		if value is None or len(value) != len(targets):
+			setattr(opts, name, [set() for _ in targets])
+	for name in ("script_rewrite_link_edits", "script_rewrite_input_edits", "script_rewrite_opcode_edits"):
+		if getattr(opts, name, None) is None:
+			setattr(opts, name, {})
+	if getattr(opts, "script_rewrite_removed_inputs", None) is None:
+		opts.script_rewrite_removed_inputs = {}
+
+
+def _script_record_removed(opts, ti, removed):
+	while len(opts.script_rewrite_removed_blocks) <= ti:
+		opts.script_rewrite_removed_blocks.append(set())
+	opts.script_rewrite_removed_blocks[ti].update(removed)
+
+
+def _script_record_new(opts, ti, created):
+	while len(opts.script_rewrite_new_blocks) <= ti:
+		opts.script_rewrite_new_blocks.append(set())
+	opts.script_rewrite_new_blocks[ti].update(created)
+
+
+def _script_literal_from_input(value):
+	if not (isinstance(value, list) and len(value) == 2 and value[0] == 1):
+		return None
+	literal = value[1]
+	if not (isinstance(literal, list) and len(literal) == 2):
+		return None
+	tag, raw = literal
+	if tag in _NUMERIC_TAGS and not isinstance(raw, bool) and isinstance(raw, (str, int, float)):
+		if isinstance(raw, float) and not math.isfinite(raw):
+			return None
+		return copy.deepcopy(literal)
+	if tag == _TEXT_TAG and isinstance(raw, str):
+		return copy.deepcopy(literal)
+	return None
+
+
+def _script_plan_unwrap_not(raw, blocks, owner_id, incoming_refs, graph):
+	if not (isinstance(raw, list) and len(raw) == 2 and raw[0] == 2):
+		return None
+	not_id = raw[1]
+	not_block = blocks.get(not_id)
+	if not isinstance(not_id, str) or not isinstance(not_block, dict):
+		return None
+	if not_block.get("opcode") != "operator_not" or not_block.get("next") is not None:
+		return None
+	operand = (not_block.get("inputs") or {}).get("OPERAND")
+	if operand is None or _is_bare_literal_input(operand):
+		return None
+	owned = _exclusive_input_block_subtree_fast(raw, blocks, owner_id, incoming_refs, graph=graph)
+	if owned is None or not_id not in owned:
+		return None
+	operand_owned = _exclusive_input_block_subtree_fast(operand, blocks, not_id, incoming_refs, graph=graph)
+	if operand_owned is None:
+		return None
+	moved_roots = _direct_input_block_refs(operand, blocks)
+	if any((not isinstance(blocks.get(ref), dict)) or blocks[ref].get("parent") != not_id for ref in moved_roots):
+		return None
+	removed_ids = owned - operand_owned
+	return not_id, copy.deepcopy(operand), removed_ids, moved_roots
+
+
+def _script_plan_branch_swap(blocks, control_id, incoming_refs, graph, commented):
+	control = blocks.get(control_id)
+	if not isinstance(control, dict) or control.get("opcode") != "control_if_else":
+		return None
+	condition = (control.get("inputs") or {}).get("CONDITION")
+	plan = _script_plan_unwrap_not(condition, blocks, control_id, incoming_refs, graph)
+	if plan is None:
+		return None
+	not_id, operand, remove_ids, moved_ids = plan
+	removed = set(remove_ids) | {not_id}
+	if removed & commented:
+		return None
+	return {"condition": operand, "removed": removed, "moved_ids": moved_ids}
+
+
+def _script_plan_empty_then(blocks, control_id, incoming_refs, graph, commented):
+	control = blocks.get(control_id)
+	if not isinstance(control, dict) or control.get("opcode") != "control_if_else":
+		return None
+	inputs = control.get("inputs") or {}
+	# We only regard a missing SUBSTACK as an empty then-branch. A malformed
+	# non-null descriptor is left alone for the verifier/repair machinery.
+	if inputs.get("SUBSTACK") is not None:
+		return None
+	else_raw = inputs.get("SUBSTACK2")
+	if _control_substack(else_raw, blocks) is None:
+		return None
+	condition = inputs.get("CONDITION")
+	if condition is None:
+		return None
+	unwrap = _script_plan_unwrap_not(condition, blocks, control_id, incoming_refs, graph)
+	if unwrap is not None:
+		not_id, operand, remove_ids, moved_ids = unwrap
+		removed = set(remove_ids) | {not_id}
+		if removed & commented:
+			return None
+		return {"mode": "unwrap", "condition": operand, "removed": removed,
+			"moved_ids": moved_ids, "else_raw": copy.deepcopy(else_raw)}
+	owned = _exclusive_input_block_subtree_fast(condition, blocks, control_id, incoming_refs, graph=graph)
+	if owned is None or owned & commented:
+		return None
+	new_id = _create_scratch_id()
+	while new_id in blocks:
+		new_id = _create_scratch_id()
+	new_block = {
+		"opcode": "operator_not", "next": None, "parent": control_id,
+		"inputs": {"OPERAND": copy.deepcopy(condition)}, "fields": {},
+	}
+	return {"mode": "wrap", "new_id": new_id, "new_block": new_block,
+		"condition_owned": owned, "else_raw": copy.deepcopy(else_raw), "removed": set()}
+
+
+def _script_plan_repeat_until_not(blocks, control_id, incoming_refs, graph, commented):
+	control = blocks.get(control_id)
+	if not isinstance(control, dict) or control.get("opcode") != "control_repeat_until":
+		return None
+	condition = (control.get("inputs") or {}).get("CONDITION")
+	unwrap = _script_plan_unwrap_not(condition, blocks, control_id, incoming_refs, graph)
+	if unwrap is None:
+		return None
+	not_id, operand, remove_ids, moved_ids = unwrap
+	removed = set(remove_ids) | {not_id}
+	if removed & commented:
+		return None
+	return {"condition": operand, "removed": removed, "moved_ids": moved_ids}
+
+
+def _script_plan_nested_if(blocks, outer_id, incoming_refs, graph, commented):
+	outer = blocks.get(outer_id)
+	if not isinstance(outer, dict) or outer.get("opcode") != "control_if":
+		return None
+	outer_inputs = outer.get("inputs") or {}
+	inner_id = _control_substack(outer_inputs.get("SUBSTACK"), blocks)
+	if inner_id is None or inner_id == outer_id:
+		return None
+	inner = blocks.get(inner_id)
+	if not isinstance(inner, dict) or inner.get("opcode") != "control_if":
+		return None
+	if inner.get("next") is not None or inner.get("parent") != outer_id:
+		return None
+	inner_inputs = inner.get("inputs") or {}
+	body_raw = inner_inputs.get("SUBSTACK")
+	body_root = _control_substack(body_raw, blocks)
+	if body_root is None or "SUBSTACK2" in inner_inputs:
+		return None
+	body_closure, _ = _substack_closure(body_raw, blocks, inner_id, incoming_refs, graph)
+	if body_closure is None:
+		return None
+	condition_b = inner_inputs.get("CONDITION")
+	if not _script_condition_is_pure(condition_b, blocks, graph):
+		return None
+	condition_a = outer_inputs.get("CONDITION")
+	outer_owned = _exclusive_input_block_subtree_fast(condition_a, blocks, outer_id, incoming_refs, graph=graph)
+	inner_owned = _exclusive_input_block_subtree_fast(condition_b, blocks, inner_id, incoming_refs, graph=graph)
+	if outer_owned is None or inner_owned is None:
+		return None
+	if ({inner_id} | outer_owned | inner_owned) & commented:
+		return None
+	new_id = _create_scratch_id()
+	while new_id in blocks:
+		new_id = _create_scratch_id()
+	new_block = {
+		"opcode": "operator_and", "next": None, "parent": outer_id,
+		"inputs": {"OPERAND1": copy.deepcopy(condition_a), "OPERAND2": copy.deepcopy(condition_b)},
+		"fields": {},
+	}
+	return {"outer_id": outer_id, "inner_id": inner_id, "new_id": new_id,
+		"new_block": new_block, "body_raw": copy.deepcopy(body_raw), "body_root": body_root}
+
+
+def simplify_script_structures(project, stats, opts):
+	"""Apply local control rewrites with explicit verifier bookkeeping."""
+	targets = project.get("targets", [])
+	_script_prepare_maps(opts, targets)
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		graph = _ScratchGraphIndex(target)
+		commented = _script_comment_ids(target)
+		while True:
+			changed = False
+			for bid, block in list(blocks.items()):
+				if not isinstance(block, dict) or bid not in blocks:
+					continue
+				incoming = graph.incoming
+
+				if opts.branch_swapping:
+					plan = _script_plan_branch_swap(blocks, bid, incoming, graph, commented)
+					if plan is not None:
+						inputs = blocks[bid].setdefault("inputs", {})
+						then_raw = copy.deepcopy(inputs.get("SUBSTACK"))
+						else_raw = copy.deepcopy(inputs.get("SUBSTACK2"))
+						inputs["CONDITION"] = plan["condition"]
+						inputs["SUBSTACK"], inputs["SUBSTACK2"] = else_raw, then_raw
+						for moved in plan["moved_ids"]:
+							if isinstance(blocks.get(moved), dict):
+								blocks[moved]["parent"] = bid
+								opts.script_rewrite_link_edits[(ti, moved, "parent")] = bid
+						for n in ("CONDITION", "SUBSTACK", "SUBSTACK2"):
+							opts.script_rewrite_input_edits[(ti, bid, n)] = copy.deepcopy(inputs[n])
+						_script_record_removed(opts, ti, plan["removed"])
+						for dead in plan["removed"]: blocks.pop(dead, None)
+						graph.rebuild(); stats["branch_swaps"] += 1; changed = True; break
+
+				if opts.branch_swapping:
+					plan = _script_plan_empty_then(blocks, bid, incoming, graph, commented)
+					if plan is not None:
+						control = blocks[bid]
+						inputs = control.setdefault("inputs", {})
+						inputs["CONDITION"] = copy.deepcopy(
+							plan["condition"] if plan["mode"] == "unwrap" else [2, plan["new_id"]]
+						)
+						inputs["SUBSTACK"] = plan["else_raw"]
+						inputs.pop("SUBSTACK2", None)
+						control["opcode"] = "control_if"
+						opts.script_rewrite_opcode_edits[(ti, bid)] = "control_if"
+						opts.script_rewrite_input_edits[(ti, bid, "CONDITION")] = copy.deepcopy(inputs["CONDITION"])
+						opts.script_rewrite_input_edits[(ti, bid, "SUBSTACK")] = copy.deepcopy(inputs["SUBSTACK"])
+						opts.script_rewrite_removed_inputs[(ti, bid)] = {"SUBSTACK2"}
+						if plan["mode"] == "unwrap":
+							for moved in plan["moved_ids"]:
+								if isinstance(blocks.get(moved), dict):
+									blocks[moved]["parent"] = bid
+									opts.script_rewrite_link_edits[(ti, moved, "parent")] = bid
+						else:
+							for ref in _direct_input_block_refs(plan["new_block"]["inputs"]["OPERAND"], blocks):
+								if isinstance(blocks.get(ref), dict):
+									blocks[ref]["parent"] = plan["new_id"]
+									opts.script_rewrite_link_edits[(ti, ref, "parent")] = plan["new_id"]
+							blocks[plan["new_id"]] = plan["new_block"]
+							_script_record_new(opts, ti, {plan["new_id"]})
+						_script_record_removed(opts, ti, plan["removed"])
+						for dead in plan["removed"]: blocks.pop(dead, None)
+						graph.rebuild(); stats["empty_then_rewrites"] += 1; changed = True; break
+
+				if opts.trivial_loops:
+					plan = _script_plan_repeat_until_not(blocks, bid, incoming, graph, commented)
+					if plan is not None:
+						control = blocks[bid]
+						control["opcode"] = "control_while"
+						control.setdefault("inputs", {})["CONDITION"] = plan["condition"]
+						opts.script_rewrite_opcode_edits[(ti, bid)] = "control_while"
+						opts.script_rewrite_input_edits[(ti, bid, "CONDITION")] = copy.deepcopy(control["inputs"]["CONDITION"])
+						for moved in plan["moved_ids"]:
+							if isinstance(blocks.get(moved), dict):
+								blocks[moved]["parent"] = bid
+								opts.script_rewrite_link_edits[(ti, moved, "parent")] = bid
+						_script_record_removed(opts, ti, plan["removed"])
+						for dead in plan["removed"]: blocks.pop(dead, None)
+						graph.rebuild(); stats["repeat_until_not_rewrites"] += 1; changed = True; break
+
+				if opts.nested_conditionals:
+					plan = _script_plan_nested_if(blocks, bid, incoming, graph, commented)
+					if plan is not None:
+						outer = blocks[bid]
+						new_id = plan["new_id"]
+						for input_name in ("OPERAND1", "OPERAND2"):
+							for ref in _direct_input_block_refs(plan["new_block"]["inputs"][input_name], blocks):
+								if isinstance(blocks.get(ref), dict):
+									blocks[ref]["parent"] = new_id
+									opts.script_rewrite_link_edits[(ti, ref, "parent")] = new_id
+						blocks[new_id] = plan["new_block"]
+						outer.setdefault("inputs", {})["CONDITION"] = [2, new_id]
+						outer["inputs"]["SUBSTACK"] = plan["body_raw"]
+						opts.script_rewrite_input_edits[(ti, bid, "CONDITION")] = [2, new_id]
+						opts.script_rewrite_input_edits[(ti, bid, "SUBSTACK")] = copy.deepcopy(plan["body_raw"])
+						if isinstance(blocks.get(plan["body_root"]), dict):
+							blocks[plan["body_root"]]["parent"] = bid
+							opts.script_rewrite_link_edits[(ti, plan["body_root"], "parent")] = bid
+						_script_record_new(opts, ti, {new_id})
+						_script_record_removed(opts, ti, {plan["inner_id"]})
+						blocks.pop(plan["inner_id"], None)
+						graph.rebuild(); stats["nested_if_merges"] += 1; changed = True; break
+			if not changed: break
+	return sum(stats.get(k,0) for k in ("branch_swaps","empty_then_rewrites","repeat_until_not_rewrites","nested_if_merges"))
+
+
+def _script_associative_plan(blocks, outer_id, graph, commented):
+	outer = blocks.get(outer_id)
+	if not isinstance(outer, dict) or outer.get("next") is not None:
+		return None
+	op = outer.get("opcode")
+	if op not in ("operator_add", "operator_join"):
+		return None
+	left_name, right_name = (("NUM1", "NUM2") if op == "operator_add" else ("STRING1", "STRING2"))
+	outer_left = (outer.get("inputs") or {}).get(left_name)
+	outer_right = (outer.get("inputs") or {}).get(right_name)
+	inner_id = _script_input_root(outer_left, blocks)
+	inner = blocks.get(inner_id) if inner_id else None
+	if not isinstance(inner, dict) or inner.get("opcode") != op or inner.get("next") is not None:
+		return None
+	inner_inputs = inner.get("inputs") or {}
+	inner_left = inner_inputs.get(left_name)
+	inner_right = inner_inputs.get(right_name)
+	c1 = _constant_expression_from_input(inner_right, blocks)
+	c2 = _constant_expression_from_input(outer_right, blocks)
+	if inner_left is None or c1 is None or c2 is None:
+		return None
+	owned = _exclusive_input_block_subtree_fast(outer_left, blocks, outer_id, graph.incoming, graph=graph)
+	if owned is None:
+		return None
+	survivor_owned = _exclusive_input_block_subtree_fast(inner_left, blocks, inner_id, graph.incoming, graph=graph)
+	if survivor_owned is None or inner_id not in owned or not survivor_owned <= owned:
+		return None
+	removed = owned - survivor_owned
+	if removed & commented:
+		return None
+	if op == "operator_join":
+		combined = _constant("string", _constant_to_string(c1[0]) + _constant_to_string(c2[0]))
+	else:
+		a = _constant_to_number(c1[0]); b = _constant_to_number(c2[0])
+		if a is None or b is None or not math.isfinite(a) or not math.isfinite(b):
+			return None
+		combined = _constant("number", a + b)
+	new_const, _ = _constant_to_scratch_input(combined, blocks, outer_id)
+	if new_const is None:
+		return None
+	# Numeric reassociation is intentionally gated by its dedicated opt-in flag.
+	return {"inner_id": inner_id, "base": copy.deepcopy(inner_left), "new_const": new_const, "removed": removed}
+
+
+def merge_associative_constants(project, stats, opts):
+	_script_prepare_maps(opts, project.get("targets", []))
+	count = 0
+	for ti, target in enumerate(project.get("targets", [])):
+		blocks = target.get("blocks") or {}
+		graph = _ScratchGraphIndex(target)
+		commented = _script_comment_ids(target)
+		while True:
+			changed = False
+			for bid in list(blocks):
+				plan = _script_associative_plan(blocks, bid, graph, commented)
+				if plan is None:
+					continue
+				outer = blocks[bid]
+				name = "NUM1" if outer.get("opcode") == "operator_add" else "STRING1"
+				name2 = "NUM2" if outer.get("opcode") == "operator_add" else "STRING2"
+				for ref in _direct_input_block_refs(plan["base"], blocks):
+					if isinstance(blocks.get(ref), dict):
+						blocks[ref]["parent"] = bid
+						opts.script_rewrite_link_edits[(ti, ref, "parent")] = bid
+				outer.setdefault("inputs", {})[name] = plan["base"]
+				outer["inputs"][name2] = plan["new_const"]
+				opts.script_rewrite_input_edits[(ti, bid, name)] = copy.deepcopy(plan["base"])
+				opts.script_rewrite_input_edits[(ti, bid, name2)] = copy.deepcopy(plan["new_const"])
+				for remove_id in plan["removed"]:
+					blocks.pop(remove_id, None)
+				_script_record_removed(opts, ti, plan["removed"])
+				graph.rebuild(); stats["associative_constant_merges"] += 1; count += 1; changed = True; break
+			if not changed: break
+	return count
+
+
+def _script_var_id(block):
+	field = (block.get("fields") or {}).get("VARIABLE") if isinstance(block, dict) else None
+	return field[1] if isinstance(field, list) and len(field) > 1 and isinstance(field[1], str) else None
+
+
+def _script_replace_known_reads(value, env, blocks, owner_id, ti, opts, graph, allow_literal=True):
+	if not isinstance(value, list) or not value:
+		return value, False, set()
+	if len(value) >= 3 and value[0] == 12 and isinstance(value[2], str) and value[2] in env:
+		if not allow_literal:
+			return value, False, set()
+		entry = env[value[2]]
+		return [1, copy.deepcopy(entry)], True, set()
+	if value[0] in (1,2,3) and len(value) > 1 and isinstance(value[1], str):
+		ref = value[1]
+		child = blocks.get(ref)
+		if isinstance(child, dict) and child.get("opcode") == "data_variable":
+			vid = _script_var_id(child)
+			if allow_literal and vid in env and child.get("parent") == owner_id:
+				owned = _exclusive_input_block_subtree_fast(value, blocks, owner_id, graph.incoming, graph=graph)
+				if owned == {ref}:
+					return [1, copy.deepcopy(env[vid])], True, {ref}
+		return value, False, set()
+	if value[0] == 3:
+		changed = False; removed = set()
+		for i in (1,2):
+			if i >= len(value) or not isinstance(value[i], list): continue
+			new, c, dead = _script_replace_known_reads(value[i], env, blocks, owner_id, ti, opts, graph, allow_literal=True)
+			if c:
+				# A [3, actual, shadow] input cannot contain an input wrapper
+				# as its actual value.  When constant propagation turns the
+				# primary value into [1, literal], collapse the entire covered
+				# input to that literal and discard the now-redundant shadow.
+				if i == 1 and _is_bare_literal_input(new):
+					return new, True, removed | dead
+				value[i] = new
+				changed = True
+			removed |= dead
+		return value, changed, removed
+	return value, False, set()
+
+
+def _script_literal_payload(value):
+	literal = _script_literal_from_input(value)
+	if literal is None:
+		return None
+	return literal
+
+
+def propagate_script_constants(project, stats, opts):
+	_script_prepare_maps(opts, project.get("targets", []))
+	count = 0
+	for ti, target in enumerate(project.get("targets", [])):
+		blocks = target.get("blocks") or {}
+		graph = _ScratchGraphIndex(target)
+		roots = [
+			bid for bid, block in blocks.items()
+			if isinstance(block, dict) and (block.get("topLevel") is True or (block.get("parent") is None and _is_hat(block)))
+		]
+		for root in roots:
+			env = {}; seen = set(); current = root
+			while isinstance(current, str) and current in blocks and current not in seen:
+				seen.add(current)
+				block = blocks[current]
+				if not isinstance(block, dict): break
+				for input_name, raw in list((block.get("inputs") or {}).items()):
+					new, changed, dead = _script_replace_known_reads(raw, env, blocks, current, ti, opts, graph, allow_literal=not _is_boolean_slot(block, input_name))
+					if changed:
+						block.setdefault("inputs", {})[input_name] = new
+						opts.script_rewrite_input_edits[(ti, current, input_name)] = copy.deepcopy(new)
+						for dead_id in dead: blocks.pop(dead_id, None)
+						_script_record_removed(opts, ti, dead)
+						graph.rebuild(); count += 1
+				op = block.get("opcode")
+				if op == "data_setvariableto":
+					vid = _script_var_id(block)
+					lit = _script_literal_payload((block.get("inputs") or {}).get("VALUE"))
+					if vid and lit is not None: env[vid] = lit
+					else: env.pop(vid, None)
+				elif op == "data_changevariableby":
+					env.pop(_script_var_id(block), None)
+				if op.startswith(("event_", "control_", "procedures_")) or op in {"sensing_askandwait", "sound_playuntildone", "event_broadcastandwait"}:
+					env.clear()
+				current = block.get("next") if isinstance(block.get("next"), str) else None
+	stats["script_constants_propagated"] += count
+	return count
+
+
+def _numeric_data_literal(value):
+	if not isinstance(value, str) or not value:
+		return None
+	try:
+		iv = int(value)
+		if str(iv) == value: return iv
+	except (ValueError, OverflowError):
+		pass
+	try: fv = float(value)
+	except (ValueError, OverflowError): return None
+	if not math.isfinite(fv) or "." not in value or "e" in value.lower() or str(fv) != value: return None
+	return fv
+
+
+def compact_data_literals(project, stats):
+	count = 0
+	for target in project.get("targets", []):
+		for entry in (target.get("variables") or {}).values():
+			if isinstance(entry, list) and len(entry) >= 2:
+				new = _numeric_data_literal(entry[1])
+				if new is not None: entry[1] = new; count += 1
+		for entry in (target.get("lists") or {}).values():
+			if not (isinstance(entry, list) and len(entry) >= 2 and isinstance(entry[1], list)): continue
+			for i, value in enumerate(entry[1]):
+				new = _numeric_data_literal(value)
+				if new is not None: entry[1][i] = new; count += 1
+	stats["data_literals_compacted"] += count
+	return count
+
+
+def strip_reference_names(project, stats):
+	count = 0
+	for target in project.get("targets", []):
+		for block in (target.get("blocks") or {}).values():
+			if isinstance(block, list) and len(block) >= 3 and block[0] in (12,13) and block[1] != "":
+				block[1] = ""; count += 1
+			elif isinstance(block, dict):
+				fields = block.get("fields") or {}
+				for key in ("VARIABLE", "LIST"):
+					field = fields.get(key)
+					if isinstance(field, list) and len(field) >= 2 and field[0] != "": field[0] = ""; count += 1
+				for raw in (block.get("inputs") or {}).values():
+					for node in _iter_scratch_input_nodes(raw):
+						if len(node) >= 3 and node[0] in (12,13) and node[1] != "": node[1] = ""; count += 1
+	stats["reference_names_stripped"] += count
+	return count
+
+_EXTENSION_PREFIXES = {
+	"pen":"pen_", "music":"music_", "videoSensing":"videoSensing_", "text2speech":"text2speech_",
+	"translate":"translate_", "makeymakey":"makeymakey_", "microbit":"microbit_", "microbit_more":"microbit_more_",
+	"boost":"boost_", "ev3":"ev3_", "wedo2":"wedo2_", "gdxfor":"gdxfor_",
+}
+
+
+def remove_unused_extensions(project, stats, opts):
+	extensions = project.get("extensions")
+	if not isinstance(extensions, list): return 0
+	used = {block.get("opcode") for target in project.get("targets", []) for block in (target.get("blocks") or {}).values() if isinstance(block, dict) and isinstance(block.get("opcode"), str)}
+	removed = []
+	for ext in list(extensions):
+		prefix = _EXTENSION_PREFIXES.get(ext)
+		if prefix is not None and not any(op.startswith(prefix) for op in used):
+			extensions.remove(ext); removed.append(ext)
+	opts.removed_extensions.update(removed)
+	stats["unused_extensions_removed"] += len(removed)
+	return len(removed)
+
+
+def _compact_data_value_equal(original, minified):
+	if original == minified: return True
+	converted = _numeric_data_literal(original) if isinstance(original, str) else None
+	return converted is not None and converted == minified
+
+
+def _compact_data_entry_equal(original, minified):
+	if not (isinstance(original, list) and isinstance(minified, list) and len(original) == len(minified) and original[0] == minified[0]): return False
+	if len(original) < 2: return original == minified
+	if isinstance(original[1], list) and isinstance(minified[1], list):
+		return len(original[1]) == len(minified[1]) and all(_compact_data_value_equal(a,b) for a,b in zip(original[1],minified[1]))
+	return _compact_data_value_equal(original[1], minified[1])
 
 def fold_constant_expressions(project, stats, opts):
 	targets = project.get("targets", [])
@@ -7566,6 +8149,14 @@ class Options:
 		deduplicate_assets=False,
 		optimize_procedure_arguments=False,
 		merge_duplicate_procedures=False,
+		branch_swapping=False,
+		trivial_loops=False,
+		nested_conditionals=False,
+		associative_constant_merging=False,
+		script_constant_propagation=False,
+		strip_reference_names=False,
+		compact_data_literals=False,
+		remove_unused_extensions=False,
 		group_similar_sequences=False,
 		sequence_threshold=3,
 		lossless=False,
@@ -7612,6 +8203,9 @@ class Options:
 						"compact_numeric_inputs", "compact_field_ids", "compact_mutation_hasnext",
 						"compact_mutation_metadata", "deduplicate_assets", "group_similar_sequences",
 						"optimize_procedure_arguments", "merge_duplicate_procedures",
+						"branch_swapping", "trivial_loops", "nested_conditionals",
+						"associative_constant_merging", "script_constant_propagation",
+						"strip_reference_names", "compact_data_literals", "remove_unused_extensions",
 						"frequency_block_ids", "frequency_data_ids")
 				)
 			]
@@ -7676,6 +8270,14 @@ class Options:
 		self.deduplicate_assets = deduplicate_assets
 		self.optimize_procedure_arguments = optimize_procedure_arguments
 		self.merge_duplicate_procedures = merge_duplicate_procedures
+		self.branch_swapping = branch_swapping
+		self.trivial_loops = trivial_loops
+		self.nested_conditionals = nested_conditionals
+		self.associative_constant_merging = associative_constant_merging
+		self.script_constant_propagation = script_constant_propagation
+		self.strip_reference_names = strip_reference_names
+		self.compact_data_literals = compact_data_literals
+		self.remove_unused_extensions = remove_unused_extensions
 		self.group_similar_sequences = group_similar_sequences
 		self.sequence_threshold = max(1, int(sequence_threshold))
 
@@ -7721,6 +8323,14 @@ class Options:
 		self.procedure_argument_removed_blocks = []
 		self.merged_procedure_removed_blocks = []
 
+		self.script_rewrite_removed_blocks = []
+		self.script_rewrite_new_blocks = []
+		self.script_rewrite_link_edits = {}
+		self.script_rewrite_input_edits = {}
+		self.script_rewrite_opcode_edits = {}
+		self.script_rewrite_removed_inputs = {}
+		self.removed_extensions = set()
+
 		self.grouped_sequence_removed_blocks = []
 		self.grouped_sequence_new_blocks = []
 		self.grouped_sequence_link_edits = {}
@@ -7757,10 +8367,18 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_constant_variable_setters(
 			project, opts.folded_constant_variable_setters, stats, opts
 		)
+	if opts.script_constant_propagation:
+		propagate_script_constants(project, stats, opts)
+	if opts.branch_swapping or opts.trivial_loops or opts.nested_conditionals:
+		simplify_script_structures(project, stats, opts)
+	if opts.associative_constant_merging:
+		merge_associative_constants(project, stats, opts)
 	if opts.fold_constant_expressions:
 		fold_constant_expressions(project, stats, opts)
 	if opts.simplify_boolean_control:
 		simplify_boolean_controls(project, stats, opts)
+	elif opts.trivial_loops:
+		simplify_boolean_controls(project, stats, opts, only_repeat_one=True)
 	if opts.simplify_blocks:
 		_simplify_setter_rhs_blocks(project, stats, opts)
 	if opts.group_similar_sequences:
@@ -7847,6 +8465,12 @@ def apply_transforms(project, opts: Options, assets=None):
 		remove_empty_target_containers(project, stats)
 	if opts.remove_project_meta:
 		remove_project_meta(project, stats)
+	if opts.compact_data_literals:
+		compact_data_literals(project, stats)
+	if opts.strip_reference_names:
+		strip_reference_names(project, stats)
+	if opts.remove_unused_extensions:
+		remove_unused_extensions(project, stats, opts)
 	for target in project.get("targets", []):
 		stats["dangling_block_refs_fixed"] += _repair_dangling_block_refs(target)
 	return stats
@@ -8348,6 +8972,9 @@ def _check_inputs_match(
 		return False
 	if not oi or not mi or oi[0] != mi[0]:
 		return False
+	if oi[0] in (12, 13) and len(oi) >= 3 and len(mi) >= 3:
+		if oi[2] != mi[2]: return False
+		return oi[1] == mi[1] or bool(getattr(opts, "strip_reference_names", False) and mi[1] == "")
 	if oi[0] in (1, 2):
 		if len(oi) > 1 and len(mi) > 1:
 			if (
@@ -8387,6 +9014,14 @@ def _check_inputs_match(
 def _check_fields_match(original_fields, minified_fields, opts):
 	if original_fields == minified_fields:
 		return True
+	if getattr(opts, "strip_reference_names", False) and isinstance(original_fields, dict) and isinstance(minified_fields, dict) and set(original_fields) == set(minified_fields):
+		good = True
+		for key, ov in original_fields.items():
+			mv = minified_fields[key]
+			if key in ("VARIABLE", "LIST") and isinstance(ov, list) and isinstance(mv, list) and len(ov) == len(mv) and len(ov) >= 2 and ov[1] == mv[1] and mv[0] == "":
+				continue
+			if ov != mv: good = False; break
+		if good: return True
 	if not (
 		opts.compact_field_ids
 		and isinstance(original_fields, dict)
@@ -8486,6 +9121,10 @@ def _check_blocks(
 		if k not in m:
 			continue
 		if k == "opcode":
+			script_opcodes = getattr(opts, "script_rewrite_opcode_edits", {}) or {}
+			expected_opcode = script_opcodes.get((target_index, block_id))
+			if expected_opcode is not None and m[k] == expected_opcode:
+				continue
 			folded_opcodes = getattr(opts, "folded_constant_expression_opcode_edits", {}) or {}
 			expected_opcode = folded_opcodes.get((target_index, block_id))
 			if expected_opcode is not None and m[k] == expected_opcode:
@@ -8530,6 +9169,45 @@ def _check_blocks(
 			procedure_removed = getattr(opts, "procedure_argument_removed_inputs", {}) or {}
 			allowed_procedure_removed = procedure_removed.get((target_index, block_id), set())
 			allowed_gone.update(gone_inputs & set(allowed_procedure_removed))
+			script_removed_inputs = getattr(opts, "script_rewrite_removed_inputs", {}) or {}
+			allowed_gone.update(gone_inputs & set(script_removed_inputs.get((target_index, block_id), set())))
+
+			# Schema-changing script rewrites may rename an input slot along with the opcode.
+			# In particular, control_if_else -> control_if moves the surviving else branch
+			# from SUBSTACK2 to SUBSTACK. A later pass may legitimately update that same
+			# surviving input, so accept either the final value as directly equivalent to the
+			# original value, or the optimizer's recorded input edit as the provenance.
+			script_opcodes = getattr(opts, "script_rewrite_opcode_edits", {}) or {}
+			expected_script_opcode = script_opcodes.get((target_index, block_id))
+			script_input_edits = getattr(opts, "script_rewrite_input_edits", {}) or {}
+			recorded_substack = script_input_edits.get((target_index, block_id, "SUBSTACK"))
+			script_removed = getattr(opts, "script_rewrite_removed_inputs", {}) or {}
+			recorded_removed = set(script_removed.get((target_index, block_id), set()))
+			if (
+				o.get("opcode") == "control_if_else"
+				and expected_script_opcode == "control_if"
+				and gone_inputs == {"SUBSTACK2"}
+				and extra_inputs == {"SUBSTACK"}
+				and "SUBSTACK2" in recorded_removed
+				and (
+					_check_inputs_match(
+						o["inputs"]["SUBSTACK2"],
+						m["inputs"]["SUBSTACK"],
+						opts, original_blocks, remaining_blocks, target_index
+					)
+					or (
+						recorded_substack is not None
+						and _check_inputs_match(
+							recorded_substack,
+						m["inputs"]["SUBSTACK"],
+						opts, original_blocks, remaining_blocks, target_index
+						)
+					)
+				)
+			):
+				gone_inputs.clear()
+				extra_inputs.clear()
+
 			if extra_inputs or gone_inputs - allowed_gone:
 				return f"{where} (opcode: {o.get('opcode')}): input names changed. Original inputs: {sorted(o['inputs'])}, minified inputs: {sorted(m['inputs'])}"
 			for name in set(o["inputs"]) & set(m["inputs"]):
@@ -8590,6 +9268,10 @@ def _check_blocks(
 					)
 				):
 					continue
+				script_inputs = getattr(opts, "script_rewrite_input_edits", {}) or {}
+				script_input = script_inputs.get((target_index, block_id, name))
+				if script_input is not None and (script_input == mi or _check_inputs_match(script_input, mi, opts, original_blocks, remaining_blocks, target_index)):
+					continue
 				simplified_inputs = getattr(opts, "simplified_block_input_edits", {}) or {}
 				simplified_input = simplified_inputs.get((target_index, block_id, name))
 				if simplified_input is not None and (
@@ -8611,6 +9293,7 @@ def _check_blocks(
 		else:
 			link_edits = getattr(opts, "variable_setter_link_edits", None) or {}
 			fold_link_edits = getattr(opts, "folded_constant_expression_link_edits", None) or {}
+			script_link_edits = getattr(opts, "script_rewrite_link_edits", None) or {}
 			group_link_edits = getattr(opts, "grouped_sequence_link_edits", None) or {}
 			simplified_link_edits = getattr(opts, "simplified_block_link_edits", None) or {}
 			if k in ("next", "parent"):
@@ -8622,6 +9305,8 @@ def _check_blocks(
 					expected_link = group_link_edits.get(link_key)
 				if expected_link is None:
 					expected_link = simplified_link_edits.get(link_key)
+				if expected_link is None:
+					expected_link = script_link_edits.get(link_key)
 				if expected_link is not None and m[k] == expected_link:
 					continue
 			if (
@@ -9047,6 +9732,9 @@ def _expected_removed_blocks(project, opts):
 		merged_removed = getattr(opts, "merged_procedure_removed_blocks", ())
 		if ti < len(merged_removed):
 			ids.update(merged_removed[ti])
+		script_removed = getattr(opts, "script_rewrite_removed_blocks", ())
+		if ti < len(script_removed):
+			ids.update(script_removed[ti])
 		allowed.append(ids)
 	return allowed
 
@@ -9073,6 +9761,22 @@ def _target_default_properties(target):
 		"rotationStyle": "all around",
 	}
 
+
+
+def _reference_primitive_head_equal(original, minified, opts):
+	if not (isinstance(original, list) and isinstance(minified, list)):
+		return False
+	if original[:3] == minified[:3]:
+		return True
+	return bool(
+		getattr(opts, "strip_reference_names", False)
+		and len(original) >= 3
+		and len(minified) >= 3
+		and original[0] in (12, 13)
+		and minified[0] == original[0]
+		and minified[1] == ""
+		and original[2] == minified[2]
+	)
 
 def verify(original_path, minified_path, opts):
 	if opts.lossless:
@@ -9180,6 +9884,14 @@ def verify(original_path, minified_path, opts):
 			_restore_identifier_names(mini, opts.renamed_identifiers)
 
 		for key in set(orig) | set(mini):
+			if key == "extensions" and getattr(opts, "remove_unused_extensions", False):
+				original_ext = orig.get("extensions", [])
+				minified_ext = mini.get("extensions", [])
+				removed_ext = getattr(opts, "removed_extensions", set()) or set()
+				expected_ext = [x for x in original_ext if x not in removed_ext]
+				if minified_ext != expected_ext:
+					return False, f"Top-level extensions changed unexpectedly: original {original_ext!r}, minified {minified_ext!r}, removed {sorted(removed_ext)!r}"
+				continue
 			if key not in ("targets", "monitors") and orig.get(key) != mini.get(key):
 				if key == "meta" and opts.remove_project_meta:
 					mo = orig.get("meta") or {}
@@ -9354,6 +10066,8 @@ def verify(original_path, minified_path, opts):
 					vm = tm_vars[vid]
 					if vo == vm:
 						continue
+					if getattr(opts, "compact_data_literals", False) and _compact_data_entry_equal(vo, vm):
+						continue
 					if (
 						opts.normalize_numbers
 						and isinstance(vo, list)
@@ -9405,6 +10119,8 @@ def verify(original_path, minified_path, opts):
 				lm = tm_lists[lid]
 				if lo == lm:
 					continue
+				if getattr(opts, "compact_data_literals", False) and _compact_data_entry_equal(lo, lm):
+					continue
 				allow_numeric_reencoding = (
 					opts.normalize_numbers
 					or getattr(opts, "optimize_json", False)
@@ -9449,6 +10165,9 @@ def verify(original_path, minified_path, opts):
 			)
 			if ti < len(group_new_block_sets):
 				allowed_new_blocks = set(allowed_new_blocks) | set(group_new_block_sets[ti])
+			script_new_block_sets = getattr(opts, "script_rewrite_new_blocks", None) or []
+			if ti < len(script_new_block_sets):
+				allowed_new_blocks = set(allowed_new_blocks) | set(script_new_block_sets[ti])
 			unexpected_blocks = (
 				set(tm["blocks"]) - set(to["blocks"]) - allowed_new_blocks
 			)
@@ -9474,7 +10193,7 @@ def verify(original_path, minified_path, opts):
 						isinstance(bo, list)
 						and isinstance(bm, list)
 						and len(bo) == len(bm)
-						and bo[:3] == bm[:3]
+						and _reference_primitive_head_equal(bo, bm, opts)
 						and all(_num_eq(x, y, opts.normalize_epsilon) or x == y for x, y in zip(bo[3:], bm[3:]))
 					)
 					if not (ok and (opts.positions or bo == bm)):
@@ -10382,6 +11101,14 @@ if __name__ == "__main__":
 				"--deduplicate-procedures",
 			)
 		),
+		branch_swapping=all_optimizations or any(f in flags for f in ("--branch-swapping", "--swap-branches", "--branch-swap")),
+		trivial_loops=all_optimizations or any(f in flags for f in ("--trivial-loops", "--simplify-trivial-loops")),
+		nested_conditionals=all_optimizations or any(f in flags for f in ("--nested-conditionals", "--merge-nested-conditionals", "--merge-nested-ifs")),
+		associative_constant_merging=any(f in flags for f in ("--associative-constants", "--merge-associative-constants", "--reassociate-constants")),
+		script_constant_propagation=all_optimizations or any(f in flags for f in ("--script-constant-propagation", "--propagate-script-constants", "--constant-propagation")),
+		strip_reference_names=any(f in flags for f in ("--strip-reference-names", "--drop-reference-names", "--empty-reference-names")),
+		compact_data_literals=any(f in flags for f in ("--compact-data-literals", "--numeric-data-literals", "--convert-numeric-data")),
+		remove_unused_extensions=any(f in flags for f in ("--remove-unused-extensions", "--unused-extensions")),
 		group_similar_sequences="--group-similar-sequences" in flags,
 		sequence_threshold=values.get("--sequence-threshold", 3),
 		compress_assets=all_optimizations or "--compress-assets" in flags,
