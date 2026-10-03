@@ -74,37 +74,21 @@ def _mapped_block_id(value, block_ids):
 
 
 def _replace_input_block_ids(value, block_ids):
-	if not isinstance(value, list) or not value:
-		return
-	if value[0] in (1, 2) and len(value) > 1:
-		value[1] = _mapped_block_id(value[1], block_ids)
-	elif value[0] == 3:
-		if len(value) > 1:
-			value[1] = _mapped_block_id(value[1], block_ids)
-		if len(value) > 2:
-			if isinstance(value[2], str):
-				value[2] = _mapped_block_id(value[2], block_ids)
-			else:
-				_replace_input_block_ids(value[2], block_ids)
+	for node in _iter_scratch_input_nodes(value):
+		tag = node[0]
+		if tag in (1, 2) and len(node) > 1:
+			node[1] = _mapped_block_id(node[1], block_ids)
+		elif tag == 3:
+			if len(node) > 1:
+				node[1] = _mapped_block_id(node[1], block_ids)
+			if len(node) > 2:
+				node[2] = _mapped_block_id(node[2], block_ids)
 
 
 def _count_input_block_refs(value, blocks, refs):
-	if not isinstance(value, list) or not value:
-		return
-	if value[0] in (1, 2) and len(value) > 1:
-		if isinstance(value[1], str) and value[1] in blocks:
-			refs[value[1]] += 1
-	elif value[0] == 3:
-		if len(value) > 1 and isinstance(value[1], str) and value[1] in blocks:
-			refs[value[1]] += 1
-		if len(value) > 2:
-			if isinstance(value[2], str) and value[2] in blocks:
-				refs[value[2]] += 1
-			else:
-				_count_input_block_refs(value[2], blocks, refs)
-	else:
-		for v in value:
-			_count_input_block_refs(v, blocks, refs)
+	for ref in _iter_input_block_refs(value):
+		if ref in blocks:
+			refs[ref] += 1
 
 
 def _count_block_references(target):
@@ -197,22 +181,9 @@ def _dangling_block_ids(target):
 
 
 def _collect_dangling_in_input(value, ids, dangling):
-	if not isinstance(value, list) or not value:
-		return
-	if value[0] in (1, 2) and len(value) > 1:
-		if isinstance(value[1], str) and value[1] not in ids:
-			dangling.add(value[1])
-	elif value[0] == 3:
-		if len(value) > 1 and isinstance(value[1], str) and value[1] not in ids:
-			dangling.add(value[1])
-		if len(value) > 2:
-			if isinstance(value[2], str) and value[2] not in ids:
-				dangling.add(value[2])
-			else:
-				_collect_dangling_in_input(value[2], ids, dangling)
-	else:
-		for v in value:
-			_collect_dangling_in_input(v, ids, dangling)
+	for ref in _iter_input_block_refs(value):
+		if ref not in ids:
+			dangling.add(ref)
 
 
 def strip_sprite_comments(project, stats):
@@ -788,14 +759,33 @@ def clear_large_lists(project, to_clear, stats):
 		entry[1] = []
 
 
-def _walk_block_values(value):
-	yield value
-	if isinstance(value, dict):
-		for v in value.values():
-			yield from _walk_block_values(v)
-	elif isinstance(value, list):
-		for v in value:
-			yield from _walk_block_values(v)
+def _iter_scratch_input_nodes(value):
+	"""Iterate serialized Scratch input nodes without walking arbitrary JSON.
+
+	Scratch input values have a small tagged grammar: tags 1/2 contain one
+	primary value, tag 3 contains primary+shadow, and other primitive tags are
+	flat. Unknown nested lists are still followed defensively, but dictionaries
+	are not recursively traversed because they are not part of the input grammar.
+	"""
+	stack = [value]
+	while stack:
+		node = stack.pop()
+		if not isinstance(node, list) or not node:
+			continue
+		yield node
+		tag = node[0]
+		if tag in (1, 2):
+			if len(node) > 1 and isinstance(node[1], list):
+				stack.append(node[1])
+		elif tag == 3:
+			if len(node) > 2 and isinstance(node[2], list):
+				stack.append(node[2])
+			if len(node) > 1 and isinstance(node[1], list):
+				stack.append(node[1])
+		else:
+			for child in node[1:]:
+				if isinstance(child, list):
+					stack.append(child)
 
 
 def _field_id(block, names):
@@ -856,15 +846,26 @@ def _collect_data_references(project, var_owners=None, list_owners=None):
 		for bid, block in target.get("blocks", {}).items():
 			b_op = block.get("opcode") if isinstance(block, dict) else "primitive"
 			desc = f"block {bid!r} ({b_op}) in {tname!r}"
-			for v in _walk_block_values(block):
-				if isinstance(v, list) and v:
-					tag = v[0]
-					if tag == 12 and len(v) > 2 and isinstance(v[2], str):
-						add_var_ref(ti, v[2], desc)
-					elif tag == 13 and len(v) > 2 and isinstance(v[2], str):
-						add_list_ref(ti, v[2], desc)
-					elif tag == 11 and len(v) > 2 and isinstance(v[2], str):
-						broadcast_refs.setdefault(v[2], []).append(desc)
+
+			if isinstance(block, list) and len(block) > 2 and isinstance(block[2], str):
+				if block[0] == 12:
+					add_var_ref(ti, block[2], desc)
+				elif block[0] == 13:
+					add_list_ref(ti, block[2], desc)
+				elif block[0] == 11:
+					broadcast_refs.setdefault(block[2], []).append(desc)
+
+			for v in ((block.get("inputs") or {}).values() if isinstance(block, dict) else ()):
+				for node in _iter_scratch_input_nodes(v):
+					if len(node) <= 2 or not isinstance(node[2], str):
+						continue
+					tag = node[0]
+					if tag == 12:
+						add_var_ref(ti, node[2], desc)
+					elif tag == 13:
+						add_list_ref(ti, node[2], desc)
+					elif tag == 11:
+						broadcast_refs.setdefault(node[2], []).append(desc)
 
 			if not isinstance(block, dict):
 				continue
@@ -1184,31 +1185,22 @@ def rename_variable_list_ids(
 
 
 def _replace_nested_primitive_ids(value, var_map, list_map):
-	if isinstance(value, list):
-		if len(value) > 2 and value[0] == 12 and value[2] in var_map:
-			value[2] = var_map[value[2]]
-		elif len(value) > 2 and value[0] == 13 and value[2] in list_map:
-			value[2] = list_map[value[2]]
-		for v in value:
-			_replace_nested_primitive_ids(v, var_map, list_map)
-	elif isinstance(value, dict):
-		for v in value.values():
-			_replace_nested_primitive_ids(v, var_map, list_map)
+	for node in _iter_scratch_input_nodes(value):
+		if len(node) > 2 and node[0] == 12 and node[2] in var_map:
+			node[2] = var_map[node[2]]
+		elif len(node) > 2 and node[0] == 13 and node[2] in list_map:
+			node[2] = list_map[node[2]]
 
 
 def _replace_broadcast_ids_in_value(value, mapping):
-	if not isinstance(value, list) or not value:
-		return
-	if (
-		len(value) > 2
-		and value[0] == 11
-		and isinstance(value[2], str)
-		and value[2] in mapping
-	):
-		value[2] = mapping[value[2]]
-	else:
-		for v in value:
-			_replace_broadcast_ids_in_value(v, mapping)
+	for node in _iter_scratch_input_nodes(value):
+		if (
+			len(node) > 2
+			and node[0] == 11
+			and isinstance(node[2], str)
+			and node[2] in mapping
+		):
+			node[2] = mapping[node[2]]
 
 
 def _collect_broadcast_references(project):
@@ -1244,14 +1236,12 @@ def _collect_broadcast_references(project):
 
 
 def _collect_broadcast_refs_in_value(value, add, desc=None):
-	if not isinstance(value, list) or not value:
-		return
-	if len(value) > 2 and value[0] == 11 and isinstance(value[2], str):
-		name = value[1] if len(value) > 1 and isinstance(value[1], str) else None
-		add(value[2], name, desc)
-		return
-	for v in value:
-		_collect_broadcast_refs_in_value(v, add, desc)
+	# Broadcast menus are Scratch primitive tag 11; walk only the serialized
+	# input grammar rather than recursively scanning arbitrary JSON containers.
+	for node in _iter_scratch_input_nodes(value):
+		if len(node) > 2 and node[0] == 11 and isinstance(node[2], str):
+			name = node[1] if len(node) > 1 and isinstance(node[1], str) else None
+			add(node[2], name, desc)
 
 
 def _all_broadcast_ids(project):
@@ -2301,39 +2291,54 @@ def _is_hat(block):
 	)
 
 
-def _build_block_graph(target):
-	blocks = target.get("blocks", {})
-	edges = {}
-	for bid, b in blocks.items():
-		if not isinstance(b, dict):
-			edges[bid] = set()
-			continue
-		out = set()
-		nxt = b.get("next")
-		if isinstance(nxt, str) and nxt in blocks:
-			out.add(nxt)
-		for v in (b.get("inputs") or {}).values():
-			_collect_block_refs(v, blocks, out)
-		edges[bid] = out
-	return edges
+class _ScratchGraphIndex:
+	__slots__ = ("target", "edges", "parents", "incoming")
+
+	def __init__(self, target):
+		self.target = target
+		self.edges = {}
+		self.parents = {}
+		self.incoming = Counter()
+		self.rebuild()
+
+	def rebuild(self):
+		blocks = self.target.get("blocks", {})
+		edges = {}
+		parents = {}
+		incoming = Counter()
+		for bid, block in blocks.items():
+			out = set()
+			if isinstance(block, dict):
+				nxt = block.get("next")
+				if isinstance(nxt, str) and nxt in blocks:
+					out.add(nxt)
+					incoming[nxt] += 1
+					parents.setdefault(nxt, set()).add(bid)
+				for value in (block.get("inputs") or {}).values():
+					# `_input_block_ids` historically de-duplicates references within
+					# one serialized input, so preserve that exact multiplicity rule.
+					for ref in set(_iter_input_block_refs(value)):
+						if ref in blocks:
+							out.add(ref)
+						incoming[ref] += 1
+						parents.setdefault(ref, set()).add(bid)
+			edges[bid] = out
+		self.edges = edges
+		self.parents = parents
+		self.incoming = incoming
+		return self
+
+
+def _build_block_graph(target, graph=None):
+	if graph is None:
+		graph = _ScratchGraphIndex(target)
+	return graph.edges
 
 
 def _collect_block_refs(value, blocks, out):
-	if isinstance(value, list):
-		if value and value[0] in (1, 2, 3):
-			if len(value) > 1 and isinstance(value[1], str) and value[1] in blocks:
-				out.add(value[1])
-			if value[0] == 3 and len(value) > 2:
-				if isinstance(value[2], str) and value[2] in blocks:
-					out.add(value[2])
-				else:
-					_collect_block_refs(value[2], blocks, out)
-		else:
-			for v in value:
-				_collect_block_refs(v, blocks, out)
-	elif isinstance(value, dict):
-		for v in value.values():
-			_collect_block_refs(v, blocks, out)
+	for ref in _iter_input_block_refs(value):
+		if ref in blocks:
+			out.add(ref)
 
 
 def _repair_dangling_block_ref(value, blocks):
@@ -2522,7 +2527,8 @@ def remove_unreachable_blocks(project, stats, stat_key="unreachable_blocks_remov
 			for bid, b in blocks.items()
 			if isinstance(b, list) or (isinstance(b, dict) and b.get("topLevel"))
 		}
-		edges = _build_block_graph(target)
+		graph = _ScratchGraphIndex(target)
+		edges = graph.edges
 		reachable = set()
 		stack = list(roots)
 
@@ -2586,25 +2592,9 @@ def _sequence_reporter_block(block):
 
 
 def _sequence_input_refs(value, blocks):
-	if not isinstance(value, list) or not value:
-		return
-	tag = value[0]
-	if tag in (1, 2):
-		if len(value) > 1 and isinstance(value[1], str) and value[1] in blocks:
-			yield value[1]
-		elif len(value) > 1 and isinstance(value[1], (list, dict)):
-			yield from _sequence_input_refs(value[1], blocks)
-		return
-	if tag == 3:
-		for item in value[1:3]:
-			if isinstance(item, str) and item in blocks:
-				yield item
-			elif isinstance(item, (list, dict)):
-				yield from _sequence_input_refs(item, blocks)
-		return
-	for item in value[1:]:
-		if isinstance(item, (list, dict)):
-			yield from _sequence_input_refs(item, blocks)
+	for ref in _iter_input_block_refs(value):
+		if ref in blocks:
+			yield ref
 
 
 def _sequence_inline_parameterizable(item):
@@ -2751,38 +2741,30 @@ def _sequence_compare(base, other, blocks):
 	return diff_positions
 
 
-def _sequence_collect_closure(sequence, blocks):
+def _sequence_collect_closure(sequence, blocks, graph=None):
+	if graph is None:
+		graph = _ScratchGraphIndex({"blocks": blocks})
 	closure = set(sequence)
 	stack = list(sequence)
 	while stack:
 		bid = stack.pop()
-		block = blocks.get(bid)
-		if not isinstance(block, dict):
-			continue
-		for value in (block.get("inputs") or {}).values():
-			for ref in _sequence_input_refs(value, blocks):
-				if ref not in closure:
-					closure.add(ref)
-					stack.append(ref)
+		for ref in graph.edges.get(bid, ()):
+			if ref not in closure:
+				closure.add(ref)
+				stack.append(ref)
 	return closure
 
 
-def _sequence_has_external_owner(closure, sequence, blocks, comments):
+def _sequence_has_external_owner(closure, sequence, blocks, comments, graph=None):
+	if graph is None:
+		graph = _ScratchGraphIndex({"blocks": blocks})
 	root = sequence[0]
 	root_parent = blocks.get(root, {}).get("parent") if isinstance(blocks.get(root), dict) else None
-	for owner_id, block in blocks.items():
-		if owner_id in closure or not isinstance(block, dict):
-			continue
-		nxt = block.get("next")
-		if isinstance(nxt, str) and nxt in closure:
-			if owner_id == root_parent and nxt == root:
+	for child_id in closure:
+		for owner_id in graph.parents.get(child_id, ()):
+			if owner_id in closure:
 				continue
-			return True
-		for input_name, value in (block.get("inputs") or {}).items():
-			refs = set(_sequence_input_refs(value, blocks))
-			if not (refs & closure):
-				continue
-			if owner_id == root_parent and root in refs and refs <= {root}:
+			if child_id == root and owner_id == root_parent:
 				continue
 			return True
 	for comment in comments.values():
@@ -2928,6 +2910,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks") or {}
 		comments = target.get("comments") or {}
+		graph = _ScratchGraphIndex(target)
 		runs = _collect_linear_sequence_runs(blocks)
 		buckets = {}
 		for sequence in runs:
@@ -2972,10 +2955,10 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				continue
 
 			closures = {
-				tuple(seq): _sequence_collect_closure(seq, blocks) for seq in sequences
+				tuple(seq): _sequence_collect_closure(seq, blocks, graph=graph) for seq in sequences
 			}
 			if any(
-				_sequence_has_external_owner(closure, seq, blocks, comments)
+				_sequence_has_external_owner(closure, seq, blocks, comments, graph=graph)
 				for seq, closure in ((seq, closures[tuple(seq)]) for seq in sequences)
 			):
 				continue
@@ -3278,6 +3261,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			stats["sequence_blocks_removed"] += len(removed)
 			stats["sequence_blocks_added"] += len(generated)
 			stats["sequence_bytes_saved"] += byte_delta
+			graph.rebuild()
 
 
 def remove_unused_procedures(project, stats):
@@ -3289,13 +3273,11 @@ def remove_unused_procedures(project, stats):
 		if not blocks:
 			continue
 
+		graph = _ScratchGraphIndex(target)
 		children = {}
-		for bid, block in blocks.items():
-			if not isinstance(block, dict):
-				continue
-			parent = block.get("parent")
-			if isinstance(parent, str) and parent in blocks:
-				children.setdefault(parent, set()).add(bid)
+		for parent_id, child_ids in graph.edges.items():
+			if child_ids:
+				children[parent_id] = set(child_ids)
 
 		definition_blocks = (
 			{}
@@ -4302,15 +4284,17 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 
 def _input_block_ids(value, blocks):
-	refs = set()
-	_serialized_input_refs(value, refs)
-	return {ref for ref in refs if ref in blocks}
+	return {ref for ref in _iter_input_block_refs(value) if ref in blocks}
 
 
-def _exclusive_input_block_subtree(value, blocks, owner_id):
-	roots = _input_block_ids(value, blocks)
+def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
+	roots = _direct_input_block_refs(value, blocks)
 	if not roots:
 		return set()
+
+	if graph is None:
+		# keep the legacy API usable for callers outside hot paths
+		graph = _ScratchGraphIndex({"blocks": blocks})
 
 	candidate = set()
 	stack = list(roots)
@@ -4324,25 +4308,20 @@ def _exclusive_input_block_subtree(value, blocks, owner_id):
 		candidate.add(bid)
 		if block.get("topLevel") is True:
 			return None
-		nxt = block.get("next")
-		if isinstance(nxt, str) and nxt in blocks:
-			stack.append(nxt)
-		for value2 in (block.get("inputs") or {}).values():
-			stack.extend(_input_block_ids(value2, blocks))
+		stack.extend(graph.edges.get(bid, ()))
 
-	# any input/next edge from outside -> the blocks are shared
-	for bid, block in blocks.items():
-		if bid in candidate or bid == owner_id or not isinstance(block, dict):
-			continue
-		nxt = block.get("next")
-		if isinstance(nxt, str) and nxt in candidate:
-			return None
-		for value2 in (block.get("inputs") or {}).values():
-			if _input_block_ids(value2, blocks) & candidate:
+	for bid in candidate:
+		owners = graph.parents.get(bid, ())
+		if bid in roots:
+			if any(owner_id != owner for owner in owners):
+				return None
+			if owner_id not in owners:
+				return None
+		else:
+			if any(owner not in candidate for owner in owners):
 				return None
 
 	return candidate
-
 
 def _reparent_serialized_input(value, blocks, parent_id):
 	for bid in _direct_input_block_refs(value, blocks):
@@ -4410,6 +4389,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 
 	for ti, target in enumerate(targets):
 		blocks = target.get("blocks") or {}
+		graph = _ScratchGraphIndex(target)
 		comments = target.get("comments") or {}
 		commented_ids = {
 			c.get("blockId")
@@ -4463,18 +4443,18 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 			if rhs_id in commented_ids:
 				continue
 
-			rhs_closure = _exclusive_input_block_subtree(rhs_value, blocks, set_id)
+			rhs_closure = _exclusive_input_block_subtree(rhs_value, blocks, set_id, graph=graph)
 			if rhs_closure is None or rhs_id not in rhs_closure:
 				continue
 
 			left_closure = _exclusive_input_block_subtree(
-				left_raw, blocks, rhs_id
+				left_raw, blocks, rhs_id, graph=graph
 			)
 			if left_closure is None:
 				continue
 
 			right_closure = _exclusive_input_block_subtree(
-				right_raw, blocks, rhs_id
+				right_raw, blocks, rhs_id, graph=graph
 			)
 			if right_closure is None:
 				continue
@@ -4503,6 +4483,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				for bid in removed:
 					blocks.pop(bid, None)
 				opts.simplified_block_removed_blocks[ti].update(removed)
+				graph.rebuild()
 
 				total += 1
 				add_count += 1
@@ -4533,6 +4514,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				for bid in removed:
 					blocks.pop(bid, None)
 				opts.simplified_block_removed_blocks[ti].update(removed)
+				graph.rebuild()
 
 				total += 1
 				subtract_count += 1
@@ -4553,6 +4535,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				for bid in removed:
 					blocks.pop(bid, None)
 				opts.simplified_block_removed_blocks[ti].update(removed)
+			graph.rebuild()
 
 			total += 1
 			subtract_count += 1
@@ -4606,7 +4589,7 @@ def _expand_removed_closure(ids, blocks, keep=frozenset()):
 	return out
 
 
-def _simplify_boolean_identity_input(value, blocks, parent_id=None):
+def _simplify_boolean_identity_input(value, blocks, parent_id=None, incoming_refs=None, graph=None):
 	"""
 	Simplify AND/OR inputs when one operand is a compile-time boolean.
 
@@ -4644,7 +4627,11 @@ def _simplify_boolean_identity_input(value, blocks, parent_id=None):
 	operator = block.get("opcode")
 
 	def discard(raw, constant_result, constant_ids):
-		dead_ids = _exclusive_input_block_subtree(raw, blocks, block_id)
+		dead_ids = (
+			_exclusive_input_block_subtree_fast(raw, blocks, block_id, incoming_refs, graph=graph)
+			if graph is not None and incoming_refs is not None
+			else _exclusive_input_block_subtree(raw, blocks, block_id)
+		)
 		if dead_ids is None:
 			return None
 		replacement, _ = _constant_to_scratch_input(
@@ -4655,7 +4642,11 @@ def _simplify_boolean_identity_input(value, blocks, parent_id=None):
 		)
 
 	def preserve(raw, constant_ids):
-		owned_ids = _exclusive_input_block_subtree(raw, blocks, block_id)
+		owned_ids = (
+			_exclusive_input_block_subtree_fast(raw, blocks, block_id, incoming_refs, graph=graph)
+			if graph is not None and incoming_refs is not None
+			else _exclusive_input_block_subtree(raw, blocks, block_id)
+		)
 		if owned_ids is None:
 			return None
 		return copy.deepcopy(raw), _expand_removed_closure(
@@ -4707,22 +4698,15 @@ def _direct_input_block_refs(value, blocks):
 	return tuple(refs)
 
 
-def _incoming_block_ref_counts(target):
-	blocks = target.get("blocks") or {}
-	refs = Counter()
-	for block in blocks.values():
-		if not isinstance(block, dict):
-			continue
-		nxt = block.get("next")
-		if isinstance(nxt, str) and nxt in blocks:
-			refs[nxt] += 1
-		for value in (block.get("inputs") or {}).values():
-			for bid in _input_block_ids(value, blocks):
-				refs[bid] += 1
-	return refs
+def _incoming_block_ref_counts(target, graph=None):
+	if graph is None:
+		graph = _ScratchGraphIndex(target)
+	return graph.incoming
 
 
-def _exclusive_input_block_subtree_fast(value, blocks, owner_id, incoming_refs):
+def _exclusive_input_block_subtree_fast(value, blocks, owner_id, incoming_refs, graph=None):
+	if graph is None:
+		graph = _ScratchGraphIndex({"blocks": blocks})
 	roots = _direct_input_block_refs(value, blocks)
 	if not roots:
 		return set()
@@ -4739,20 +4723,15 @@ def _exclusive_input_block_subtree_fast(value, blocks, owner_id, incoming_refs):
 		if incoming_refs.get(bid, 0) != 1:
 			return None
 		candidate.add(bid)
-		nxt = block.get("next")
-		if isinstance(nxt, str) and nxt in blocks:
-			stack.append(nxt)
-		for value2 in (block.get("inputs") or {}).values():
-			stack.extend(_input_block_ids(value2, blocks))
+		stack.extend(graph.edges.get(bid, ()))
 
 	roots_set = set(roots)
 	for bid in candidate:
-		block = blocks.get(bid)
-		parent = block.get("parent") if isinstance(block, dict) else None
+		owners = graph.parents.get(bid, set())
 		if bid in roots_set:
-			if parent != owner_id:
+			if owner_id not in owners or len(owners) != 1:
 				return None
-		elif parent not in candidate:
+		elif not owners or not owners <= candidate:
 			return None
 	return candidate
 
@@ -4769,21 +4748,18 @@ def _constant_to_scratch_input(constant, blocks, parent_id):
 	return None, set()
 
 
-def _fold_ids_have_external_refs(folded_ids, blocks, owner_id):
+def _fold_ids_have_external_refs(folded_ids, blocks, owner_id, graph=None):
 	folded_ids = set(folded_ids)
-	for bid, block in blocks.items():
-		if bid in folded_ids or bid == owner_id or not isinstance(block, dict):
-			continue
-		nxt = block.get("next")
-		if isinstance(nxt, str) and nxt in folded_ids:
-			return True
-		for value in (block.get("inputs") or {}).values():
-			if _input_block_ids(value, blocks) & folded_ids:
+	if graph is None:
+		graph = _ScratchGraphIndex({"blocks": blocks})
+	for bid in folded_ids:
+		for owner in graph.parents.get(bid, ()):
+			if owner != owner_id and owner not in folded_ids:
 				return True
 	return False
 
 
-def _demorgan_boolean_input(value, blocks, owner_id=None, incoming_refs=None):
+def _demorgan_boolean_input(value, blocks, owner_id=None, incoming_refs=None, graph=None):
 	"""
 	Apply De Morgan's law in exactly one direction:
 
@@ -4861,10 +4837,10 @@ def _demorgan_boolean_input(value, blocks, owner_id=None, incoming_refs=None):
 		return None
 
 	left_owned = _exclusive_input_block_subtree_fast(
-		left_operand, blocks, left_not_id, incoming_refs
+		left_operand, blocks, left_not_id, incoming_refs, graph=graph
 	)
 	right_owned = _exclusive_input_block_subtree_fast(
-		right_operand, blocks, right_not_id, incoming_refs
+		right_operand, blocks, right_not_id, incoming_refs, graph=graph
 	)
 	if left_owned is None or right_owned is None:
 		return None
@@ -4898,6 +4874,138 @@ def _demorgan_boolean_input(value, blocks, owner_id=None, incoming_refs=None):
 	}
 
 
+_NUMERIC_REPORTER_OPCODES = {
+	"operator_add", "operator_subtract", "operator_multiply",
+	"operator_divide", "operator_mod", "operator_round",
+	"operator_mathop", "operator_length", "motion_xposition",
+	"motion_yposition", "motion_direction", "looks_size",
+	"looks_costumenumbername", "looks_backdropnumbername",
+	"sound_volume", "sensing_timer", "sensing_dayssince2000",
+}
+
+_BOOLEAN_REPORTER_OPCODES = {
+	"operator_not", "operator_and", "operator_or", "operator_gt",
+	"operator_lt", "operator_equals", "operator_contains",
+	"sensing_touchingobject", "sensing_touchingcolor",
+	"sensing_keypressed", "sensing_mousedown", "sensing_loud",
+	"sensing_askandwait", "video_sensing_on",
+}
+
+
+def _value_is_definitely_numeric(value, blocks, visiting=frozenset()):
+	constant = _constant_expression_from_input(value, blocks, visiting)
+	if constant is not None:
+		return constant[0][0] in ("number", "bool")
+	if not (isinstance(value, list) and len(value) > 1):
+		return False
+	child = value[1]
+	if not isinstance(child, str) or child in visiting:
+		return False
+	block = blocks.get(child)
+	return isinstance(block, dict) and block.get("opcode") in _NUMERIC_REPORTER_OPCODES
+
+
+def _value_is_definitely_boolean(value, blocks, visiting=frozenset()):
+	constant = _constant_expression_from_input(value, blocks, visiting)
+	if constant is not None:
+		return constant[0][0] == "bool"
+	if not (isinstance(value, list) and len(value) > 1):
+		return False
+	child = value[1]
+	if not isinstance(child, str) or child in visiting:
+		return False
+	block = blocks.get(child)
+	if not isinstance(block, dict):
+		return False
+	op = block.get("opcode")
+	return op in _BOOLEAN_REPORTER_OPCODES or op == "argument_reporter_boolean"
+
+
+def _simplify_double_boolean_negation(value, blocks, owner_id, input_name, incoming_refs, graph):
+	if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
+		return None
+	outer_id = value[1]
+	if not isinstance(outer_id, str) or outer_id == owner_id:
+		return None
+	outer = blocks.get(outer_id)
+	if not isinstance(outer, dict) or outer.get("opcode") != "operator_not":
+		return None
+	inner_raw = (outer.get("inputs") or {}).get("OPERAND")
+	if not (isinstance(inner_raw, list) and len(inner_raw) > 1 and inner_raw[0] in (2, 3)):
+		return None
+	inner_id = inner_raw[1]
+	if not isinstance(inner_id, str) or inner_id in (owner_id, outer_id):
+		return None
+	inner = blocks.get(inner_id)
+	if not isinstance(inner, dict) or inner.get("opcode") != "operator_not":
+		return None
+	operand = (inner.get("inputs") or {}).get("OPERAND")
+	if operand is None:
+		return None
+	if not (_is_boolean_slot(blocks.get(owner_id), input_name) or _value_is_definitely_boolean(operand, blocks)):
+		return None
+	closure = _exclusive_input_block_subtree_fast(value, blocks, owner_id, incoming_refs, graph=graph)
+	if closure is None or outer_id not in closure or inner_id not in closure:
+		return None
+	preserved_ids = _subtree_block_ids(operand, blocks)
+	removed = closure - preserved_ids
+	if owner_id in removed or not removed:
+		return None
+	return copy.deepcopy(operand), removed
+
+
+def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
+	"""Apply safe numeric identities to definitely-numeric reporter expressions."""
+	if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
+		return None
+	block_id = value[1]
+	if not isinstance(block_id, str) or block_id == owner_id:
+		return None
+	block = blocks.get(block_id)
+	if not isinstance(block, dict) or block.get("next") is not None:
+		return None
+	op = block.get("opcode")
+	if op not in ("operator_add", "operator_subtract", "operator_multiply", "operator_divide"):
+		return None
+	inputs = block.get("inputs") or {}
+	left_raw, right_raw = inputs.get("NUM1"), inputs.get("NUM2")
+	if left_raw is None or right_raw is None:
+		return None
+	left = _constant_expression_from_input(left_raw, blocks)
+	right = _constant_expression_from_input(right_raw, blocks)
+	left_num = _constant_to_number(left[0]) if left is not None else None
+	right_num = _constant_to_number(right[0]) if right is not None else None
+	preserve = None
+	dead_side = None
+	if op == "operator_add":
+		if left_num == 0 and _value_is_definitely_numeric(right_raw, blocks):
+			preserve, dead_side = right_raw, left
+		elif right_num == 0 and _value_is_definitely_numeric(left_raw, blocks):
+			preserve, dead_side = left_raw, right
+	elif op == "operator_subtract":
+		if right_num == 0 and _value_is_definitely_numeric(left_raw, blocks):
+			preserve, dead_side = left_raw, right
+	elif op == "operator_multiply":
+		if left_num == 1 and _value_is_definitely_numeric(right_raw, blocks):
+			preserve, dead_side = right_raw, left
+		elif right_num == 1 and _value_is_definitely_numeric(left_raw, blocks):
+			preserve, dead_side = left_raw, right
+	elif op == "operator_divide":
+		if right_num == 1 and _value_is_definitely_numeric(left_raw, blocks):
+			preserve, dead_side = left_raw, right
+	if preserve is None:
+		return None
+	closure = _exclusive_input_block_subtree_fast(value, blocks, owner_id, incoming_refs, graph=graph)
+	if closure is None or block_id not in closure:
+		return None
+	removed = closure - _subtree_block_ids(preserve, blocks)
+	if owner_id in removed or not removed:
+		return None
+	if dead_side is not None and not (_subtree_block_ids(dead_side, blocks) <= removed):
+		return None
+	return copy.deepcopy(preserve), removed
+
+
 def fold_constant_expressions(project, stats, opts):
 	targets = project.get("targets", [])
 	opts.folded_constant_expression_link_edits = {}
@@ -4909,7 +5017,8 @@ def fold_constant_expressions(project, stats, opts):
 
 	for ti, target in enumerate(targets):
 		blocks = target.get("blocks") or {}
-		incoming_refs = _incoming_block_ref_counts(target)
+		graph = _ScratchGraphIndex(target)
+		incoming_refs = graph.incoming
 		commented_ids = {
 			c.get("blockId")
 			for c in (target.get("comments") or {}).values()
@@ -4923,11 +5032,73 @@ def fold_constant_expressions(project, stats, opts):
 					continue
 
 				for input_name, input_val in list((block.get("inputs") or {}).items()):
+					boolean_negation = _simplify_double_boolean_negation(
+						input_val, blocks, block_id, input_name, incoming_refs, graph
+					)
+					if boolean_negation is not None:
+						replacement, removed_ids = boolean_negation
+						if not _fold_blocked_by_comment(removed_ids, blocks, commented_ids) and not _fold_ids_have_external_refs(removed_ids, blocks, block_id, graph=graph):
+							new_input = copy.deepcopy(replacement)
+							for child_id in _input_block_ids(new_input, blocks):
+								child = blocks.get(child_id)
+								if isinstance(child, dict) and child.get("parent") != block_id:
+									opts.folded_constant_expression_link_edits[(
+									ti, child_id, "parent"
+								)] = block_id
+							_reparent_serialized_input(new_input, blocks, block_id)
+							block.setdefault("inputs", {})[input_name] = new_input
+							opts.folded_constant_expression_inputs[(ti, block_id, input_name)] = copy.deepcopy(new_input)
+							opts.folded_constant_expression_blocks[ti].update(removed_ids)
+							for remove_id in removed_ids:
+								blocks.pop(remove_id, None)
+							graph.rebuild()
+							incoming_refs = graph.incoming
+							stats["boolean_constants_propagated"] += 1
+							folded += 1
+							changed = True
+							break
+
+					if changed:
+						break
+
+					algebraic = _simplify_algebraic_input(
+						input_val, blocks, block_id, incoming_refs, graph
+					)
+					if algebraic is not None:
+						replacement, removed_ids = algebraic
+						if not _fold_blocked_by_comment(removed_ids, blocks, commented_ids) and not _fold_ids_have_external_refs(removed_ids, blocks, block_id, graph=graph):
+							new_input = copy.deepcopy(replacement)
+							if not (_is_boolean_slot(block, input_name) and _is_bare_literal_input(new_input)):
+								for child_id in _input_block_ids(new_input, blocks):
+									child = blocks.get(child_id)
+									if isinstance(child, dict) and child.get("parent") != block_id:
+										opts.folded_constant_expression_link_edits[(
+										ti, child_id, "parent"
+									)] = block_id
+									
+								_reparent_serialized_input(new_input, blocks, block_id)
+								block.setdefault("inputs", {})[input_name] = new_input
+								opts_key = (ti, block_id, input_name)
+								opts.folded_constant_expression_inputs[opts_key] = copy.deepcopy(new_input)
+								opts.folded_constant_expression_blocks[ti].update(removed_ids)
+								for remove_id in removed_ids:
+									blocks.pop(remove_id, None)
+								graph.rebuild()
+								incoming_refs = graph.incoming
+								stats["algebraic_simplifications"] += 1
+								folded += 1
+								changed = True
+								break
+
+					if changed:
+						break
+
 					demorgan = _demorgan_boolean_input(
 						input_val,
 						blocks,
 						owner_id=block_id,
 						incoming_refs=incoming_refs,
+						graph=graph,
 					)
 					if demorgan is not None and not _fold_blocked_by_comment(
 						demorgan["changed_ids"], blocks, commented_ids
@@ -4989,7 +5160,8 @@ def fold_constant_expressions(project, stats, opts):
 						)] = copy.deepcopy(demorgan["new_outer_input"])
 						opts.folded_constant_expression_blocks[ti].add(right_not_id)
 						blocks.pop(right_not_id, None)
-						incoming_refs = _incoming_block_ref_counts(target)
+						graph.rebuild()
+						incoming_refs = graph.incoming
 						changed = True
 						stats["demorgan_rewrites"] += 1
 						break
@@ -4998,14 +5170,18 @@ def fold_constant_expressions(project, stats, opts):
 						break
 
 					identity = _simplify_boolean_identity_input(
-						input_val, blocks, parent_id=block_id
+						input_val,
+						blocks,
+						parent_id=block_id,
+						incoming_refs=incoming_refs,
+						graph=graph,
 					)
 					if identity is not None:
 						replacement, folded_ids = identity
 						if _fold_blocked_by_comment(
 							folded_ids, blocks, commented_ids
 						) or _fold_ids_have_external_refs(
-							folded_ids, blocks, block_id
+							folded_ids, blocks, block_id, graph=graph
 						):
 							continue
 						if block_id not in blocks:
@@ -5033,6 +5209,7 @@ def fold_constant_expressions(project, stats, opts):
 									)] = block_id
 							_reparent_serialized_input(new_input, blocks, block_id)
 						inputs[input_name] = new_input
+						stats["boolean_constants_propagated"] += 1
 						opts.folded_constant_expression_inputs[(
 							ti, block_id, input_name
 						)] = copy.deepcopy(new_input)
@@ -5040,7 +5217,8 @@ def fold_constant_expressions(project, stats, opts):
 						opts.folded_constant_expression_new_blocks[ti].update(new_ids)
 						for remove_id in folded_ids:
 							blocks.pop(remove_id, None)
-						incoming_refs = _incoming_block_ref_counts(target)
+						graph.rebuild()
+						incoming_refs = graph.incoming
 						folded += 1
 						changed = True
 						break
@@ -5053,14 +5231,14 @@ def fold_constant_expressions(project, stats, opts):
 						continue
 
 					owned_ids = _exclusive_input_block_subtree_fast(
-						input_val, blocks, block_id, incoming_refs
+						input_val, blocks, block_id, incoming_refs, graph=graph
 					)
 					if owned_ids is None or not folded_ids <= owned_ids:
 						continue
 					if _fold_blocked_by_comment(
 						owned_ids, blocks, commented_ids
 					) or _fold_ids_have_external_refs(
-						owned_ids, blocks, block_id
+						owned_ids, blocks, block_id, graph=graph
 					):
 						continue
 					if block_id not in blocks:
@@ -5083,7 +5261,8 @@ def fold_constant_expressions(project, stats, opts):
 					opts.folded_constant_expression_new_blocks[ti].update(new_ids)
 					for remove_id in owned_ids:
 						blocks.pop(remove_id, None)
-					incoming_refs = _incoming_block_ref_counts(target)
+					graph.rebuild()
+					incoming_refs = graph.incoming
 					folded += 1
 					changed = True
 					break
@@ -6458,25 +6637,7 @@ def _validate_asset_entries(project, zf, label):
 
 
 def _serialized_input_refs(value, out):
-	if not isinstance(value, list) or not value:
-		return
-	tag = value[0]
-	if tag in (1, 2):
-		if len(value) > 1 and isinstance(value[1], str):
-			out.add(value[1])
-		elif len(value) > 1 and isinstance(value[1], (list, dict)):
-			_serialized_input_refs(value[1], out)
-		return
-	if tag == 3:
-		for item in value[1:3]:
-			if isinstance(item, str):
-				out.add(item)
-			elif isinstance(item, (list, dict)):
-				_serialized_input_refs(item, out)
-		return
-	for item in value[1:]:
-		if isinstance(item, (list, dict)):
-			_serialized_input_refs(item, out)
+	out.update(_iter_input_block_refs(value))
 
 
 def _validate_block_structure(project, label):
@@ -7462,6 +7623,8 @@ STAT_GROUPS = [
 		"Fold constant expressions",
 		[
 			("constant_expressions_folded", "constant expressions folded"),
+			("boolean_constants_propagated", "boolean constants propagated"),
+			("algebraic_simplifications", "algebraic simplifications"),
 			("demorgan_rewrites", "De Morgan rewrites"),
 		],
 	),
