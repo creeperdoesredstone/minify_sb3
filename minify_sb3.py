@@ -2292,6 +2292,7 @@ def _is_hat(block):
 
 
 class _ScratchGraphIndex:
+	"""Cached block graph and reverse edges for a single Scratch target."""
 	__slots__ = ("target", "edges", "parents", "incoming")
 
 	def __init__(self, target):
@@ -3492,6 +3493,93 @@ def remove_sound_metadata(project, stats):
 	return removed
 
 
+def _asset_alias(name, mapping):
+	seen = set()
+	while isinstance(name, str) and name in mapping and name not in seen:
+		seen.add(name)
+		name = mapping[name]
+	return name
+
+
+def deduplicate_assets(project, assets, stats):
+	if not assets:
+		return {}
+
+	referenced = Counter()
+	for target in project.get("targets", []):
+		for kind, key in (("costume", "costumes"), ("sound", "sounds")):
+			for entry in target.get(key, []):
+				name = _asset_filename(entry, kind)
+				if name in assets:
+					referenced[name] += 1
+
+	buckets = {}
+	all_extensions = _ASSET_EXTENSIONS["costume"] | _ASSET_EXTENSIONS["sound"]
+	ext_compat = {
+		"jpeg": "jpeg",
+		"jpg": "jpeg",
+		"wav": "wav",
+		"wave": "wav",
+	}
+	for name, data in assets.items():
+		if not isinstance(name, str) or "." not in name:
+			continue
+		ext = name.rsplit(".", 1)[1].lower()
+		if ext not in all_extensions:
+			continue
+		kind = "costume" if ext in _ASSET_EXTENSIONS["costume"] else "sound"
+		family = ext_compat.get(ext, ext)
+		key = (kind, family, hashlib.md5(data).digest())
+		buckets.setdefault(key, []).append(name)
+
+	mapping = {}
+	for names in buckets.values():
+		if len(names) < 2:
+			continue
+		canonical = min(names, key=lambda n: (-referenced.get(n, 0), n))
+		for duplicate in sorted(names):
+			if duplicate != canonical:
+				mapping[duplicate] = canonical
+
+	for target in project.get("targets", []):
+		for kind, key in (("costume", "costumes"), ("sound", "sounds")):
+			for entry in target.get(key, []):
+				if not isinstance(entry, dict):
+					continue
+				old_name = _asset_filename(entry, kind)
+				new_name = _asset_alias(old_name, mapping)
+				if old_name == new_name or new_name not in assets:
+					continue
+				stem, new_ext = new_name.rsplit(".", 1)
+				entry["assetId"] = stem
+				entry["dataFormat"] = new_ext.lower()
+				if "md5ext" in entry:
+					entry["md5ext"] = new_name
+
+	removed_bytes = 0
+	for old_name in mapping:
+		data = assets.pop(old_name, None)
+		if data is not None:
+			removed_bytes += len(data)
+
+	stats["assets_deduplicated"] += len(mapping)
+	stats["asset_bytes_saved"] += removed_bytes
+	return mapping
+
+
+	removed = 0
+	for target in project.get("targets", []):
+		for sound in target.get("sounds", []):
+			if not isinstance(sound, dict):
+				continue
+			for key in ("rate", "sampleCount"):
+				if key in sound:
+					del sound[key]
+					removed += 1
+	stats["sound_metadata_removed"] += removed
+	return removed
+
+
 def compact_redundant_field_ids(project, stats):
 	count = 0
 	for target in project.get("targets", []):
@@ -4293,7 +4381,7 @@ def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
 		return set()
 
 	if graph is None:
-		# keep the legacy API usable for callers outside hot paths
+		# Keep the legacy API usable for callers outside hot paths.
 		graph = _ScratchGraphIndex({"blocks": blocks})
 
 	candidate = set()
@@ -5006,6 +5094,254 @@ def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 	return copy.deepcopy(preserve), removed
 
 
+def _replace_owner_block_ref(parent_block, old_id, new_id):
+	if not isinstance(parent_block, dict):
+		return None
+	if parent_block.get("next") == old_id:
+		parent_block["next"] = new_id
+		return ("next", None)
+	for name, value in (parent_block.get("inputs") or {}).items():
+		if not isinstance(value, list) or not value:
+			continue
+		if value[0] in (1, 2, 3) and len(value) > 1 and value[1] == old_id:
+			value[1] = new_id
+			return ("input", name)
+	return None
+
+
+def _control_substack(value, blocks):
+	if not isinstance(value, list) or not value or value[0] not in (1, 2, 3):
+		return None
+	if len(value) <= 1:
+		return None
+	ref = value[1]
+	return ref if isinstance(ref, str) and ref in blocks else None
+
+
+def _substack_tail(blocks, closure):
+	if not closure:
+		return None
+	roots = [
+		bid for bid in closure
+		if isinstance(blocks.get(bid), dict)
+		and blocks[bid].get("parent") not in closure
+	]
+	if len(roots) != 1:
+		return None
+	current = roots[0]
+	seen = set()
+	while True:
+		if current in seen or current not in closure:
+			return None
+		seen.add(current)
+		block = blocks.get(current)
+		if not isinstance(block, dict):
+			return None
+		nxt = block.get("next")
+		if nxt is None:
+			return current
+		if not isinstance(nxt, str) or nxt not in closure:
+			return None
+		current = nxt
+
+
+def _simplify_constant_control(blocks, control_id, incoming_refs, graph):
+	"""Eliminate a constant `if`/`if else` by splicing the live branch."""
+	control = blocks.get(control_id)
+	if not isinstance(control, dict):
+		return None
+	opcode = control.get("opcode")
+	if opcode not in ("control_if", "control_if_else"):
+		return None
+	parents = graph.parents.get(control_id, set())
+	if len(parents) != 1:
+		return None
+	owner_id = next(iter(parents))
+	owner = blocks.get(owner_id)
+	if not isinstance(owner, dict) or control.get("parent") != owner_id:
+		return None
+	if control.get("topLevel") is True:
+		return None
+
+	inputs = control.get("inputs") or {}
+	condition_raw = inputs.get("CONDITION")
+	condition = _constant_expression_from_input(condition_raw, blocks)
+	if condition is None:
+		return None
+	condition_bool = _constant_to_bool(condition[0])
+
+	selected_raw = inputs.get("SUBSTACK") if condition_bool else inputs.get("SUBSTACK2")
+	if opcode == "control_if":
+		selected_raw = inputs.get("SUBSTACK") if condition_bool else None
+		dead_raws = [inputs.get("SUBSTACK")] if not condition_bool else []
+	else:
+		dead_raws = [inputs.get("SUBSTACK2") if condition_bool else inputs.get("SUBSTACK")]
+
+	selected_id = _control_substack(selected_raw, blocks)
+	removed = {control_id}
+	condition_closure = set()
+	if condition_raw is not None:
+		condition_closure = _exclusive_input_block_subtree_fast(
+			condition_raw, blocks, control_id, incoming_refs, graph=graph
+		)
+		if condition_closure is None:
+			return None
+		removed.update(condition_closure)
+
+	dead_closures = []
+	for raw in dead_raws:
+		if raw is None:
+			continue
+		closure = _exclusive_input_block_subtree_fast(
+			raw, blocks, control_id, incoming_refs, graph=graph
+		)
+		if closure is None:
+			return None
+		dead_closures.append(closure)
+		removed.update(closure)
+
+	selected_closure = set()
+	selected_tail = None
+	if selected_id is not None:
+		selected_closure = _exclusive_input_block_subtree_fast(
+			selected_raw, blocks, control_id, incoming_refs, graph=graph
+		)
+		if selected_closure is None:
+			return None
+		selected_tail = _substack_tail(blocks, selected_closure)
+		if selected_tail is None:
+			return None
+		if selected_closure & removed:
+			return None
+		if blocks[selected_tail].get("next") is not None:
+			return None
+
+	continuation = control.get("next")
+	if continuation is not None and (
+		not isinstance(continuation, str) or continuation not in blocks
+	):
+		return None
+	if isinstance(continuation, str) and continuation in (selected_closure | removed):
+		return None
+
+	if any((closure & selected_closure) or (isinstance(continuation, str) and continuation in closure)
+		for closure in dead_closures):
+		return None
+	if condition_closure & selected_closure:
+		return None
+
+	replacement = selected_id if selected_id is not None else continuation
+	owner_edge = _replace_owner_block_ref(owner, control_id, replacement)
+	if owner_edge is None:
+		return None
+
+	if selected_id is not None:
+		blocks[selected_id]["parent"] = owner_id
+		blocks[selected_tail]["next"] = continuation
+		if isinstance(continuation, str):
+			blocks[continuation]["parent"] = selected_tail
+	elif isinstance(continuation, str):
+		blocks[continuation]["parent"] = owner_id
+
+	return {
+		"owner_id": owner_id,
+		"owner_edge": owner_edge,
+		"replacement": replacement,
+		"selected_id": selected_id,
+		"selected_tail": selected_tail,
+		"continuation": continuation,
+		"removed": removed,
+	}
+
+
+def simplify_boolean_controls(project, stats, opts):
+	"""Eliminate constant-condition `if`/`if else` branches conservatively."""
+	targets = project.get("targets", [])
+	link_edits = getattr(opts, "folded_constant_expression_link_edits", None)
+	input_edits = getattr(opts, "folded_constant_expression_inputs", None)
+	removed_sets = getattr(opts, "folded_constant_expression_blocks", None)
+	if link_edits is None:
+		opts.folded_constant_expression_link_edits = {}
+		link_edits = opts.folded_constant_expression_link_edits
+	if input_edits is None:
+		opts.folded_constant_expression_inputs = {}
+		input_edits = opts.folded_constant_expression_inputs
+	if removed_sets is None or len(removed_sets) != len(targets):
+		opts.folded_constant_expression_blocks = [set() for _ in targets]
+		removed_sets = opts.folded_constant_expression_blocks
+
+	changes = 0
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		commented_ids = {
+			c.get("blockId")
+			for c in (target.get("comments") or {}).values()
+			if isinstance(c, dict) and c.get("blockId") is not None
+		}
+		commented_ids.update(
+			bid for bid, block in blocks.items()
+			if isinstance(block, dict) and "comment" in block
+		)
+		graph = _ScratchGraphIndex(target)
+
+		while True:
+			made_change = False
+			for control_id, block in list(blocks.items()):
+				if not isinstance(block, dict) or block.get("opcode") not in ("control_if", "control_if_else"):
+					continue
+				result = _simplify_constant_control(blocks, control_id, graph.incoming, graph)
+				if result is None:
+					continue
+				removed = set(result["removed"])
+				if _fold_blocked_by_comment(removed, blocks, commented_ids):
+					# Roll back the speculative edge changes.
+					owner = blocks[result["owner_id"]]
+					edge_kind, edge_name = result["owner_edge"]
+					if edge_kind == "next":
+						owner["next"] = control_id
+					else:
+						owner["inputs"][edge_name][1] = control_id
+					if result["selected_id"] is not None:
+						blocks[result["selected_id"]]["parent"] = control_id
+						blocks[result["selected_tail"]]["next"] = None
+					if isinstance(result["continuation"], str):
+						blocks[result["continuation"]]["parent"] = control_id
+					continue
+
+				owner_id = result["owner_id"]
+				owner = blocks[owner_id]
+				edge_kind, edge_name = result["owner_edge"]
+				replacement = result["replacement"]
+				if edge_kind == "next":
+					link_edits[(ti, owner_id, "next")] = replacement
+				else:
+					input_edits[(ti, owner_id, edge_name)] = copy.deepcopy(
+						owner["inputs"][edge_name]
+					)
+				if result["selected_id"] is not None:
+					link_edits[(ti, result["selected_id"], "parent")] = owner_id
+					link_edits[(ti, result["selected_tail"], "next")] = result["continuation"]
+					if isinstance(result["continuation"], str):
+						link_edits[(ti, result["continuation"], "parent")] = result["selected_tail"]
+				elif isinstance(result["continuation"], str):
+					link_edits[(ti, result["continuation"], "parent")] = owner_id
+
+				removed_sets[ti].update(removed)
+				for remove_id in removed:
+					blocks.pop(remove_id, None)
+				changes += 1
+				stats["boolean_control_simplifications"] += 1
+				stats["control_blocks_removed"] += 1
+				stats["control_branch_blocks_removed"] += len(removed) - 1
+				graph.rebuild()
+				made_change = True
+				break
+			if not made_change:
+				break
+
+	return changes
+
+
 def fold_constant_expressions(project, stats, opts):
 	targets = project.get("targets", [])
 	opts.folded_constant_expression_link_edits = {}
@@ -5641,7 +5977,9 @@ class Options:
 		compact_mutation_metadata=False,
 		fold_constant_variables=False,
 		fold_constant_expressions=False,
+		simplify_boolean_control=False,
 		simplify_blocks=False,
+		deduplicate_assets=False,
 		group_similar_sequences=False,
 		sequence_threshold=3,
 	):
@@ -5697,7 +6035,9 @@ class Options:
 		self.compact_mutation_metadata = compact_mutation_metadata
 		self.fold_constant_variables = fold_constant_variables
 		self.fold_constant_expressions = fold_constant_expressions
+		self.simplify_boolean_control = simplify_boolean_control
 		self.simplify_blocks = simplify_blocks
+		self.deduplicate_assets = deduplicate_assets
 		self.group_similar_sequences = group_similar_sequences
 		self.sequence_threshold = max(1, int(sequence_threshold))
 
@@ -5713,6 +6053,7 @@ class Options:
 		self.renamed_identifiers = {}
 
 		self.wav_conversions = {}
+		self.asset_deduplications = {}
 
 		self.repaired_broadcast_ids = set()
 		self.broadcast_repair_conflicts = {}
@@ -5746,6 +6087,8 @@ def apply_transforms(project, opts: Options, assets=None):
 	stats = minify_blocks(project)
 	if opts.convert_wav_to_mp3 and assets is not None:
 		opts.wav_conversions = convert_wav_sounds_to_mp3(project, assets, stats)
+	if opts.deduplicate_assets and assets is not None:
+		opts.asset_deduplications = deduplicate_assets(project, assets, stats)
 	if opts.comments:
 		strip_sprite_comments(project, stats)
 	if opts.positions:
@@ -5769,6 +6112,8 @@ def apply_transforms(project, opts: Options, assets=None):
 		)
 	if opts.fold_constant_expressions:
 		fold_constant_expressions(project, stats, opts)
+		if opts.simplify_boolean_control:
+			simplify_boolean_controls(project, stats, opts)
 	if opts.simplify_blocks:
 		_simplify_setter_rhs_blocks(project, stats, opts)
 	if opts.group_similar_sequences:
@@ -6730,6 +7075,37 @@ def _validate_block_structure(project, label):
 	return None
 
 
+def _final_asset_name(name, opts):
+	conversions = getattr(opts, "wav_conversions", {}) or {}
+	dedup = getattr(opts, "asset_deduplications", {}) or {}
+	name = conversions.get(name, name)
+	return _asset_alias(name, dedup)
+
+
+def _expected_asset_entry(entry, kind, opts):
+	if not isinstance(entry, dict):
+		return entry
+	expected = dict(entry)
+	old_name = _asset_filename(entry, kind)
+	if old_name is None:
+		return expected
+	conversions = getattr(opts, "wav_conversions", {}) or {}
+	if entry.get("dataFormat") == "wav" and old_name in conversions:
+		conv_name = conversions[old_name]
+		expected["assetId"] = conv_name.rsplit(".", 1)[0]
+		expected["dataFormat"] = "mp3"
+		if "md5ext" in expected:
+			expected["md5ext"] = conv_name
+	new_name = _final_asset_name(conv_name if old_name in conversions else old_name, opts)
+	if new_name != old_name:
+		stem, new_ext = new_name.rsplit(".", 1)
+		expected["assetId"] = stem
+		expected["dataFormat"] = new_ext.lower()
+		if "md5ext" in expected:
+			expected["md5ext"] = new_name
+	return expected
+
+
 def _check_costumes(original_target, minified_target, opts, zf):
 	original = original_target.get("costumes", [])
 	minified = minified_target.get("costumes", [])
@@ -6752,7 +7128,8 @@ def _check_costumes(original_target, minified_target, opts, zf):
 				return f"{where}: costume entry changed"
 			continue
 
-		extra = set(cm) - set(co)
+		expected = _expected_asset_entry(co, "costume", opts)
+		extra = set(cm) - set(expected)
 		if extra:
 			return f"{where}: unexpected attribute(s) appeared: {sorted(extra)}"
 
@@ -6768,12 +7145,12 @@ def _check_costumes(original_target, minified_target, opts, zf):
 			and co.get("bitmapResolution") == 1
 		):
 			allowed_removed.add("bitmapResolution")
-		missing = (set(co) - set(cm)) - allowed_removed
+		missing = (set(expected) - set(cm)) - allowed_removed
 		if missing:
 			return f"{where}: attribute(s) were removed unexpectedly: {sorted(missing)}"
 
-		for key in set(co) & set(cm):
-			ov, mv = co[key], cm[key]
+		for key in set(expected) & set(cm):
+			ov, mv = expected[key], cm[key]
 			if key in ("rotationCenterX", "rotationCenterY") and opts.positions:
 				if ov != mv and not _num_eq(ov, mv):
 					return f"{where}: {key!r} changed from {ov!r} to {mv!r}"
@@ -6928,7 +7305,10 @@ def verify(original_path, minified_path, opts):
 		orig_assets = {name for name in a.namelist() if name != "project.json"}
 		mini_assets = {name for name in b.namelist() if name != "project.json"}
 		conversions = getattr(opts, "wav_conversions", {}) or {}
-		expected_assets = (orig_assets - set(conversions)) | set(conversions.values())
+		expected_assets = {
+			_final_asset_name(conversions.get(name, name), opts)
+			for name in orig_assets
+		}
 		if mini_assets != expected_assets:
 			diff_missing = sorted(expected_assets - mini_assets)
 			diff_extra = sorted(mini_assets - expected_assets)
@@ -6938,7 +7318,7 @@ def verify(original_path, minified_path, opts):
 			)
 		for name in orig_assets:
 			if name in conversions:
-				new_name = conversions[name]
+				new_name = _final_asset_name(conversions[name], opts)
 				new_bytes = b.read(new_name)
 				if hashlib.md5(new_bytes).hexdigest() != new_name.rsplit(".", 1)[0]:
 					return (
@@ -6946,7 +7326,11 @@ def verify(original_path, minified_path, opts):
 						f"converted asset {new_name!r} does not match its MD5 asset ID",
 					)
 			else:
-				if a.read(name) != b.read(name):
+				final_name = _final_asset_name(name, opts)
+				if final_name != name:
+					if a.read(name) != b.read(final_name):
+						return (False, f"deduplicated asset byte mismatch: {name!r} -> {final_name!r}")
+				elif a.read(name) != b.read(name):
 					return (
 						False,
 						f"asset byte-for-byte mismatch: {name!r} ({len(a.read(name))} bytes vs {len(b.read(name))} bytes)",
@@ -7445,15 +7829,7 @@ def _check_sounds(original_target, minified_target, opts):
 				return f"Target {original_target.get('name')!r}, sound {index}: sound entry changed"
 			continue
 
-		expected = dict(so)
-		old_name = so.get("md5ext") or (
-			f"{so.get('assetId')}.wav" if so.get("dataFormat") == "wav" else None
-		)
-		if so.get("dataFormat") == "wav" and old_name in conversions:
-			new_name = conversions[old_name]
-			expected["assetId"] = new_name.rsplit(".", 1)[0]
-			expected["dataFormat"] = "mp3"
-			expected["md5ext"] = new_name
+		expected = _expected_asset_entry(so, "sound", opts)
 
 		allowed_missing = set()
 		if not opts.keep_sound_metadata:
@@ -7551,6 +7927,14 @@ STAT_GROUPS = [
 			("wav_bytes_saved", "asset bytes saved"),
 			("wav_conversion_failed", "conversions failed"),
 			("wav_ffmpeg_unavailable", "ffmpeg unavailable"),
+		],
+	),
+	(
+		"2a.",
+		"Deduplicate identical assets",
+		[
+			("assets_deduplicated", "duplicate asset files removed"),
+			("asset_bytes_saved", "raw asset bytes removed"),
 		],
 	),
 	(
@@ -7727,6 +8111,14 @@ def _print_transform_stats(stats, opts):
 					("sequence_blocks_added", "sequence procedure blocks added"),
 					("sequence_bytes_saved", "sequence grouping JSON bytes saved"),
 					("sequence_groups_rejected_size", "candidate groups rejected for size"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.simplify_boolean_control:
+				print(Ansi.subheading("  12c. Simplify constant boolean control flow"))
+				for key, label in (
+					("boolean_control_simplifications", "constant control blocks simplified"),
+					("control_blocks_removed", "control blocks removed"),
+					("control_branch_blocks_removed", "branch/condition blocks removed"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 
@@ -7956,7 +8348,9 @@ if __name__ == "__main__":
 		fold_constant_variables="--fold-constant-variables" in flags,
 		fold_constant_expressions=all_optimizations
 		or "--fold-constant-expressions" in flags,
+		simplify_boolean_control=all_optimizations or "--simplify-boolean-control" in flags,
 		simplify_blocks=all_optimizations or "--simplify-blocks" in flags,
+		deduplicate_assets=all_optimizations or "--deduplicate-assets" in flags,
 		group_similar_sequences="--group-similar-sequences" in flags,
 		sequence_threshold=values.get("--sequence-threshold", 3),
 		compress_assets=all_optimizations or "--compress-assets" in flags,

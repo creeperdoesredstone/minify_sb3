@@ -47,6 +47,8 @@ toggles = {
 	"--simplify-blocks",
 	"--group-similar-sequences",
 	"--remove-empty-target-containers",
+    "--deduplicate-assets",
+    "--simplify-boolean-control"
 }
 valued = {
 	"--list-bytes",
