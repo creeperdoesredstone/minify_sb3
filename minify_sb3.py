@@ -263,7 +263,7 @@ def compact_representation(project, compact_defaults=False, compact_costume_refe
 
 
 def minimum_json_size(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False):
-	"""Exact lower bound for the fixed-tree model documented in README.md."""
+	"""Exact lower bound for the selected fixed-tree representation model."""
 	project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags)
 	identifier_cost = None
 	if relabel_block_ids:
@@ -9942,7 +9942,7 @@ def _minify_lossless_sb3(src, dst, opts):
 			print(line)
 		print(f"JSON DEFLATE : {json_info.compress_size:,} -> {len(compressed):,} bytes")
 		floor = stats["json_minimum"]["minimum_bytes"]
-		print(f"JSON lower bound under selected model: {floor:,} bytes; gap: {len(out_json) - floor:,} bytes (see README.md, JSON minimum proofs)")
+		print(f"JSON lower bound under selected model: {floor:,} bytes; gap: {len(out_json) - floor:,} bytes (fixed representation model)")
 		print(f"asset DEFLATE: {stats.get('asset_deflate_bytes_saved', 0):,} bytes saved across {stats.get('assets_recompressed', 0):,} assets")
 		if opts.all_lossless and not zopfli:
 			print("Optional Zopfli was unavailable; all built-in lossless methods ran. Install zopfli for stronger compression.")

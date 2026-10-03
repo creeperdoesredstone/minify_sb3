@@ -1,13 +1,10 @@
 # minify_sb3
 
 
-`minify_sb3.py` minimizes `project.json` and compresses Scratch 3 project archives (`.sb3`). Preservation modes retain exact saved values and asset bytes; separate flags enable internal representation changes and lossy audio conversion. The legacy cleanup pipeline remains available. Every pipeline verifies its output.
+`minify_sb3.py` shrinks Scratch 3 project archives (`.sb3`) by removing redundant metadata and dead data while preserving project behavior, editor compatibility, and asset integrity. It targets the Scratch VM, the Scratch block editor, and TurboWarp-style editors, and it checks its own output before leaving it on disk.
 
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
-- [Lossless compression](#lossless-compression)
-- [Minimum JSON and opt-in representation changes](#minimum-json-and-opt-in-representation-changes)
-- [JSON minimum proofs](#json-minimum-proofs)
 - [CLI reference](#command-line-reference)
 - [How the pipeline works](#how-the-pipeline-works)
 - [Always-on behavior](#always-on-behavior)
@@ -27,18 +24,14 @@
 
 ## Requirements
 
-- **Python 3.10 or newer.** Built-in methods use only the standard library. It relies on `X | None` annotations, which need 3.10+.
-- **`zopfli` (optional).** Stronger, slower lossless DEFLATE encoding: `python -m pip install zopfli`. `--all-lossless` uses it when installed and reports when it is unavailable. Explicit `--zopfli` / `--zopfli-assets` flags require it.
-- **`ffmpeg` with `libmp3lame` (optional).** Needed for lossy `--convert-wav-to-mp3`, also included in `--all-flags`.
+- **Python 3.10 or newer.** The script uses only the standard library (`collections`, `copy`, `hashlib`, `json`, `math`, `os`, `subprocess`, `sys`, `uuid`, `zipfile`, `zlib`). It relies on `X | None` annotations, which need 3.10+.
+- **`ffmpeg` with `libmp3lame` (optional).** Only needed for `--convert-wav-to-mp3` (and `--all-optimizations`, which enables it).
 - Enough RAM to hold the whole archive: every asset is read into memory before the output is written.
 
 ## Quick start
 
 ```bash
-# All safe methods, prioritizing raw project.json size
-python minify_sb3.py my_project.sb3 --all-safe-flags
-
-# Legacy defaults; large lists are not scanned unless requested
+# Safe defaults; large lists are not scanned unless requested
 python minify_sb3.py my_project.sb3
 
 # Scan large lists and prompt before clearing any
@@ -52,78 +45,6 @@ python minify_sb3.py my_project.sb3 --keep-comments --keep-monitors --sort-keys
 ```
 
 If no output path is given, the result is written next to the input as `<input name>_minified.sb3`. The output path must differ from the input path; the script refuses to overwrite its own source. Your original file is never modified.
-
-## Lossless compression
-
-Use `--all-safe-flags` (aliases `--all-safe`, `--all-lossless`) to retain saved values, original block IDs, explicit false block flags, editor data and every uncompressed asset byte. It enables shortest exact JSON tokens, omission of empty block fields/inputs that the loader reconstructs, omission of canonical costume filename references that the loader derives, measured block-record layouts, ZIP asset compression, reuse of smaller original streams, and optional Zopfli on JSON and assets. It prioritizes raw `project.json` bytes, then compressed JSON bytes.
-
-This preset preserves variable/list values and names, broadcasts, procedures, all blocks and IDs, comments, monitors, coordinates, costume centers, sound metadata, project metadata, and collection order. It does not remove dead code, round numbers, reset covered shadows, clear lists, rename identifiers, repair existing graph quirks, or transcode assets. Asset names and their uncompressed bytes are identical to the source. All existing script, block, input, variable, list, sprite, costume, and monitor order is retained.
-
-`--lossless` is the narrower preset: exact JSON encoding and original asset streams, without empty-container omission, asset recompression, or automatic Zopfli. Add individual lossless flags as desired.
-
-| Flag | Effect |
-| --- | --- |
-| `--all-safe-flags`, `--all-safe`, `--all-lossless` | Enable every safe method; minimize raw JSON first and use optional Zopfli when available. |
-| `--lossless` | Bypass every legacy transform and preserve the exact saved data. |
-| `--optimize-json` | Measure several block-record property layouts and DEFLATE settings; keep the smallest actual compressed result. Collection order is preserved. |
-| `--compact-block-defaults` | Omit only empty block `fields`/`inputs`. Implies JSON optimization. `next: null` and parent links are retained. |
-| `--compact-costume-references` | Omit costume `md5ext` only when exactly equal to the loader-derived `assetId.dataFormat`. The explicit `dataFormat` remains. |
-| `--minimum-json` | Prioritize raw JSON size; use compressed JSON size to choose between equally short representations. Enabled by the safe preset. |
-| `--json-search-rounds=N` | Additional contiguous-window layout passes, alternating 128 and 64 blocks. Positive integer; default `1` in presets, otherwise `0`. |
-| `--optimize-assets` | Try stored and several DEFLATE encodings of identical asset bytes, retaining smaller original streams. |
-| `--zopfli` | Apply stronger DEFLATE encoding to `project.json`. Requires the optional package. |
-| `--zopfli-assets` | Apply stronger DEFLATE encoding to assets. Requires the optional package; can take several minutes. |
-| `--zopfli-iterations=N` | Set the positive Zopfli search iteration count. Default `5`; higher values cost more time. |
-
-JSON encoding tries exact decimal/scientific number spellings, consistent block-record property layouts, and layouts chosen separately for each target, record shape, opcode, or target/opcode combination. A bounded sample screens all 120 permutations of the five core block properties; the strongest candidates are then measured on the complete project. Additional window passes score layouts against the preceding 32 KiB of DEFLATE history and a following context sample. Several complete layouts are screened with Zopfli before the strongest receives the requested iteration budget. Every candidate is measured after compression. The original layout and compressed entry remain fallbacks under the selected objective. In `--minimum-json` mode, a shorter raw representation takes priority even if its compressed size increases; otherwise compressed size takes priority. Property order inside a block record can change; block table order and input evaluation order cannot.
-
-Numbers are parsed as decimal tokens rather than binary floats. This protects large integers, significant decimal digits, and negative zero. Strings that look like numbers remain strings. Duplicate JSON keys and non-finite constants are rejected rather than silently rewritten.
-
-The lossless verifier independently reloads both archives and checks every JSON value, collection order, ZIP metadata, archive entry order, and asset byte. It permits only the explicitly enabled loader defaults and canonical costume reference to be reconstructed. Opt-in representation flags authorize only their named block changes. Existing parent-link quirks are preserved. Output is written to a temporary archive and replaces the destination only after verification succeeds; a failed run preserves an existing destination.
-
-Scratch's [SB3 deserializer](https://github.com/scratchfoundation/scratch-vm/blob/develop/src/serialization/sb3.js) reconstructs empty fields and inputs. Its serializer also documents why `next: null` must remain explicit.
-
-Preservation modes reject legacy cleanup, renaming, graph optimization, sorting and audio conversion. The separately named representation flags below can be combined explicitly with `--lossless` or the safe preset. Audio conversion is never enabled by the safe preset or `--all-optimizations`; it is enabled by `--all-flags`.
-
-```bash
-# Standard-library lossless compression, preserving all original containers
-python minify_sb3.py my_project.sb3 --lossless --optimize-assets
-
-# Every lossless method; more CPU time for the optional compressor
-python minify_sb3.py my_project.sb3 my_project_small.sb3 --all-lossless --zopfli-iterations=15
-
-# Explicitly accept lossy WAV-to-MP3 conversion
-python minify_sb3.py my_project.sb3 --convert-wav-to-mp3
-```
-
-## Minimum JSON and opt-in representation changes
-
-`--minimum-json` reaches the certified byte floor for the selected fixed-tree model. Exact numeric minimization enumerates all potentially shortest decimal-point placements. The certificate counts required punctuation, keys, scalar strings, number tokens and literals independently. [JSON minimum proofs](#json-minimum-proofs) gives the formal proofs and precise model restrictions. A zero certificate gap establishes that scoped raw-JSON minimum; it does not establish a minimum over all equivalent Scratch programs or DEFLATE encodings.
-
-| Flag | Effect |
-| --- | --- |
-| `--compact-block-flags` | Omit only explicit false `topLevel` / `shadow`. Loaded property presence changes, so this is excluded from the safe preset. |
-| `--relabel-block-ids` | Assign the shortest admissible JSON names to the most frequently referenced blocks. Use names that survive unescaped editor XML attributes; preserve JavaScript enumeration order and unresolved references; do not rename literal strings, data IDs or procedure arguments. Excluded from the safe preset. |
-| `--all-flags` | Enable the non-interactive legacy batch, the representation methods above, raw JSON minimization, optional Zopfli and lossy WAV conversion. This preset may change editor data and audio quality. |
-
-For stronger JSON compression while retaining all asset bytes and all other saved data, opt in to only the two representation methods:
-
-```bash
-python minify_sb3.py my_project.sb3 my_project_small.sb3 --all-safe-flags --compact-block-flags --relabel-block-ids --zopfli-iterations=15
-```
-
-The ID assignment has a rearrangement proof for its supported name domain. All names costing one or two JSON payload bytes are enumerated; remaining names cost three bytes. Unsupported larger domains fail instead of receiving a false optimality certificate. These passes combine established techniques; they are not claimed as new mathematical laws.
-
-Validation on `XenonOS Round 3 Submission.sb3` preserved all 1,100 asset files byte for byte. The official Scratch VM load/save and graph comparisons checked 14 targets, 68,814 hydrated blocks and 734 ordered scripts. All 28,046 serialized block IDs passed the actual VM XML serializer and strict XML parsing. The local regression suite passed 44 tests. These were headless checks, without exhaustive interactive execution or guarantees for tools that store old IDs.
-
-| Policy | Raw project.json | JSON inside ZIP | Archive |
-| --- | ---: | ---: | ---: |
-| Original source | 5,019,694 bytes | 631,748 bytes | 43,652,150 bytes |
-| Previous reliable implementation | 4,756,938 bytes | 534,398 bytes | 42,707,165 bytes |
-| All safe methods | 4,700,154 bytes | 529,906 bytes | 42,702,673 bytes |
-| Explicit block flag and ID changes | 4,214,547 bytes | 519,295 bytes | 42,692,062 bytes |
-
-The original upstream minifier ran first but failed its verifier on an inherited parent-link inconsistency and was disqualified. Every later JSON trial reused the previous reliable baseline's exact asset compression streams. The optimized result saves 542,391 raw JSON bytes (11.40%) against that baseline. A larger layout/Zopfli search tied the winner. Both safe and opt-in results reach the scoped raw byte minima proved below.
 
 ## CLI reference
 
@@ -228,20 +149,16 @@ A list qualifies if it is non-empty and meets either threshold.
 
 | Flag | Effect |
 | --- | --- |
-| `--all-optimizations` | Enable the legacy batch of non-interactive optional transforms. See [below](#--all-optimizations-in-detail). |
-| `--all-flags` | Include that batch, the new representation methods, optional Zopfli, minimum raw JSON and lossy WAV conversion. |
-| `--all-safe-flags` | Every safe method; preserve original block IDs, explicit false flags, saved state and asset bytes. |
+| `--all-optimizations` (alias `--all-flags`) | Enable the batch of non-interactive optional transforms. See [below](#--all-optimizations-in-detail). |
 
 ### Validation rules for valued flags
 
-- `--list-bytes`, `--list-items`, `--zopfli-iterations`, `--json-search-rounds`: digits only, greater than zero.
+- `--list-bytes`, `--list-items`: digits only, greater than zero.
 - `--compression-level`: digits only, `0` through `9`.
 - `--normalize-epsilon`: any finite float greater than zero.
 - A valued flag given without `=value`, or a toggle given with `=value`, is rejected as malformed.
 
 ## How the pipeline works
-
-The steps below describe the legacy pipeline. Preservation modes use the independent exact-JSON pipeline described above.
 
 1. `project.json` is parsed (UTF-8 JSON) and every other archive entry is read into memory as an asset.
 2. If `--clear-large-lists` is given, the large-list prompt runs. If `--fold-constant-variables` is given, the constant-variable prompt runs. Both happen before anything is written. Aborting with Ctrl-C at either prompt exits with status 130 and writes nothing. Neither prompt runs by default or with `--all-optimizations` alone.
@@ -471,7 +388,7 @@ These can change behavior if a project relies on data or scripts that are only r
 
 ## `--all-optimizations` in detail
 
-`--all-optimizations` turns on the following legacy batch:
+`--all-optimizations` (alias `--all-flags`) turns on the following:
 
 | Group | Enabled |
 | --- | --- |
@@ -479,7 +396,7 @@ These can change behavior if a project relies on data or scripts that are only r
 | Dead data | unused variables, lists, and broadcasts; unreachable blocks; unused procedures |
 | Compaction | `--compact-numeric-inputs`, `--compact-field-ids`, `--compact-mutation-hasnext`, `--fold-constant-expressions`, `--normalize-numbers` |
 | Trimming | `--remove-empty-fields`, `--remove-empty-inputs`, `--remove-costume-metadata`, `--remove-default-target-properties`, `--remove-empty-containers`, `--remove-project-meta` |
-| Archive | `--optimize-json`, `--compact-block-defaults`, `--compact-costume-references`, `--optimize-assets`, `--preserve-asset-compression` (and the no-op `--compress-assets`) |
+| Archive | `--convert-wav-to-mp3`, `--preserve-asset-compression` (and the no-op `--compress-assets`) |
 | Prompts | neither interactive prompt runs; large lists are not scanned or cleared |
 
 It does not enable:
@@ -490,11 +407,9 @@ It does not enable:
 - `--sort-keys`
 - `--keep-sound-metadata` (sound `rate`/`sampleCount` are still removed)
 
-`--keep-*` flags, `--compression-level=N`, and `--normalize-epsilon=N` still apply on top of it. The list thresholds are used only with `--clear-large-lists`. This legacy preset includes aggressive removals and does not preserve all editor data. Use `--all-lossless` for preservation. `--all-flags` additionally enables `--compact-block-flags`, `--relabel-block-ids`, `--minimum-json`, optional Zopfli and `--convert-wav-to-mp3`. It does not include interactive prompts or every mutually incompatible CLI option.
+`--keep-*` flags, `--compression-level=N`, and `--normalize-epsilon=N` still apply on top of it. The list thresholds are used only with `--clear-large-lists`. Because `--all-optimizations` includes lossy WAV conversion and aggressive removals, review the result for projects that use unusual patterns.
 
 ## Archive and asset handling
-
-The details below describe the legacy pipeline. Preservation modes retain entry order and metadata, measure stored/DEFLATE alternatives, and publish atomically after verification.
 
 ### Output archive
 
@@ -527,8 +442,6 @@ Some fields cannot be removed without breaking the editor, loader, or VM. The sc
 - Stage comments and `_twconfig_` metadata are untouched.
 
 ## Verification
-
-The checks below describe the legacy verifier. Preservation modes use the stricter exact-value and byte-identity audit described above, retaining inherited graph quirks.
 
 After the output is written, the script reloads both archives and checks the following. Any failure deletes the output file, prints the reason, and exits with status 2. The original archive is never modified.
 
@@ -748,117 +661,3 @@ python minify_sb3.py my_project.sb3 --rename-identifiers
 # Shrink all variable & list names only
 python minify_sb3.py my_project.sb3 --rename-variable-names --rename-list-names
 ```
-
-## JSON minimum proofs
-
-This project does **not** claim an absolute minimum for all equivalent Scratch programs or an optimal DEFLATE stream. Its certificates prove minima in explicitly bounded representation models. The search methods combine established ideas; no claim is made that they are new fundamental laws or novel research results.
-
-### What a certificate means
-
-Let `P` be an accepted SB3 project parsed into exact JSON values. Decimal numbers retain their exact values and the sign of zero. Strings retain their characters and types. A model fixes the target sequence, block graph, variable/list contents, names, procedure definitions, costume/sound metadata, comments, monitors, unknown properties and every ordered collection.
-
-`fixed-tree-v2` allows only:
-
-1. JSON whitespace removal and alternative spellings of the same exact numbers and strings.
-2. Property permutations within block records. Block-table and input-map order remain fixed.
-3. If enabled, omission of empty block `inputs` and `fields` objects, which the loader recreates.
-4. If enabled, omission of a costume `md5ext` exactly equal to its loader-derived `assetId.dataFormat`. The explicit `dataFormat` remains mandatory.
-5. Only with `--compact-block-flags`, omission of `shadow: false` and `topLevel: false`. This changes property presence in the hydrated records and therefore belongs to the opt-in tier. True flags, links and coordinates remain unchanged.
-
-`fixed-graph-block-ids-v3` additionally allows bijective renaming of each target's block IDs and their schema-defined references. Output names are nonempty, compatible with XML attribute round trips, exclude ampersand, less-than, quotation mark and normalized attribute whitespace, cannot be JavaScript array-index property names or prototype-sensitive names, and cannot capture unresolved references. Every other identifier namespace remains fixed. The certificate is supported when all required names fit in at most three JSON payload bytes; unsupported cases fail rather than receive a false certificate.
-
-The model deliberately excludes changes to procedure names, variable/list/broadcast IDs, assets, program structure, execution schedules and opaque extension metadata. It also excludes external tools that observe or store the old block IDs. Thus a zero gap does **not** establish a global Scratch minimum.
-
-The fixed-tree version 2 uses strict UTF-8 decoding. Graph version 3 adds the verified reference-type contract and the stricter alphabet required by the editor's unescaped XML attributes. Historical graph versions 1/2 permitted XML-unsafe names; those ID candidates were disqualified and their certificates are superseded. Compare a certificate with its stated policy, input and model version, not just its byte count. A proposed PNG format-default omission was rejected by actual SB3 validation and is excluded from both supported models.
-
-### 1. Exact shortest number tokens
-
-For a nonzero decimal value, strip leading and trailing coefficient zeros to obtain
-
-`v = (-1)^s C × 10^e`,
-
-where `C` has `n` significant digits, begins and ends with a nonzero digit, and `s` is the sign. No binary floating-point conversion is used.
-
-After removing redundant exponent signs/zeros and fractional trailing zeros, every JSON number representing this value has a mantissa obtained by putting the decimal point at an integer position `p` relative to `C`. Its required exponent is `q = e + n - p`. Its mantissa length is
-
-```text
-M(p) = n              if p = n
-       n + 1          if 0 < p < n
-       p              if p > n
-       n + 2 - p      if p <= 0
-```
-
-These cases respectively encode `C`, an internal decimal point, appended integer zeros, or `0.` followed by leading fractional zeros. The total length is
-
-`L(p) = s + M(p) + E(q)`,
-
-where `E(0)=0`, and otherwise `E(q)=1+len(str(q))`: one exponent marker followed by the minimally spelled signed integer exponent. Uppercase `E` has the same cost as lowercase `e`; an explicit plus sign or exponent leading zeros cannot improve it.
-
-**Theorem.** Minimizing `L(p)` over the bounded positions searched by `_short_number` gives a shortest JSON number token for the exact value.
-
-**Proof.** The representation above covers every irredundant mantissa. Let `U` be the length of the original valid token, an available upper bound. Any improvement must satisfy `s+M(p)<=U`. For `p<=0`, this implies `p>=n+2+s-U`; for `p>n`, it implies `p<=U-s`. All internal positions are finite. The implementation enumerates an interval containing those positions, evaluates their exact lengths, and constructs a best token. Any position outside the interval already exceeds the upper bound before its exponent is included. No omitted representation can be shorter. Zero separately has minimum token `0`; negative zero has minimum token `-0` under the required sign-preservation rule. QED.
-
-The permitted token syntax follows the [JSON number grammar](https://www.rfc-editor.org/rfc/rfc8259#section-6). The regression suite also checks decimal equivalence, large exponents, signed zero and an independent enumeration of small valid tokens.
-
-### 2. Minimum strings and structure
-
-Let `S(x)` be the minimum byte length of a quoted JSON string. Its two quotation marks are mandatory. Each quotation mark, backslash, or character with a standard two-byte short escape requires two bytes. Other C0 controls and isolated surrogate code units require a six-byte escape. Remaining characters use their literal UTF-8 encoding, which is shorter than their Unicode escape. Summing these costs gives `S(x)`. This uses the [JSON string and UTF-8 rules](https://www.rfc-editor.org/rfc/rfc8259#section-7).
-
-For an object with `m` properties, the mandatory structural cost is
-
-`2 + m + max(m-1,0)`:
-
-two braces, `m` colons, and its commas. Add `S(key)` and the minimum value length for every property. For an array with `m` elements the structural cost is `2+max(m-1,0)`, plus its element lengths. The literal minima are four bytes for `null` and `true`, and five for `false`.
-
-**Theorem.** The recursive sum produced by `minimum_json_size` is the exact minimum in `fixed-tree-v2` under the selected omission policy.
-
-**Proof.** Every retained key, scalar and punctuation token is required by the fixed JSON tree and its grammar. Each scalar lower bound is attainable independently. Property permutations cannot change their byte counts. Every permitted omission decreases the recursive length, so a minimum omits every eligible property. There is no remaining sharing or abbreviation operation in this model. Encoding the normalized tree without whitespace and with the shortest tokens attains the sum. Hence the sum is both a lower bound and an achieved upper bound. QED.
-
-The certificate reports independent categories for structure, keys, string values, number tokens and literals. `--minimum-json` prioritizes this raw byte objective; compression-aware mode can deliberately choose a longer numeric spelling if it compresses better and reports a nonzero gap.
-
-### 3. Optimal block ID byte assignment
-
-Block references in this model are only block-table keys, `next`, `parent`, the string reference positions of input tags 1/2/3, and comment `blockId`. Literal strings, variable/list IDs in primitive descriptors, argument IDs and broadcasts are never renamed.
-
-Let `f_i>=1` be the occurrence count of block ID `i`, including its declaration. Let `c_j` be the number of JSON payload bytes needed for available name `j`, excluding the two quotation marks. With structure and all other values fixed, the variable part of the raw length is
-
-`Σ_i f_i c_assignment(i)`.
-
-Unresolved reference strings are reserved, preventing an invalid old edge from becoming a valid new edge. JavaScript's actual property enumeration order is retained; generated names are never array-index keys.
-
-The generator covers **every** admissible name of cost one or two:
-
-- One byte: 96 characters from U+0020 through U+007F, minus quotation mark, backslash, ampersand and less-than, minus ten array-index digits: **82** names before reservations.
-- Two raw ASCII characters: `92² - 90 = 8,374` names after excluding canonical two-digit array indices.
-- Single backslash: **1** name, requiring a two-byte JSON escape. Quotation mark is excluded because the editor interpolates IDs into double-quoted XML attributes without escaping.
-- Single U+0080 through U+07FF character: **1,920** UTF-8 names of two bytes.
-
-This gives **10,295** two-byte names before reservations. The character domain follows the [XML character rules](https://www.w3.org/TR/xml/#charsets) and [attribute-value grammar](https://www.w3.org/TR/xml/#NT-AttValue); TAB/LF/CR are excluded because attribute normalization would change them. Ampersand, less-than and double quote are excluded because Scratch VM's `blockToXML` interpolates block IDs without escaping. For the supported domain, additional ASCII names of cost three supply enough remaining IDs. Other admissible three-byte names can only tie that cost; they cannot improve the lower bound.
-
-**Theorem.** Assigning available names in ascending byte cost to IDs in descending `f_i` order minimizes the raw JSON length in `fixed-graph-block-ids-v3`.
-
-**Proof.** A minimum uses the shortest available names: replacing a used longer name with an unused shorter one strictly reduces cost because every `f_i` is positive. For two frequencies `f_i>=f_j` and name costs `c_a<=c_b`, compare the ordered assignment with its swap. The difference is
-
-`(f_i c_a + f_j c_b) - (f_i c_b + f_j c_a) = (f_i-f_j)(c_a-c_b) <= 0`.
-
-Thus exchanging inversions never increases cost. Repeated exchanges produce the assignment used by the implementation. Independent target namespaces contribute additively. Combining this achieved ID-cost bound with the fixed-tree bound proves the reported graph-model minimum. QED.
-
-The regression suite verifies the complete short-name buckets, weighted reference costs, preservation of literal/data IDs, dangling-reference reservations and numeric-key enumeration order and strict XML attribute round trips. An independent verifier infers the ID correspondence from semantic record order; it does not trust optimizer-generated maps.
-
-### 4. What the behavior checks establish
-
-Safe flags retain exact hydrated block graphs, saved data and asset bytes. Derived costume fields produce identical loaded filenames, formats and metadata in the official Scratch VM. For opt-in block changes, verification restores the inferred ID correspondence and normalizes only the explicitly permitted false flags.
-
-The validation runs also load both complete archives in Scratch VM 5.0.300, compares actual load/save state, ordered scripts and loaded costume/sound metadata, checks actual editor XML ID round trips, and compares every hydrated block after the declared normalization. It independently checks every uncompressed asset byte and requires later JSON experiments to retain the previous winner's exact compressed asset streams.
-
-These checks are evidence for the standard loader/graph model. They do not prove every possible interaction, third-party extension, editor add-on or externally stored ID reference remains identical. Representation-changing flags therefore remain outside `--all-safe-flags`.
-
-### 5. Why no absolute compressed minimum is claimed
-
-Raw JSON length and the size of JSON inside the ZIP are different objectives. The compressor searches actual candidate streams, tries zlib settings and optional Zopfli, and retains smaller existing streams. Window scores are heuristics; a complete output measurement decides whether a candidate is accepted. A search plateau is evidence about the explored candidates, not a proof of an optimum.
-
-[DEFLATE](https://www.rfc-editor.org/rfc/rfc1951) permits different LZ77 parses, Huffman tables and block partitions. We have not exhaustively minimized all such streams, much less every loader-equivalent JSON representation. For a fixed JSON byte sequence and a known valid stream of `b` bits, enumerating all bit strings of length at most `b` and validating their decompression would establish a minimum in principle. That finite search is far beyond the performed benchmark.
-
-Byte-frequency entropy alone is not a universal lower bound for this individual structured document. Also, with an unrestricted bespoke decoder whose size is not counted, define `D_P(empty)=P`; a particular project then needs zero payload bytes. Thus a useful mathematical limit must specify the decoder, transformation class, byte accounting and observable state.
-
-The reproducible result is an achieved scoped raw-JSON minimum plus measured compressed improvements. **No global Scratch or DEFLATE minimum has been proved.**
