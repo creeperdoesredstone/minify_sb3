@@ -1,4 +1,5 @@
 import copy
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -8027,14 +8028,58 @@ def _restore_argument_ids(project, mapping):
 			block["inputs"] = {local_rev.get(k, k): v for k, v in inputs.items()}
 
 
-def _num_eq(a, b):
-	return (
-		isinstance(a, (int, float))
-		and isinstance(b, (int, float))
-		and not isinstance(a, bool)
-		and not isinstance(b, bool)
-		and int(round(a)) == b
-	)
+def _num_eq(a, b, epsilon=0):
+	"""Compare JSON numbers by decimal value, optionally allowing normalization epsilon.
+
+	The JSON optimizer may rewrite a large integer into exponent notation.
+	Python then parses the exponent form as a float, even when the decimal
+	value is exactly the same integer.  Decimal(str(...)) preserves that exact
+	decimal value.  When ``epsilon`` is nonzero, the comparison also mirrors
+	``normalize_numbers``: values within the configured normalization epsilon
+	are considered equivalent.
+	"""
+	if (
+		not isinstance(a, (int, float))
+		or not isinstance(b, (int, float))
+		or isinstance(a, bool)
+		or isinstance(b, bool)
+	):
+		return False
+	if (isinstance(a, float) and not math.isfinite(a)) or (
+		isinstance(b, float) and not math.isfinite(b)
+	):
+		return a == b
+	try:
+		da = Decimal(str(a))
+		db = Decimal(str(b))
+		if da == db:
+			return True
+		if epsilon:
+			return abs(da - db) <= Decimal(str(epsilon))
+		return False
+	except (InvalidOperation, ValueError):
+		if a == b:
+			return True
+		return bool(epsilon) and abs(a - b) <= epsilon
+
+
+def _position_num_eq(original, minified):
+	"""Match the exact numeric transformation performed by ``round_positions``."""
+	if _num_eq(original, minified):
+		return True
+	if (
+		not isinstance(original, (int, float))
+		or isinstance(original, bool)
+		or not isinstance(minified, (int, float))
+		or isinstance(minified, bool)
+	):
+		return False
+	if isinstance(original, float) and not math.isfinite(original):
+		return False
+	try:
+		return minified == round(original)
+	except (TypeError, ValueError, OverflowError):
+		return False
 
 
 def _check_broadcast_consistency(project):
@@ -8138,22 +8183,69 @@ def _check_argument_id_consistency(target, where):
 
 
 def _input_val_eq(vo, vm, opts):
+	"""Compare the payload of a Scratch primitive literal.
+
+	``compact_numeric_inputs`` can first turn a canonical numeric string such
+	as ``"10000"`` into the integer ``10000``.  The later JSON encoder may
+	serialize that numeric value as exponent notation, which ``json.loads``
+	then exposes as ``10000.0``.  Compare the resulting numeric value rather
+	than the incidental Python type, but only for string forms that the
+	optimizer itself can actually compact.
+	"""
 	if vo == vm:
 		return True
-	if opts.normalize_numbers and (_num_eq(vo, vm) or vo == vm):
+
+	if opts.normalize_numbers and (_num_eq(vo, vm, opts.normalize_epsilon) or vo == vm):
 		return True
-	if (
-		opts.compact_numeric_inputs
-		and isinstance(vo, str)
-		and isinstance(vm, (int, float))
-	):
-		try:
-			if isinstance(vm, int) and str(int(vo)) == vo and int(vo) == vm:
-				return True
-			if isinstance(vm, float) and str(float(vo)) == vo and float(vo) == vm:
-				return True
-		except ValueError:
-			pass
+
+	# The JSON layout optimizer can spell an integral number using exponent
+	# notation (for example 10000 -> 1e4), which changes only the Python
+	# int/float type returned by json.loads. Accept that exact numeric
+	# re-encoding when JSON optimization is enabled.
+	if getattr(opts, "optimize_json", False):
+		if (
+			isinstance(vo, (int, float))
+			and isinstance(vm, (int, float))
+			and not isinstance(vo, bool)
+			and not isinstance(vm, bool)
+			and not (isinstance(vo, float) and not math.isfinite(vo))
+			and not (isinstance(vm, float) and not math.isfinite(vm))
+		):
+			try:
+				if Decimal(str(vo)) == Decimal(str(vm)):
+					return True
+			except InvalidOperation:
+				pass
+
+	if opts.compact_numeric_inputs:
+		if isinstance(vo, str) and isinstance(vm, (int, float)) and not isinstance(vm, bool):
+			# Mirror the integer branch of compact_numeric_inputs exactly.
+			try:
+				iv = int(vo)
+			except (ValueError, OverflowError):
+				iv = None
+			if iv is not None and str(iv) == vo:
+				if isinstance(vm, float) and not math.isfinite(vm):
+					return False
+				return Decimal(str(iv)) == Decimal(str(vm))
+
+			# Mirror the float branch of compact_numeric_inputs exactly.
+			try:
+				fv = float(vo)
+			except (ValueError, OverflowError):
+				fv = None
+			if (
+				fv is not None
+				and "." in vo
+				and "e" not in vo.lower()
+				and str(fv) == vo
+				and math.isfinite(fv)
+			):
+				try:
+					return Decimal(str(fv)) == Decimal(str(vm))
+				except InvalidOperation:
+					return False
+
 	return False
 
 
@@ -8422,7 +8514,7 @@ def _check_blocks(
 			if not _check_mutation_match(o[k], m[k], opts):
 				return f"{where} (opcode: {o.get('opcode')}): mutation changed from original {o[k]!r} to minified {m[k]!r}"
 		elif k in ("x", "y") and opts.positions:
-			if not _num_eq(o[k], m[k]) and o[k] != m[k]:
+			if not _position_num_eq(o[k], m[k]) and o[k] != m[k]:
 				return f"{where} (opcode: {o.get('opcode')}): coordinate {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
 		elif k == "inputs":
 			gone_inputs = set(o["inputs"]) - set(m["inputs"])
@@ -8835,7 +8927,7 @@ def _check_costumes(original_target, minified_target, opts, zf):
 		for key in set(expected) & set(cm):
 			ov, mv = expected[key], cm[key]
 			if key in ("rotationCenterX", "rotationCenterY") and opts.positions:
-				if ov != mv and not _num_eq(ov, mv):
+				if ov != mv and not _position_num_eq(ov, mv):
 					return f"{where}: {key!r} changed from {ov!r} to {mv!r}"
 			elif ov != mv:
 				return f"{where}: attribute {key!r} changed from {ov!r} to {mv!r}"
@@ -9179,7 +9271,7 @@ def verify(original_path, minified_path, opts):
 				if k not in tm and k in allowed_default_keys:
 					continue
 				if to[k] != tm[k]:
-					if opts.normalize_numbers and _num_eq(to[k], tm[k]):
+					if opts.normalize_numbers and _num_eq(to[k], tm[k], opts.normalize_epsilon):
 						continue
 					return (
 						False,
@@ -9268,7 +9360,7 @@ def verify(original_path, minified_path, opts):
 						and isinstance(vm, list)
 						and len(vo) == len(vm)
 						and vo[0] == vm[0]
-						and (_num_eq(vo[1], vm[1]) or vo[1] == vm[1])
+						and (_num_eq(vo[1], vm[1], opts.normalize_epsilon) or vo[1] == vm[1])
 						and (len(vo) < 3 or vo[2:] == vm[2:])
 					):
 						continue
@@ -9313,16 +9405,25 @@ def verify(original_path, minified_path, opts):
 				lm = tm_lists[lid]
 				if lo == lm:
 					continue
-				if (
+				allow_numeric_reencoding = (
 					opts.normalize_numbers
+					or getattr(opts, "optimize_json", False)
+					or getattr(opts, "minimum_json", False)
+				)
+				if (
+					allow_numeric_reencoding
 					and isinstance(lo, list)
 					and isinstance(lm, list)
 					and len(lo) == len(lm)
-					and lo[0] == lm[0]
 					and isinstance(lo[1], list)
 					and isinstance(lm[1], list)
 					and len(lo[1]) == len(lm[1])
-					and all(x == y or _num_eq(x, y) for x, y in zip(lo[1], lm[1]))
+					and all(x == y or _num_eq(x, y, opts.normalize_epsilon) for x, y in zip(lo[1], lm[1]))
+					and (
+						lo[0] == lm[0]
+						or getattr(opts, "rename_list_names", False)
+						or getattr(opts, "rename_identifiers", False)
+					)
 				):
 					continue
 				if not (
@@ -9374,7 +9475,7 @@ def verify(original_path, minified_path, opts):
 						and isinstance(bm, list)
 						and len(bo) == len(bm)
 						and bo[:3] == bm[:3]
-						and all(_num_eq(x, y) or x == y for x, y in zip(bo[3:], bm[3:]))
+						and all(_num_eq(x, y, opts.normalize_epsilon) or x == y for x, y in zip(bo[3:], bm[3:]))
 					)
 					if not (ok and (opts.positions or bo == bm)):
 						return (
@@ -9461,7 +9562,7 @@ def verify(original_path, minified_path, opts):
 					for f in set(co[cid]) | set(cm[cid]):
 						x, y = co[cid].get(f), cm[cid].get(f)
 						if f in ("x", "y", "width", "height") and opts.positions:
-							if not (x == y or _num_eq(x, y)):
+							if not (x == y or _num_eq(x, y, opts.normalize_epsilon)):
 								return (
 									False,
 									f"Target {ti} ({name!r}): comment {cid!r} attribute {f!r} changed from {x!r} to {y!r}",
