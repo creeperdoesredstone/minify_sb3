@@ -48,7 +48,18 @@ toggles = {
 	"--group-similar-sequences",
 	"--remove-empty-target-containers",
     "--deduplicate-assets",
-    "--simplify-boolean-control"
+    "--simplify-boolean-control",
+    "--optimize-procedure-arguments",
+	"--optimize-custom-procedure-arguments",
+	"--drop-procedure-arguments",
+	"--remove-unused-procedure-arguments",
+	"--remove-unused-custom-procedure-arguments",
+	"--fold-constant-procedure-arguments",
+	"--fold-constant-custom-procedure-arguments",
+    "--merge-duplicate-procedures",
+	"--merge-duplicate-custom-procedures",
+	"--merge-duplicate-custom-blocks",
+	"--deduplicate-procedures",
 }
 valued = {
 	"--list-bytes",
