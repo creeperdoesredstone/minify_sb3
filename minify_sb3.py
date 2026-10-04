@@ -21,6 +21,10 @@ from itertools import permutations, product
 
 class JsonNumber(str):
 	"""A JSON number token, kept separate from JSON strings and binary floats."""
+	__slots__ = ()
+
+	def __deepcopy__(self, memo):
+		return self
 
 
 def _unique_object(pairs):
@@ -46,6 +50,24 @@ def loads_exact(data):
 		parse_constant=_invalid_constant,
 		object_pairs_hook=_unique_object,
 	)
+
+
+def _copy_json(value, memo=None):
+	"""Copy JSON containers without dispatching immutable leaves through deepcopy."""
+	kind = type(value)
+	if kind is str or kind is JsonNumber or value is None or kind in (bool, int, float): return value
+	if memo is None: memo = {}
+	if kind not in (dict, list): return copy.deepcopy(value, memo)
+	identity = id(value)
+	if identity in memo: return memo[identity]
+	result = {} if kind is dict else []
+	memo[identity] = result
+	if kind is dict:
+		for key, child in value.items():
+			result[key if type(key) in (str, JsonNumber) else _copy_json(key, memo)] = _copy_json(child, memo)
+	else:
+		result.extend(_copy_json(child, memo) for child in value)
+	return result
 
 
 @lru_cache(maxsize=8192)
@@ -195,8 +217,8 @@ def _reference_scopes(project):
 	return [dict(global_scope, **scope) for scope in scopes]
 
 
-def _restore_reference_names(original, result):
-	result = copy.deepcopy(result)
+def _restore_reference_names(original, result, *, copy_result=True):
+	if copy_result: result = copy.deepcopy(result)
 	scopes = _reference_scopes(original)
 	for path, container, index, ident, kind in _reference_name_slots(original):
 		if type(ident) is not str or not ident or ident in ("__proto__", "constructor", "prototype") or type(container[index]) is not str: continue
@@ -210,25 +232,640 @@ def _restore_reference_names(original, result):
 	return result
 
 
-def exact_difference(original, result, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False, compact_reference_names=False):
-	"""Compare exact numbers, strings, keys and all ordered collections."""
+def _orphan_argument_ids(target):
+	"""Find detached built-in argument shadows without incoming links or editor metadata."""
+	blocks = target.get("blocks") or {}
+	if not isinstance(blocks, dict): return set()
+	for block in blocks.values():
+		if not isinstance(block, dict): continue
+		if any(block.get(key) is not None and type(block[key]) is not str for key in ("next", "parent")): return set()
+		inputs = block.get("inputs", {})
+		if not isinstance(inputs, dict): return set()
+		for desc in inputs.values():
+			if not isinstance(desc, list) or not desc or _input_tag(desc[0]) is None: return set()
+			for value in desc[1:3] if _input_tag(desc[0]) == 3 else desc[1:2]:
+				if value is not None and type(value) is not str and not isinstance(value, list): return set()
+	referenced = {container[key] for container, key in _block_slots(target)}
+	allowed = {"opcode", "next", "parent", "inputs", "fields", "shadow", "topLevel"}
+	orphans = set()
+	for bid, block in blocks.items():
+		if not isinstance(block, dict) or bid in referenced or set(block) - allowed: continue
+		if block.get("opcode") not in ("argument_reporter_boolean", "argument_reporter_string_number"): continue
+		if block.get("shadow") is not True or block.get("topLevel", False) is not False: continue
+		if block.get("next") is not None or block.get("inputs", {}) != {}: continue
+		fields = block.get("fields")
+		if not isinstance(fields, dict) or set(fields) != {"VALUE"}: continue
+		value = fields["VALUE"]
+		if not isinstance(value, list) or len(value) != 2 or type(value[0]) is not str or value[1] is not None: continue
+		parent = block.get("parent")
+		prototype = blocks.get(parent) if type(parent) is str else None
+		if isinstance(prototype, dict) and prototype.get("opcode") == "procedures_prototype":
+			orphans.add(bid)
+	return orphans
+
+
+def _prune_orphan_arguments(project, result=None):
+	"""For verification, accept either unchanged or fully pruned targets."""
+	pruned = dict(project)
+	pruned["targets"] = []
+	for ti, target in enumerate(project.get("targets", [])):
+		target = dict(target)
+		blocks = target.get("blocks")
+		if isinstance(blocks, dict):
+			orphans = _orphan_argument_ids(target)
+			if result is not None:
+				other_targets = result.get("targets", [])
+				other = other_targets[ti].get("blocks", {}) if ti < len(other_targets) else {}
+				if len(other) != len(blocks) - len(orphans): orphans = set()
+			target["blocks"] = {bid: block for bid, block in blocks.items() if bid not in orphans}
+		pruned["targets"].append(target)
+	return pruned
+
+
+_SYNC_REPORTERS = frozenset((
+	"operator_add", "operator_subtract", "operator_multiply", "operator_divide", "operator_random",
+	"operator_gt", "operator_lt", "operator_equals", "operator_and", "operator_or", "operator_not",
+	"operator_join", "operator_letter_of", "operator_length", "operator_contains", "operator_mod",
+	"operator_round", "operator_mathop", "argument_reporter_string_number", "argument_reporter_boolean",
+	"data_variable", "data_itemoflist", "data_itemnumoflist", "data_lengthoflist", "data_listcontainsitem",
+	"motion_xposition", "motion_yposition", "motion_direction", "looks_size", "looks_costumenumbername",
+	"looks_backdropnumbername", "sound_volume", "sensing_timer", "sensing_mousex", "sensing_mousey",
+	"sensing_mousedown", "sensing_keypressed", "sensing_current", "sensing_dayssince2000", "sensing_username",
+	"sensing_of", "sensing_answer", "sensing_loudness", "sensing_touchingobject", "sensing_touchingcolor",
+	"sensing_coloristouchingcolor", "sensing_distanceto",
+))
+
+_SPECIAL_ARGUMENT_NAMES = frozenset(("last key pressed", "is compiled?", "is turbowarp?"))
+_RESERVED_PROCEDURE_SYMBOLS = frozenset(("__proto__", "constructor", "prototype", "toString", "toLocaleString", "valueOf", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "mutation"))
+
+
+_SYNC_TERMINAL_COMMANDS = frozenset((
+	"data_setvariableto", "data_changevariableby", "data_addtolist", "data_deleteoflist",
+	"data_deletealloflist", "data_insertatlist", "data_replaceitemoflist",
+))
+_SYNC_TERMINAL_MENUS = frozenset((
+	"sensing_of_object_menu", "looks_costume", "sensing_keyoptions", "sound_sounds_menu",
+	"control_create_clone_of_menu", "looks_backdrops", "motion_goto_menu", "motion_pointtowards_menu",
+))
+
+
+def _terminal_link_ids(project):
+	if not isinstance(project, dict) or not isinstance(project.get("targets"), list): return {}
+	if project.get("extensionURLs") or project.get("extensionStorage"): return {}
+	extensions = project.get("extensions", [])
+	if not isinstance(extensions, list) or any(value not in ("pen", "music") for value in extensions): return {}
+	for target in project["targets"]:
+		if not isinstance(target, dict) or not isinstance(target.get("blocks", {}), dict) or target.get("extensionStorage"): return {}
+		for block in target.get("blocks", {}).values():
+			if isinstance(block, dict) and (type(block.get("opcode")) is not str or block["opcode"] not in _DATA_PRUNING_OPCODES): return {}
+	primitive_tags = {_number_components(str(i)): i for i in range(4, 14)}
+	result = {}
+	for ti, target in enumerate(project["targets"]):
+		blocks, memo = target.get("blocks", {}), {}
+		def input_refs(block):
+			inputs = block.get("inputs", {})
+			if not isinstance(inputs, dict): return None
+			refs = []
+			for desc in inputs.values():
+				if not isinstance(desc, list) or not desc: return None
+				tag = _input_tag(desc[0])
+				if tag not in (1, 2, 3) or len(desc) != (3 if tag == 3 else 2): return None
+				for value in desc[1:]:
+					if type(value) is str:
+						refs.append(value)
+					elif isinstance(value, list) and value:
+						kind = primitive_tags.get(_number_components(value[0])) if isinstance(value[0], JsonNumber) else value[0] if type(value[0]) in (int, float) else None
+						if kind not in range(4, 14) or len(value) != (3 if kind >= 11 else 2): return None
+					else: return None
+			return refs
+		def synchronous(root):
+			pending, active = [(root, None)], set()
+			while pending:
+				bid, children = pending.pop()
+				if children is not None:
+					memo[bid] = all(memo.get(child, False) for child in children)
+					active.discard(bid)
+					continue
+				if bid in memo: continue
+				if bid in active:
+					memo[bid] = False
+					continue
+				block = blocks.get(bid)
+				if not isinstance(block, dict) or block.get("next") is not None or not (block.get("opcode") in _SYNC_REPORTERS or block.get("opcode") in _SYNC_TERMINAL_MENUS and block.get("shadow") is True):
+					memo[bid] = False
+					continue
+				refs = input_refs(block)
+				if refs is None:
+					memo[bid] = False
+					continue
+				active.add(bid)
+				pending.append((bid, refs))
+				pending.extend((child, None) for child in refs)
+			return memo[root]
+		eligible = set()
+		for bid, block in blocks.items():
+			if not isinstance(block, dict) or block.get("next", False) is not None: continue
+			opcode = block.get("opcode")
+			candidate = opcode in _SYNC_TERMINAL_COMMANDS or opcode in _SYNC_TERMINAL_MENUS and block.get("shadow") is True
+			if opcode == "procedures_prototype":
+				parent = blocks.get(block.get("parent")) if type(block.get("parent")) is str else None
+				inputs = parent.get("inputs") if isinstance(parent, dict) and parent.get("opcode") == "procedures_definition" else None
+				desc = inputs.get("custom_block") if isinstance(inputs, dict) else None
+				candidate = isinstance(desc, list) and len(desc) == 2 and _input_tag(desc[0]) in (1, 2) and desc[1] == bid
+			if not candidate: continue
+			refs = input_refs(block)
+			if refs is not None and all(synchronous(child) for child in refs): eligible.add(bid)
+		if eligible: result[ti] = eligible
+	return result
+
+
+_COVERED_INPUT_OPCODES = _SYNC_REPORTERS | frozenset((
+	"procedures_call", "control_if", "control_if_else", "control_repeat", "control_repeat_until", "control_wait", "control_wait_until",
+	"data_setvariableto", "data_changevariableby", "data_addtolist", "data_deleteoflist", "data_insertatlist", "data_replaceitemoflist",
+	"motion_movesteps", "motion_turnright", "motion_turnleft", "motion_gotoxy", "motion_glidesecstoxy", "motion_pointindirection",
+	"motion_changexby", "motion_setx", "motion_changeyby", "motion_sety", "looks_sayforsecs", "looks_say", "looks_thinkforsecs",
+	"looks_think", "looks_changesizeby", "looks_setsizeto", "looks_changeeffectby", "looks_seteffectto", "looks_goforwardbackwardlayers",
+	"sound_changeeffectby", "sound_seteffectto", "sound_changevolumeby", "sound_setvolumeto", "sensing_askandwait",
+	"pen_setPenColorToColor", "pen_changePenColorParamBy", "pen_setPenColorParamTo", "pen_changePenSizeBy", "pen_setPenSizeTo",
+))
+
+
+def _covered_shadow_slots(project):
+	"""Yield only covered inline value defaults; these become absent when editing."""
+	token_kinds = {_number_components(str(value)): value for value in range(4, 14)}
+	def kind(value):
+		if isinstance(value, JsonNumber):
+			return token_kinds.get(_number_components(value))
+		return value if type(value) in (int, float) and value in range(4, 14) else None
+	for ti, target in enumerate(project.get("targets", [])):
+		blocks = target.get("blocks", {})
+		for bid, block in blocks.items():
+			if not isinstance(block, dict) or block.get("opcode") not in _COVERED_INPUT_OPCODES: continue
+			if block.get("opcode") == "procedures_call":
+				mutation = block.get("mutation", {})
+				if not isinstance(mutation, dict) or type(mutation.get("proccode")) is not str: continue
+				if set(mutation) - {"tagName", "children", "proccode", "argumentids", "warp"}: continue
+			for name, desc in (block.get("inputs") or {}).items():
+				if not isinstance(desc, list) or len(desc) != 3 or _input_tag(desc[0]) != 3: continue
+				active, shadow = desc[1:]
+				if not isinstance(shadow, list) or len(shadow) != 2 or kind(shadow[0]) not in (4, 5, 6, 7, 8, 9, 10): continue
+				if not isinstance(shadow[1], str): continue
+				if type(active) is str:
+					child = blocks.get(active)
+					if not active or not isinstance(child, dict) or child.get("parent") != bid or child.get("topLevel", False) is not False: continue
+				elif isinstance(active, list):
+					if len(active) != 3 or kind(active[0]) not in (12, 13) or type(active[1]) is not str or type(active[2]) is not str or not active[2]: continue
+				else: continue
+				yield ti, bid, name, desc
+
+
+def _restore_covered_shadows(original, result):
+	for ti, bid, name, before in _covered_shadow_slots(original):
+		try:
+			inputs = result["targets"][ti]["blocks"][bid]["inputs"]
+			after = inputs[name]
+			if isinstance(after, list) and len(after) == 2 and _input_tag(after[0]) == 2:
+				inputs[name] = [before[0], after[1], before[2]]
+		except (KeyError, IndexError, TypeError):
+			pass
+	return result
+
+
+def _procedure_symbol_info(target):
+	counts = [Counter(), Counter(), Counter()]
+	for block in (target.get("blocks") or {}).values():
+		if not isinstance(block, dict): continue
+		op = block.get("opcode")
+		if op in ("procedures_prototype", "procedures_call"):
+			mutation = block.get("mutation")
+			if not isinstance(mutation, dict) or type(mutation.get("proccode")) is not str: return None
+			if set(mutation) - {"tagName", "children", "proccode", "argumentids", "argumentnames", "argumentdefaults", "warp", "hasnext"}: return None
+			if mutation.get("tagName", "mutation") != "mutation" or mutation.get("children", []) != []: return None
+			code = mutation["proccode"]
+			if code in _RESERVED_PROCEDURE_SYMBOLS: return None
+			if "%" in re.sub(r"%[snb]", "", code): return None
+			counts[0][code] += 1
+			for key, index in (("argumentids", 1), ("argumentnames", 2)):
+				if key not in mutation:
+					if key == "argumentids" or op == "procedures_prototype": return None
+					continue
+				try: values = json.loads(mutation[key])
+				except (TypeError, ValueError): return None
+				if not isinstance(values, list) or any(type(v) is not str for v in values): return None
+				if len(values) != len(re.findall(r"%[snb]", code)): return None
+				if any(v in _RESERVED_PROCEDURE_SYMBOLS for v in values): return None
+				counts[index].update(values)
+			inputs = block.get("inputs", {})
+			if not isinstance(inputs, dict): return None
+			if list(inputs) != javascript_keys(inputs): return None
+			if set(inputs) - set(json.loads(mutation["argumentids"])): return None
+			counts[1].update(inputs.keys())
+		elif op in ("argument_reporter_string_number", "argument_reporter_boolean"):
+			value = (block.get("fields") or {}).get("VALUE")
+			if not isinstance(value, list) or not value or type(value[0]) is not str: return None
+			counts[2][value[0]] += 1
+	return counts
+
+
+def _compact_procedure_symbols(project, *, copy_result=True):
+	if copy_result: project = copy.deepcopy(project)
+	for target in project.get("targets", []):
+		counts = _procedure_symbol_info(target)
+		if counts is None: continue
+		maps = []
+		for index, frequencies in enumerate(counts):
+			def names():
+				return (name for name in _identifier_names(_RESERVED_PROCEDURE_SYMBOLS) if name.strip() and "%" not in name and "\\" not in name)
+			pool = names()
+			procedure_pools = {}
+			mapping = {}
+			for old in sorted(frequencies, key=lambda value: -frequencies[value]):
+				if index == 2 and old.lower() in _SPECIAL_ARGUMENT_NAMES:
+					mapping[old] = old
+					continue
+				if index == 0:
+					kinds = tuple(re.findall(r"%[snb]", old))
+					first = kinds not in procedure_pools
+					if first: procedure_pools[kinds] = names()
+					label = "" if kinds and first else next(procedure_pools[kinds])
+					name = " ".join(kinds) + label if kinds else label
+				else:
+					name = next(pool)
+				mapping[old] = name
+			maps.append(mapping)
+		for block in (target.get("blocks") or {}).values():
+			if not isinstance(block, dict): continue
+			op = block.get("opcode")
+			if op in ("procedures_prototype", "procedures_call"):
+				mutation = block["mutation"]
+				mutation["proccode"] = maps[0][mutation["proccode"]]
+				for key, index in (("argumentids", 1), ("argumentnames", 2)):
+					if key in mutation:
+						mutation[key] = json.dumps([maps[index][v] for v in json.loads(mutation[key])], ensure_ascii=False, separators=(",", ":"))
+				if "inputs" in block:
+					block["inputs"] = {maps[1][key]: value for key, value in block["inputs"].items()}
+			elif op in ("argument_reporter_string_number", "argument_reporter_boolean"):
+				block["fields"]["VALUE"][0] = maps[2][block["fields"]["VALUE"][0]]
+	return project
+
+
+def _restore_procedure_symbols(original, result, *, copy_result=True):
+	if copy_result: result = copy.deepcopy(result)
+	for left, right in zip(original.get("targets", []), result.get("targets", [])):
+		if _procedure_symbol_info(left) is None: continue
+		forward, reverse = [{}, {}, {}], [{}, {}, {}]
+		def pair(index, old, new):
+			if type(old) is not str or type(new) is not str or new in _RESERVED_PROCEDURE_SYMBOLS:
+				raise ValueError("invalid procedure symbol")
+			if (old in forward[index] and forward[index][old] != new) or (new in reverse[index] and reverse[index][new] != old):
+				raise ValueError("procedure symbol correspondence is not bijective")
+			if index == 2 and (old.lower() in _SPECIAL_ARGUMENT_NAMES or new.lower() in _SPECIAL_ARGUMENT_NAMES) and new != old:
+				raise ValueError("special argument reporter name changed")
+			forward[index][old], reverse[index][new] = new, old
+		pairs = []
+		for bid, block in (left.get("blocks") or {}).items():
+			if not isinstance(block, dict): continue
+			other = (right.get("blocks") or {}).get(bid)
+			if not isinstance(other, dict): continue
+			op = block.get("opcode")
+			if op in ("procedures_prototype", "procedures_call"):
+				a, b = block["mutation"], other.get("mutation", {})
+				pair(0, a["proccode"], b.get("proccode"))
+				if re.findall(r"%[snb]", a["proccode"]) != re.findall(r"%[snb]", b["proccode"]):
+					raise ValueError("procedure placeholder types changed")
+				for key, index in (("argumentids", 1), ("argumentnames", 2)):
+					if key not in a: continue
+					x, y = json.loads(a[key]), json.loads(b.get(key))
+					if not isinstance(y, list) or len(x) != len(y): raise ValueError("procedure argument count changed")
+					for old, new in zip(x, y): pair(index, old, new)
+				pairs.append((block, other))
+			elif op in ("argument_reporter_string_number", "argument_reporter_boolean"):
+				pair(2, block["fields"]["VALUE"][0], other["fields"]["VALUE"][0])
+		for block, other in pairs:
+			a, b = block["mutation"], other["mutation"]
+			b["proccode"] = reverse[0][b["proccode"]]
+			for key in ("argumentids", "argumentnames"):
+				if key in a: b[key] = a[key]
+			if "inputs" in other:
+				if list(other["inputs"]) != [forward[1][key] for key in block.get("inputs", {})]:
+					raise ValueError("procedure input keys or evaluation order changed")
+				other["inputs"] = {reverse[1][key]: value for key, value in other["inputs"].items()}
+		for block in (right.get("blocks") or {}).values():
+			if isinstance(block, dict) and block.get("opcode") in ("argument_reporter_string_number", "argument_reporter_boolean"):
+				value = block["fields"]["VALUE"]
+				value[0] = reverse[2].get(value[0], value[0])
+	return result
+
+
+_DATA_PRUNING_OPCODES = _COVERED_INPUT_OPCODES | frozenset((
+	"control_create_clone_of", "control_create_clone_of_menu", "control_delete_this_clone", "control_for_each",
+	"control_forever", "control_start_as_clone", "control_stop", "control_while", "control_all_at_once",
+	"data_deletealloflist", "data_listcontents", "data_showvariable", "data_hidevariable", "data_showlist", "data_hidelist",
+	"event_broadcast", "event_broadcastandwait", "event_broadcast_menu", "event_whenbroadcastreceived", "event_whenflagclicked",
+	"event_whenkeypressed", "event_whenthisspriteclicked", "event_whenstageclicked", "event_whenbackdropswitchesto", "event_whengreaterthan",
+	"looks_backdrops", "looks_cleargraphiceffects", "looks_costume", "looks_gotofrontback", "looks_hide", "looks_show",
+	"looks_switchbackdropto", "looks_switchbackdroptoandwait", "looks_nextbackdrop", "looks_switchcostumeto", "looks_nextcostume",
+	"motion_goto", "motion_goto_menu", "motion_glideto", "motion_glideto_menu", "motion_ifonedgebounce",
+	"motion_pointtowards", "motion_pointtowards_menu", "motion_setrotationstyle",
+	"music_midiSetInstrument", "music_playNoteForBeats", "music_setTempo", "music_getTempo", "music_changeTempo",
+	"music_playDrumForBeats", "music_midiPlayDrumForBeats", "music_restForBeats", "music_setInstrument", "music_menu_DRUM", "music_menu_INSTRUMENT",
+	"pen_clear", "pen_stamp", "pen_penDown", "pen_penUp", "pen_menu_colorParam", "pen_changePenHueBy", "pen_setPenHueToNumber",
+	"pen_changePenShadeBy", "pen_setPenShadeToNumber", "procedures_definition", "procedures_prototype",
+	"sensing_keyoptions", "sensing_of_object_menu", "sensing_of_property_menu", "sensing_touchingobjectmenu", "sensing_distancetomenu",
+	"sensing_resettimer", "sensing_setdragmode", "sound_play", "sound_playuntildone", "sound_sounds_menu", "sound_stopallsounds", "sound_cleareffects",
+	"math_number", "math_positive_number", "math_whole_number", "math_integer", "math_angle", "colour_picker", "text",
+))
+
+
+def _unused_data_ids(project):
+	"""Conservatively identify declarations unreachable by native ID or name lookup."""
+	targets = project.get("targets", [])
+	stages = [ti for ti, target in enumerate(targets) if target.get("isStage") is True]
+	extensions = project.get("extensions", [])
+	if len(stages) != 1 or not isinstance(extensions, list) or any(ext not in ("pen", "music") for ext in extensions):
+		return {}
+	if any(project.get(key) for key in ("extensionURLs", "extensionData", "extensionStorage")):
+		return {}
+	stage = stages[0]
+	ids, names = set(), set()
+	scopes = []
+	for target in targets:
+		seen = set()
+		for kind in ("variables", "lists", "broadcasts"):
+			table = target.get(kind, {})
+			if not isinstance(table, dict) or seen.intersection(table): return {}
+			seen.update(table)
+		scopes.append(seen)
+	primitive_kinds = {_number_components(str(tag)): tag for tag in range(4, 14)}
+	def mark(ti, kind, name, ident):
+		if type(ident) is str:
+			for owner in (ti, stage):
+				if ident in scopes[owner]:
+					ids.add((owner, ident))
+					return
+		for owner in (ti, stage):
+			if type(name) is str: names.add((owner, kind, name))
+	def primitive(ti, value):
+		if not isinstance(value, list) or not value: return False
+		tag = value[0]
+		if isinstance(tag, JsonNumber):
+			tag = primitive_kinds.get(_number_components(tag))
+		if type(tag) not in (int, float): return False
+		if tag in (4, 5, 6, 7, 8, 9, 10): return len(value) == 2
+		if tag not in (11, 12, 13) or len(value) not in (3, 5) or type(value[1]) is not str or type(value[2]) is not str: return False
+		mark(ti, {11: "broadcasts", 12: "variables", 13: "lists"}[tag], value[1], value[2])
+		return True
+	for ti, target in enumerate(targets):
+		if target.get("extensionStorage"): return {}
+		blocks = target.get("blocks", {})
+		if not isinstance(blocks, dict): return {}
+		for block in blocks.values():
+			if isinstance(block, list):
+				if not primitive(ti, block): return {}
+				continue
+			if not isinstance(block, dict) or block.get("opcode") not in _DATA_PRUNING_OPCODES: return {}
+			fields, inputs = block.get("fields", {}), block.get("inputs", {})
+			if not isinstance(fields, dict) or not isinstance(inputs, dict): return {}
+			if fields.keys() & inputs.keys(): return {}
+			op = block["opcode"]
+			data_field = "VARIABLE" if op in ("data_variable", "data_setvariableto", "data_changevariableby", "data_showvariable", "data_hidevariable", "control_for_each") else "LIST" if op.startswith("data_") else None
+			if data_field and data_field not in fields: return {}
+			for field, kind in (("VARIABLE", "variables"), ("LIST", "lists"), ("BROADCAST_OPTION", "broadcasts"), ("BROADCAST_INPUT", "broadcasts")):
+				if field not in fields: continue
+				value = fields[field]
+				if not isinstance(value, list) or len(value) not in (1, 2) or type(value[0]) is not str: return {}
+				ident = value[1] if len(value) > 1 else None
+				if ident is not None and type(ident) is not str: return {}
+				mark(ti, kind, value[0], ident)
+			for desc in inputs.values():
+				if not isinstance(desc, list) or not desc: return {}
+				tag = _input_tag(desc[0])
+				if tag is None or len(desc) != (3 if tag == 3 else 2): return {}
+				for value in desc[1:]:
+					if value is None or type(value) is str: continue
+					if not primitive(ti, value): return {}
+			if block.get("opcode") in ("sensing_of", "sensing_of_property_menu"):
+				prop = fields.get("PROPERTY")
+				if not isinstance(prop, list) or not prop or type(prop[0]) is not str: return {}
+				for owner in range(len(targets)): names.add((owner, "variables", prop[0]))
+	monitors = project.get("monitors", [])
+	if not isinstance(monitors, list): return {}
+	for monitor in monitors:
+		if not isinstance(monitor, dict) or monitor.get("opcode") not in _DATA_PRUNING_OPCODES: return {}
+		if type(monitor.get("id")) is not str: return {}
+		params = monitor.get("params", {})
+		if not isinstance(params, dict): return {}
+		if monitor["opcode"] in ("sensing_of", "sensing_of_property_menu"):
+			if type(params.get("PROPERTY")) is not str: return {}
+			for owner in range(len(targets)): names.add((owner, "variables", params["PROPERTY"]))
+		for owner in range(len(targets)):
+			for field, kind in (("VARIABLE", "variables"), ("LIST", "lists")):
+				mark(owner, kind, params.get(field), monitor.get("id"))
+	return {(ti, kind): frozenset(ident for ident, entry in target.get(kind, {}).items()
+		if ident and ident not in ("__proto__", "constructor", "prototype", "null", "undefined") and isinstance(entry, list) and len(entry) == 2
+		and type(entry[0]) is str and (kind != "lists" or isinstance(entry[1], list))
+		and (ti, ident) not in ids and (ti, kind, entry[0]) not in names)
+		for ti, target in enumerate(targets) for kind in ("variables", "lists")}
+
+
+def _restore_unused_data(original, result):
+	eligible = _unused_data_ids(original)
+	for ti, (left, right) in enumerate(zip(original.get("targets", []), result.get("targets", []))):
+		for kind in ("variables", "lists"):
+			before, after = left.get(kind), right.get(kind)
+			if not isinstance(before, dict) or not isinstance(after, dict): continue
+			missing = before.keys() - after.keys()
+			if not missing: continue
+			if not missing <= eligible.get((ti, kind), frozenset()):
+				raise ValueError("referenced, cloud, or unsupported data declaration removed")
+			if list(after) != [ident for ident in before if ident not in missing]:
+				raise ValueError("retained data declaration order changed")
+			right[kind] = {ident: before[ident] if ident in missing else after[ident] for ident in before}
+	return result
+
+
+def _editor_comment_ids(target):
+	if target.get("isStage") is not False or not isinstance(target.get("comments"), dict):
+		return frozenset()
+	return frozenset(cid for cid, comment in target["comments"].items()
+		if isinstance(comment, dict) and isinstance(comment.get("text"), str)
+		and "_twconfig_" not in comment["text"])
+
+
+def _editor_position_keys(block):
+	if not isinstance(block, dict) or block.get("topLevel") is not True or block.get("parent", False) is not None:
+		return ()
+	return tuple(key for key in ("x", "y") if isinstance(block.get(key), JsonNumber))
+
+
+def _restore_editor_metadata(original, result, strip_editor_comments, strip_script_positions):
+	for left, right in zip(original.get("targets", []), result.get("targets", [])):
+		missing = set()
+		if strip_editor_comments:
+			eligible = _editor_comment_ids(left)
+			before, after = left.get("comments"), right.get("comments")
+			if eligible and isinstance(after, dict):
+				missing = eligible - after.keys()
+				if missing:
+					if list(after) != [cid for cid in before if cid not in missing]:
+						raise ValueError("retained comment keys or order changed")
+					right["comments"] = {cid: before[cid] if cid in missing else after[cid] for cid in before}
+		for bid, block in (left.get("blocks") or {}).items():
+			other = (right.get("blocks") or {}).get(bid)
+			if not isinstance(block, dict) or not isinstance(other, dict):
+				continue
+			if isinstance(block.get("comment"), str) and block["comment"] in missing:
+				if "comment" in other:
+					raise ValueError("removed editor comment retains a block link")
+				other["comment"] = block["comment"]
+			if strip_script_positions:
+				for key in _editor_position_keys(block):
+					if key not in other:
+						other[key] = block[key]
+	return result
+
+
+def _procedure_display_plans(target):
+	blocks = target.get("blocks", {})
+	if not isinstance(blocks, dict): return []
+	candidates = []
+	allowed = {"opcode", "next", "parent", "inputs", "fields", "shadow", "topLevel", "mutation"}
+	for bid, prototype in blocks.items():
+		if not isinstance(prototype, dict) or prototype.get("opcode") != "procedures_prototype": continue
+		if set(prototype) - allowed or prototype.get("shadow") is not True or prototype.get("topLevel", False) is not False: continue
+		if prototype.get("next") is not None or prototype.get("fields", {}) != {}: continue
+		definition_id = prototype.get("parent")
+		definition = blocks.get(definition_id) if type(definition_id) is str else None
+		if not isinstance(definition, dict) or definition.get("opcode") != "procedures_definition": continue
+		if definition.get("parent") is not None or definition.get("topLevel") is not True: continue
+		inputs = definition.get("inputs")
+		if not isinstance(inputs, dict) or set(inputs) != {"custom_block"}: continue
+		desc = inputs["custom_block"]
+		if not isinstance(desc, list) or len(desc) != 2 or _input_tag(desc[0]) != 1 or desc[1] != bid: continue
+		mutation = prototype.get("mutation")
+		if not isinstance(mutation, dict) or set(mutation) - {"tagName", "children", "proccode", "argumentids", "argumentnames", "argumentdefaults", "warp"}: continue
+		if mutation.get("tagName") != "mutation" or mutation.get("children") != []: continue
+		if mutation.get("warp") not in (True, False, "true", "false"): continue
+		code = mutation.get("proccode")
+		if type(code) is not str or "%" in re.sub(r"%[snb]", "", code): continue
+		kinds = re.findall(r"%[snb]", code)
+		try:
+			ids, names, defaults = [json.loads(mutation[key]) for key in ("argumentids", "argumentnames", "argumentdefaults")]
+		except (KeyError, TypeError, ValueError): continue
+		if not all(isinstance(value, list) for value in (ids, names, defaults)): continue
+		if not kinds or not len(kinds) == len(ids) == len(names) == len(defaults): continue
+		if any(type(value) is not str for value in ids + names) or len(set(ids)) != len(ids): continue
+		inputs = prototype.get("inputs")
+		if not isinstance(inputs, dict) or list(inputs) != ids: continue
+		children = []
+		for ident, name, kind in zip(ids, names, kinds):
+			desc = inputs[ident]
+			if not isinstance(desc, list) or len(desc) != 2 or _input_tag(desc[0]) != 1 or type(desc[1]) is not str: break
+			child_id = desc[1]
+			child = blocks.get(child_id)
+			if not isinstance(child, dict) or set(child) - (allowed - {"mutation"}): break
+			expected = "argument_reporter_boolean" if kind == "%b" else "argument_reporter_string_number"
+			if child.get("opcode") != expected or child.get("parent") != bid or child.get("shadow") is not True: break
+			if child.get("next") is not None or child.get("inputs", {}) != {} or child.get("topLevel", False) is not False: break
+			if child.get("fields") not in ({"VALUE": [name]}, {"VALUE": [name, None]}): break
+			children.append(child_id)
+		else:
+			if len(set(children)) == len(children): candidates.append((definition_id, bid, children))
+	if not candidates: return []
+	try:
+		references, direct = Counter(), Counter()
+		for container, key in _block_slots(target):
+			references[container[key]] += 1
+			if key != "parent": direct[container[key]] += 1
+	except (KeyError, TypeError, IndexError): return []
+	return [(definition, prototype, children) for definition, prototype, children in candidates
+		if direct[prototype] == 1 and all(references[child] == 1 for child in children)]
+
+
+def _rebuild_procedure_displays(project):
+	if not isinstance(project, dict) or not isinstance(project.get("targets"), list): return project
+	if project.get("extensionURLs") or project.get("extensionStorage"): return project
+	extensions = project.get("extensions", [])
+	if not isinstance(extensions, list) or any(extension not in ("pen", "music") for extension in extensions): return project
+	for target in project.get("targets", []):
+		if not isinstance(target, dict) or not isinstance(target.get("blocks", {}), dict): return project
+		if any(isinstance(block, dict) and block.get("opcode") not in _DATA_PRUNING_OPCODES for block in target.get("blocks", {}).values()): return project
+	result = dict(project)
+	result["targets"] = []
+	for source in project.get("targets", []):
+		plans = _procedure_display_plans(source)
+		target = source
+		if plans:
+			target = dict(source)
+			blocks = target["blocks"] = dict(source["blocks"])
+			for definition, prototype, children in plans:
+				blocks[prototype] = dict(blocks[prototype])
+				blocks[prototype].pop("inputs")
+				blocks[prototype].pop("shadow")
+				blocks[definition] = dict(blocks[definition])
+				blocks[definition]["inputs"] = {"custom_block": [JsonNumber("2"), prototype]}
+				for child in children: del blocks[child]
+		result["targets"].append(target)
+	return result
+
+
+def exact_difference(original, result, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False, compact_reference_names=False, prune_orphan_arguments=False, compact_procedure_symbols=False, compact_reporter_defaults=False, strip_covered_shadows=False, strip_editor_comments=False, strip_script_positions=False, prune_unused_data=False, rebuild_procedure_displays=False, compact_terminal_links=False):
+	"""Compare exact values and ordered collections after authorized representation changes."""
+	if rebuild_procedure_displays:
+		original = _rebuild_procedure_displays(original)
+		result = _rebuild_procedure_displays(result)
+	if prune_orphan_arguments:
+		original = _prune_orphan_arguments(original, result)
+	if relabel_block_ids or compact_procedure_symbols or compact_reference_names or strip_covered_shadows or strip_editor_comments or strip_script_positions or prune_unused_data:
+		result = _copy_json(result)
 	if relabel_block_ids:
 		try:
-			result = restore_block_labels(original, result)
+			result = restore_block_labels(original, result, copy_result=False)
 		except (ValueError, KeyError, TypeError) as error:
 			return f"block ID correspondence failed: {error}"
+	if compact_procedure_symbols:
+		try:
+			result = _restore_procedure_symbols(original, result, copy_result=False)
+		except (ValueError, KeyError, TypeError, IndexError) as error:
+			return f"procedure symbol correspondence failed: {error}"
 	if compact_reference_names:
-		result = _restore_reference_names(original, result)
+		result = _restore_reference_names(original, result, copy_result=False)
+	if strip_covered_shadows:
+		result = _restore_covered_shadows(original, result)
+	if prune_unused_data:
+		try:
+			result = _restore_unused_data(original, result)
+		except (ValueError, KeyError, TypeError) as error:
+			return f"unused data verification failed: {error}"
+	if strip_editor_comments or strip_script_positions:
+		try:
+			result = _restore_editor_metadata(original, result, strip_editor_comments, strip_script_positions)
+		except (ValueError, KeyError, TypeError) as error:
+			return f"editor metadata verification failed: {error}"
+	terminal = _terminal_link_ids(original) if compact_terminal_links else {}
 	stack = [((), original, result)]
+	def mismatch(reason):
+		return f"{'/'.join(map(str, path)) or 'project'}: {reason}"
 	while stack:
 		path, left, right = stack.pop()
-		where = "/".join(map(str, path)) or "project"
 		if type(left) is not type(right):
-			return f"{where}: JSON value type changed"
+			return mismatch("JSON value type changed")
 		if isinstance(left, JsonNumber):
 			if _number_components(left) != _number_components(right):
-				return f"{where}: exact numeric value changed"
+				return mismatch("exact numeric value changed")
 		elif isinstance(left, dict):
+			block_record = _record_order_is_irrelevant(path)
+			if block_record and (compact_reporter_defaults or compact_defaults or compact_block_flags or compact_terminal_links):
+				right = dict(right)
+			if block_record and path[3] in terminal.get(path[1], ()) and left.get("next", False) is None and "next" not in right:
+				right["next"] = None
+			if compact_reporter_defaults and block_record and left.get("opcode") in _SYNC_REPORTERS:
+				if "next" in left and left["next"] is None and "next" not in right: right["next"] = None
+				if isinstance(right.get("fields"), dict):
+					right["fields"] = dict(right["fields"])
+					for name, value in (left.get("fields") or {}).items():
+						if name not in ("VARIABLE", "LIST", "BROADCAST_OPTION") and isinstance(value, list) and len(value) == 2 and value[1] is None and right["fields"].get(name) == value[:1]:
+							right["fields"][name] = value
 			if compact_costume_references and len(path) == 4 and path[0] == "targets" and path[2] == "costumes":
 				removed = {}
 				canonical = _canonical_costume_filename(left)
@@ -236,29 +873,27 @@ def exact_difference(original, result, compact_defaults=False, compact_costume_r
 					removed["md5ext"] = canonical
 				if removed:
 					if list(right) != [key for key in left if key not in removed]:
-						return f"{where}: costume keys or their order changed"
+						return mismatch("costume keys or their order changed")
 					right = {key: removed[key] if key in removed else right[key] for key in left}
-			if compact_defaults and _record_order_is_irrelevant(path):
-				right = dict(right)
+			if compact_defaults and block_record:
 				for key in ("inputs", "fields"):
 					if left.get(key) == {} and key not in right:
 						right[key] = {}
-			if compact_block_flags and _record_order_is_irrelevant(path):
-				right = dict(right)
+			if compact_block_flags and block_record:
 				for key in ("topLevel", "shadow"):
 					if left.get(key) is False and key not in right:
 						right[key] = False
 			if set(left) != set(right):
-				return f"{where}: object keys changed"
-			if not _record_order_is_irrelevant(path) and list(left) != list(right):
-				return f"{where}: collection order changed"
+				return mismatch("object keys changed")
+			if not block_record and list(left) != list(right):
+				return mismatch("collection order changed")
 			stack.extend((path + (key,), left[key], right[key]) for key in left)
 		elif isinstance(left, list):
 			if len(left) != len(right):
-				return f"{where}: array length changed"
+				return mismatch("array length changed")
 			stack.extend((path + (index,), a, b) for index, (a, b) in enumerate(zip(left, right)))
 		elif left != right:
-			return f"{where}: JSON value changed"
+			return mismatch("JSON value changed")
 	return None
 
 
@@ -303,18 +938,48 @@ def _canonical_costume_filename(costume):
 	return None
 
 
-def compact_representation(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, compact_reference_names=False):
+def compact_representation(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, compact_reference_names=False, prune_orphan_arguments=False, compact_procedure_symbols=False, compact_reporter_defaults=False, strip_covered_shadows=False, strip_editor_comments=False, strip_script_positions=False, prune_unused_data=False, rebuild_procedure_displays=False, compact_terminal_links=False):
+	if compact_procedure_symbols or compact_reference_names or strip_covered_shadows or rebuild_procedure_displays:
+		project = _copy_json(project)
+	if prune_orphan_arguments:
+		project = _prune_orphan_arguments(project)
+	if rebuild_procedure_displays:
+		project = _rebuild_procedure_displays(project)
+	if strip_covered_shadows:
+		for ti, bid, name, desc in _covered_shadow_slots(project):
+			project["targets"][ti]["blocks"][bid]["inputs"][name] = [JsonNumber("2"), desc[1]]
+	if compact_procedure_symbols:
+		project = _compact_procedure_symbols(project, copy_result=False)
 	result = dict(project)
 	result["targets"] = []
-	for source in project.get("targets", []):
+	unused = _unused_data_ids(project) if prune_unused_data else {}
+	terminal = _terminal_link_ids(project) if compact_terminal_links else {}
+	for ti, source in enumerate(project.get("targets", [])):
 		target = dict(source)
-		if isinstance(source.get("blocks"), dict) and (compact_defaults or compact_block_flags):
+		for kind in ("variables", "lists"):
+			if unused.get((ti, kind)):
+				target[kind] = {ident: entry for ident, entry in source[kind].items() if ident not in unused[ti, kind]}
+		removed_comments = _editor_comment_ids(source) if strip_editor_comments else frozenset()
+		if removed_comments:
+			target["comments"] = {cid: comment for cid, comment in source["comments"].items() if cid not in removed_comments}
+		if isinstance(source.get("blocks"), dict) and (compact_defaults or compact_block_flags or compact_reporter_defaults or removed_comments or strip_script_positions or compact_terminal_links):
 			target["blocks"] = {}
 			for bid, block in source["blocks"].items():
 				if isinstance(block, dict):
 					block = {key: value for key, value in block.items()
 						if not (compact_defaults and key in ("inputs", "fields") and value == {})
 						and not (compact_block_flags and key in ("topLevel", "shadow") and value is False)}
+					if isinstance(block.get("comment"), str) and block["comment"] in removed_comments:
+						del block["comment"]
+					if strip_script_positions:
+						for key in _editor_position_keys(block):
+							del block[key]
+					if bid in terminal.get(ti, ()): block.pop("next")
+					if compact_reporter_defaults and block.get("opcode") in _SYNC_REPORTERS:
+						if block.get("next", False) is None: block.pop("next")
+						if isinstance(block.get("fields"), dict):
+							block["fields"] = {key: value[:1] if key not in ("VARIABLE", "LIST", "BROADCAST_OPTION") and isinstance(value, list) and len(value) == 2 and value[1] is None else value
+								for key, value in block["fields"].items()}
 				target["blocks"][bid] = block
 		if compact_costume_references and isinstance(source.get("costumes"), list):
 			target["costumes"] = []
@@ -327,17 +992,19 @@ def compact_representation(project, compact_defaults=False, compact_costume_refe
 				target["costumes"].append(costume)
 		result["targets"].append(target)
 	if compact_reference_names:
-		result = copy.deepcopy(result)
 		strip_reference_names(result, Counter())
 	return result
 
 
-def minimum_json_size(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False, compact_reference_names=False):
+def minimum_json_size(project, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False, compact_reference_names=False, prune_orphan_arguments=False, compact_procedure_symbols=False, compact_reporter_defaults=False, strip_covered_shadows=False, strip_editor_comments=False, strip_script_positions=False, prune_unused_data=False, rebuild_procedure_displays=False, compact_terminal_links=False, *, _prepared=None):
 	"""Exact lower bound for the selected fixed-tree representation model."""
-	project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags, compact_reference_names)
-	identifier_cost = None
-	if relabel_block_ids:
-		project, _, identifier_cost = relabel_blocks(project)
+	if _prepared is None:
+		project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags, compact_reference_names, prune_orphan_arguments, compact_procedure_symbols, compact_reporter_defaults, strip_covered_shadows, strip_editor_comments, strip_script_positions, prune_unused_data, rebuild_procedure_displays, compact_terminal_links)
+		identifier_cost = None
+		if relabel_block_ids:
+			project, _, identifier_cost = relabel_blocks(project, copy_result=not (compact_procedure_symbols or compact_reference_names or strip_covered_shadows))
+	else:
+		project, identifier_cost = _prepared
 	counts = dict(structure=0, keys=0, strings=0, numbers=0, literals=0)
 	@lru_cache(maxsize=65536)
 	def string_size(value):
@@ -362,9 +1029,11 @@ def minimum_json_size(project, compact_defaults=False, compact_costume_reference
 		else:
 			raise TypeError(f"unsupported exact JSON value: {type(value).__name__}")
 	visit(project)
-	return {"model": "fixed-resolved-references-v4" if compact_reference_names else "fixed-graph-block-ids-v3" if relabel_block_ids else "fixed-tree-v2", "minimum_bytes": sum(counts.values()), "components": counts,
+	return {"model": "selected-terminal-links-v13" if compact_terminal_links else "selected-procedure-displays-v12" if rebuild_procedure_displays else "selected-unused-data-v11" if prune_unused_data else "selected-editor-metadata-v10" if strip_editor_comments or strip_script_positions else "selected-signature-symbols-v9" if compact_procedure_symbols else "selected-covered-shadows-v8" if strip_covered_shadows else "fixed-sync-reporters-v6" if compact_reporter_defaults else "fixed-live-arguments-v5" if prune_orphan_arguments else "fixed-resolved-references-v4" if compact_reference_names else "fixed-graph-block-ids-v3" if relabel_block_ids else "fixed-tree-v2", "minimum_bytes": sum(counts.values()), "components": counts,
+		"rebuild_procedure_displays": rebuild_procedure_displays, "procedure_editing_state_preserved": not rebuild_procedure_displays,
+		"compact_terminal_links": compact_terminal_links, "terminal_link_presence_preserved": not compact_terminal_links,
 		"compact_block_defaults": compact_defaults, "compact_costume_references": compact_costume_references,
-		"compact_block_flags": compact_block_flags, "compact_reference_names": compact_reference_names, "identifier_cost": identifier_cost, "global_scratch_minimum_proven": False}
+		"compact_block_flags": compact_block_flags, "compact_reference_names": compact_reference_names, "prune_orphan_arguments": prune_orphan_arguments, "compact_procedure_symbols": compact_procedure_symbols, "compact_reporter_defaults": compact_reporter_defaults, "strip_covered_shadows": strip_covered_shadows, "strip_editor_comments": strip_editor_comments, "strip_script_positions": strip_script_positions, "prune_unused_data": prune_unused_data, "covered_defaults_preserved": not strip_covered_shadows, "symbol_assignment_optimal_proven": not compact_procedure_symbols, "identifier_cost": identifier_cost, "global_scratch_minimum_proven": False}
 
 
 def _index_key(key):
@@ -418,9 +1087,9 @@ def _identifier_names(reserved):
 		length += 1
 
 
-def relabel_blocks(project):
+def relabel_blocks(project, *, copy_result=True):
 	"""Minimize identifier bytes for a fixed graph; preserve dangling edges."""
-	result = copy.deepcopy(project)
+	result = copy.deepcopy(project) if copy_result else project
 	maps, cost = {}, dict(before=0, after=0, identifiers=0, occurrences=0)
 	for ti, target in enumerate(result.get("targets", [])):
 		blocks = target.get("blocks")
@@ -475,11 +1144,11 @@ def relabel_blocks(project):
 	return result, maps, cost
 
 
-def restore_block_labels(original, result):
+def restore_block_labels(original, result, *, copy_result=True):
 	"""Infer bijections independently from semantic record order, not optimizer maps."""
 	if len(original.get("targets", [])) != len(result.get("targets", [])):
 		raise ValueError("target count changed")
-	result = copy.deepcopy(result)
+	if copy_result: result = copy.deepcopy(result)
 	for left, right in zip(original.get("targets", []), result.get("targets", [])):
 		if "blocks" not in left and "blocks" not in right: continue
 		if "blocks" not in left or "blocks" not in right: raise ValueError("block table presence changed")
@@ -661,21 +1330,25 @@ def get_zopfli(required=False):
 	return zopfli.zlib.compress
 
 
-def zopfli_deflate(data, compress, iterations=15):
-	candidates = [
-		compress(data, numiterations=iterations)[2:-4],
-		compress(data, numiterations=iterations, blocksplittingmax=0)[2:-4],
-	]
+def zopfli_deflate(data, compress, iterations=15, *, parallel=False):
+	options = ({"numiterations": iterations}, {"numiterations": iterations, "blocksplittingmax": 0})
+	if parallel and len(data) >= 65536 and (os.cpu_count() or 1) > 1:
+		with ThreadPoolExecutor(max_workers=2) as pool:
+			jobs = [pool.submit(compress, data, **kwargs) for kwargs in options]
+			candidates = [job.result()[2:-4] for job in jobs]
+	else:
+		candidates = [compress(data, **kwargs)[2:-4] for kwargs in options]
 	return min(candidates, key=len)
 
 
 def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zopfli_required=True, compact_defaults=False,
-	compact_costume_references=False, compact_block_flags=False, minimum_json=False, search_rounds=0, relabel_block_ids=False, compact_reference_names=False):
-	"""Search encodings, preserving every value and every block/input order."""
+	compact_costume_references=False, compact_block_flags=False, minimum_json=False, search_rounds=0, relabel_block_ids=False, compact_reference_names=False, prune_orphan_arguments=False, compact_procedure_symbols=False, compact_reporter_defaults=False, fast_json=False, strip_covered_shadows=False, strip_editor_comments=False, strip_script_positions=False, prune_unused_data=False, rebuild_procedure_displays=False, compact_terminal_links=False):
+	"""Search encodings and verify only explicitly allowed representation changes."""
 	baseline = dumps_exact(project)
-	search_project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags, compact_reference_names)
+	search_project = compact_representation(project, compact_defaults, compact_costume_references, compact_block_flags, compact_reference_names, prune_orphan_arguments, compact_procedure_symbols, compact_reporter_defaults, strip_covered_shadows, strip_editor_comments, strip_script_positions, prune_unused_data, rebuild_procedure_displays, compact_terminal_links)
+	identifier_cost = None
 	if relabel_block_ids:
-		search_project, _, _ = relabel_blocks(search_project)
+		search_project, _, identifier_cost = relabel_blocks(search_project, copy_result=not (compact_procedure_symbols or compact_reference_names or strip_covered_shadows))
 	best_raw = dumps_exact(search_project, True) if minimum_json else baseline
 	best_compressed = deflate(best_raw, level)
 	rank = (lambda encoded, raw: (len(raw), len(encoded))) if minimum_json else (lambda encoded, raw: (len(encoded), len(raw)))
@@ -693,9 +1366,9 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 	best_label = "original-order/zlib"
 	trials = 1
 	seen = set()
-	screened_orders, screen_trials = _screen_record_orders(search_project, level)
+	screened_orders, screen_trials = ((), 0) if fast_json else _screen_record_orders(search_project, level)
 	trials += screen_trials
-	orders = tuple(dict.fromkeys((*BLOCK_KEY_ORDERS, *screened_orders)))
+	orders = BLOCK_KEY_ORDERS[:3] if fast_json else tuple(dict.fromkeys((*BLOCK_KEY_ORDERS, *screened_orders)))
 	for short_numbers in (False, True):
 		if minimum_json and not short_numbers: continue
 		parts, shapes = _layout_parts(search_project, short_numbers), {}
@@ -713,7 +1386,7 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 					best_label = f"layout-{order_index}/{'short-numbers' if short_numbers else 'original-numbers'}/{compressor}"
 	# Different sprites benefit from different record layouts. Measure them separately,
 	# then evaluate their combination against the complete project stream.
-	if isinstance(search_project.get("targets"), list):
+	if not fast_json and isinstance(search_project.get("targets"), list):
 		adaptive = dict(search_project)
 		adaptive["targets"] = []
 		for target in search_project["targets"]:
@@ -734,7 +1407,7 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 				if rank(compressed, candidate) < rank(best_compressed, best_raw):
 					best_raw, best_compressed = candidate, compressed
 					best_label = f"per-target/short-numbers/{compressor}"
-	for grouping in ("shape", "opcode", "target-opcode"):
+	for grouping in (() if fast_json else ("shape", "opcode", "target-opcode")):
 		specialized, specialized_trials = _specialized_layout(search_project, orders, level, grouping)
 		trials += specialized_trials
 		for short_numbers in (False, True):
@@ -750,7 +1423,7 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 				if rank(compressed, candidate) < rank(best_compressed, best_raw):
 					best_raw, best_compressed = candidate, compressed
 					best_label = f"per-{grouping}/{'short-numbers' if short_numbers else 'original-numbers'}/{compressor}"
-	for round_index in range(search_rounds):
+	for round_index in range(0 if fast_json else search_rounds):
 		candidate, window_trials = _window_layout(loads_exact(best_raw), orders, level, 128 if round_index % 2 == 0 else 64)
 		trials += window_trials
 		for compressor, compressed in _compressions(candidate, level, False):
@@ -768,25 +1441,37 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 		remember(best_raw, best_compressed)
 		if search_rounds > 1:
 			for _, candidate in pool[:2]:
-				compressed = zopfli_deflate(candidate, zopfli, min(iterations, 2)); trials += 1
+				compressed = zopfli_deflate(candidate, zopfli, min(iterations, 2), parallel=True); trials += 1
 				if rank(compressed, candidate) < rank(best_compressed, best_raw):
 					best_raw, best_compressed = candidate, compressed
 					best_label = "Zopfli-ranked layouts"
-		compressed = zopfli_deflate(best_raw, zopfli, iterations)
+		compressed = zopfli_deflate(best_raw, zopfli, iterations, parallel=True)
 		trials += 1
 		if len(compressed) < len(best_compressed):
 			best_compressed = compressed
 			best_label += "/zopfli"
-	difference = exact_difference(project, loads_exact(best_raw), compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids, compact_reference_names)
+	result = loads_exact(best_raw)
+	difference = exact_difference(project, result, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids, compact_reference_names, prune_orphan_arguments, compact_procedure_symbols, compact_reporter_defaults, strip_covered_shadows, strip_editor_comments, strip_script_positions, prune_unused_data, rebuild_procedure_displays, compact_terminal_links)
 	if difference or zlib.decompress(best_compressed, -15) != best_raw:
 		raise ValueError(f"JSON encoding verification failed: {difference or 'DEFLATE mismatch'}")
+	removed = sum(len(a.get("blocks", {})) - len(b.get("blocks", {})) for a, b in zip(project.get("targets", []), result.get("targets", [])))
+	orphan_removed = removed
+	if rebuild_procedure_displays:
+		orphan_removed = sum(min(len(_orphan_argument_ids(a)), max(0, len(a.get("blocks", {})) - len(b.get("blocks", {})))) for a, b in zip(project.get("targets", []), result.get("targets", []))) if prune_orphan_arguments else 0
 	return best_raw, best_compressed, {
 		"json_encoding_trials": trials,
 		"json_encoding_bytes_saved": len(baseline) - len(best_raw),
 		"json_deflate_bytes_saved": len(deflate(baseline, level)) - len(best_compressed),
 		"json_encoding": best_label,
 		"zopfli_available": zopfli is not None,
-		"json_minimum": minimum_json_size(project, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids, compact_reference_names),
+		"orphan_argument_blocks_removed": orphan_removed,
+		"procedure_display_blocks_removed": removed - orphan_removed,
+		"terminal_links_removed": sum(len(ids) for ids in _terminal_link_ids(project).values()) if compact_terminal_links else 0,
+		"covered_defaults_removed": sum(1 for _ in _covered_shadow_slots(project)) - sum(1 for _ in _covered_shadow_slots(result)) if strip_covered_shadows else 0,
+		"editor_comments_removed": sum(len(a.get("comments", {})) - len(b.get("comments", {})) for a, b in zip(project.get("targets", []), result.get("targets", []))) if strip_editor_comments else 0,
+		"script_position_values_removed": sum(len(_editor_position_keys(block)) for target in project.get("targets", []) for block in target.get("blocks", {}).values()) - sum(len(_editor_position_keys(block)) for target in result.get("targets", []) for block in target.get("blocks", {}).values()) if strip_script_positions else 0,
+		"unused_data_declarations_removed": sum(len(a.get(kind, {})) - len(b.get(kind, {})) for a, b in zip(project.get("targets", []), result.get("targets", [])) for kind in ("variables", "lists")) if prune_unused_data else 0,
+		"json_minimum": minimum_json_size(project, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids, compact_reference_names, prune_orphan_arguments, compact_procedure_symbols, compact_reporter_defaults, strip_covered_shadows, strip_editor_comments, strip_script_positions, prune_unused_data, rebuild_procedure_displays, compact_terminal_links, _prepared=(search_project, identifier_cost)),
 	}
 
 
@@ -1463,7 +2148,7 @@ def prompt_for_lists(project, candidates, project_bytes) -> set | None:
 		f"  {'#':>3}  {'scope':<{w_scope}}  {'list':<{w_name}}  {'items':>6}  {'bytes':>8}  usage"
 	)
 	for i, c in enumerate(candidates, 1):
-		nm = c["name"] if len(c["name"]) <= w_name else c["name"][: w_name - 1] + "…"
+		nm = c["name"] if len(c["name"]) <= w_name else c["name"][: w_name - 1] + "Ã¢â‚¬Â¦"
 		mark = Ansi.warning("!") if c["risky"] else " "
 		print(
 			f" {mark}{i:>3}  {c['scope']:<{w_scope}}  {nm:<{w_name}}  {c['items']:>6,}  {c['bytes']:>8,}  {c['label']}"
@@ -1640,8 +2325,21 @@ def _collect_data_references(project, var_owners=None, list_owners=None):
 	var_refs = {}
 	list_refs = {}
 	broadcast_refs = {}
+	named_ids = {}
+	for ti, target in enumerate(targets):
+		for kind in ("variables", "lists"):
+			for ident, entry in (target.get(kind) or {}).items():
+				if isinstance(entry, list) and entry and isinstance(entry[0], str):
+					named_ids.setdefault((ti, kind, entry[0]), []).append(ident)
 
-	def add_var_ref(ti, i, desc):
+	def add_named_refs(ti, kind, name, refs, desc):
+		if not isinstance(name, str): return
+		for owner in {ti, stage_index}:
+			for ident in named_ids.get((owner, kind, name), ()):
+				refs.setdefault((owner, ident), []).append(desc)
+
+	def add_var_ref(ti, i, desc, name=None):
+		add_named_refs(ti, "variables", name, var_refs, desc)
 		if not isinstance(i, str):
 			return
 		target_ids = targets[ti].get("variables", {})
@@ -1654,7 +2352,8 @@ def _collect_data_references(project, var_owners=None, list_owners=None):
 		else:
 			var_refs.setdefault((ti, i), []).append(desc)
 
-	def add_list_ref(ti, i, desc):
+	def add_list_ref(ti, i, desc, name=None):
+		add_named_refs(ti, "lists", name, list_refs, desc)
 		if not isinstance(i, str):
 			return
 		target_ids = targets[ti].get("lists", {})
@@ -1675,9 +2374,9 @@ def _collect_data_references(project, var_owners=None, list_owners=None):
 
 			if isinstance(block, list) and len(block) > 2 and isinstance(block[2], str):
 				if block[0] == 12:
-					add_var_ref(ti, block[2], desc)
+					add_var_ref(ti, block[2], desc, block[1])
 				elif block[0] == 13:
-					add_list_ref(ti, block[2], desc)
+					add_list_ref(ti, block[2], desc, block[1])
 				elif block[0] == 11:
 					broadcast_refs.setdefault(block[2], []).append(desc)
 
@@ -1687,9 +2386,9 @@ def _collect_data_references(project, var_owners=None, list_owners=None):
 						continue
 					tag = node[0]
 					if tag == 12:
-						add_var_ref(ti, node[2], desc)
+						add_var_ref(ti, node[2], desc, node[1])
 					elif tag == 13:
-						add_list_ref(ti, node[2], desc)
+						add_list_ref(ti, node[2], desc, node[1])
 					elif tag == 11:
 						broadcast_refs.setdefault(node[2], []).append(desc)
 
@@ -1697,6 +2396,8 @@ def _collect_data_references(project, var_owners=None, list_owners=None):
 				continue
 			fields = block.get("fields") or {}
 			for name, f in fields.items():
+				if isinstance(f, list) and f and name in ("VARIABLE", "LIST"):
+					add_named_refs(ti, "variables" if name == "VARIABLE" else "lists", f[0], var_refs if name == "VARIABLE" else list_refs, desc)
 				if not (isinstance(f, list) and len(f) > 1 and isinstance(f[1], str)):
 					continue
 				if name == "VARIABLE":
@@ -1706,7 +2407,7 @@ def _collect_data_references(project, var_owners=None, list_owners=None):
 				elif name in ("BROADCAST_OPTION", "BROADCAST_INPUT"):
 					broadcast_refs.setdefault(f[1], []).append(desc)
 
-			if block.get("opcode") == "sensing_of_property_menu":
+			if block.get("opcode") in ("sensing_of", "sensing_of_property_menu"):
 				prop_field = fields.get("PROPERTY")
 				if (
 					isinstance(prop_field, list)
@@ -1741,9 +2442,9 @@ def _collect_data_references(project, var_owners=None, list_owners=None):
 		mid = m.get("id")
 		desc = f"monitor {mid!r} ({op})"
 		if op == "data_variable" and isinstance(mid, str):
-			add_var_ref(ti, mid, desc)
+			add_var_ref(ti, mid, desc, (m.get("params") or {}).get("VARIABLE"))
 		elif op == "data_listcontents" and isinstance(mid, str):
-			add_list_ref(ti, mid, desc)
+			add_list_ref(ti, mid, desc, (m.get("params") or {}).get("LIST"))
 
 	return var_refs, list_refs, broadcast_refs
 
@@ -3269,8 +3970,9 @@ def _iter_input_block_refs(value):
 			yield from _iter_input_block_refs(item)
 
 
-def _repair_dangling_block_refs(target):
+def _repair_dangling_block_refs(target, preserve_comments=False, preserve_refs=()):
 	blocks = target.get("blocks", {})
+	available = blocks.keys() | set(preserve_refs)
 	fixed = 0
 
 	# remove unresolved refs
@@ -3279,14 +3981,16 @@ def _repair_dangling_block_refs(target):
 			continue
 		for key in ("next", "parent"):
 			ref = block.get(key)
-			if isinstance(ref, str) and ref not in blocks:
+			if isinstance(ref, str) and ref not in available:
+				if key == "parent" and _is_known_orphan_argument_reporter(block, blocks):
+					continue
 				block[key] = None
 				fixed += 1
 		inputs = block.get("inputs")
 		if not isinstance(inputs, dict):
 			continue
 		for name in list(inputs):
-			fixed_value, changed = _repair_dangling_block_ref(inputs[name], blocks)
+			fixed_value, changed = _repair_dangling_block_ref(inputs[name], available)
 			if not changed:
 				continue
 			if fixed_value is None:
@@ -3332,7 +4036,7 @@ def _repair_dangling_block_refs(target):
 			child["parent"] = next(iter(owners))
 			fixed += 1
 
-	comments = target.get("comments") or {}
+	comments = {} if preserve_comments else target.get("comments") or {}
 	for cid in list(comments):
 		c = comments[cid]
 		if (
@@ -7892,7 +8596,7 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 		f"  {'#':>4}  {'scope':<{w_scope}}  {'variable':<{w_name}}  {'uses':>5}  {'bytes':>8}  notes"
 	)
 	for i, c in enumerate(candidates, 1):
-		nm = c["name"] if len(c["name"]) <= w_name else c["name"][: w_name - 1] + "…"
+		nm = c["name"] if len(c["name"]) <= w_name else c["name"][: w_name - 1] + "Ã¢â‚¬Â¦"
 		notes = []
 		if c["bytes"] < 0:
 			notes.append("LOSS")
@@ -8253,13 +8957,33 @@ class Options:
 		json_search_rounds=0,
 		relabel_block_ids=False,
 		auto_zopfli=False,
+		prune_orphan_arguments=False,
+		compact_procedure_symbols=False,
+		compact_reporter_defaults=False,
+		fast_json=False,
+		strip_covered_shadows=False,
+		strip_editor_comments=False,
+		strip_script_positions=False,
+		prune_unused_data=False,
+		rebuild_procedure_displays=False,
+		compact_terminal_links=False,
 	):
-		self.lossless = lossless or all_lossless
+		self.lossless = lossless or all_lossless or prune_orphan_arguments or compact_procedure_symbols or compact_reporter_defaults or fast_json or strip_covered_shadows or strip_editor_comments or strip_script_positions or prune_unused_data or rebuild_procedure_displays or compact_terminal_links
+		self.rebuild_procedure_displays = rebuild_procedure_displays
+		self.compact_terminal_links = compact_terminal_links
+		self.strip_covered_shadows = strip_covered_shadows
+		self.strip_editor_comments = strip_editor_comments
+		self.prune_unused_data = prune_unused_data
+		self.strip_script_positions = strip_script_positions
+		self.fast_json = fast_json
+		self.prune_orphan_arguments = prune_orphan_arguments
+		self.compact_procedure_symbols = compact_procedure_symbols
+		self.compact_reporter_defaults = compact_reporter_defaults
 		self.all_lossless = all_lossless
 		self.optimize_json = optimize_json or self.lossless or zopfli or auto_zopfli or compact_block_defaults or compact_costume_references or compact_block_flags or minimum_json or bool(json_search_rounds) or relabel_block_ids
 		self.optimize_assets = optimize_assets or all_lossless or zopfli_assets or auto_zopfli
 		self.compact_block_defaults = compact_block_defaults or all_lossless
-		self.zopfli = zopfli or all_lossless or auto_zopfli
+		self.zopfli = zopfli or ((all_lossless or auto_zopfli) and not fast_json)
 		self.zopfli_assets = zopfli_assets
 		self.auto_zopfli = auto_zopfli
 		self.relabel_block_ids = relabel_block_ids
@@ -8267,7 +8991,7 @@ class Options:
 		self.zopfli_iterations = int(zopfli_iterations)
 		self.compact_costume_references = compact_costume_references or all_lossless
 		self.compact_block_flags = compact_block_flags
-		self.minimum_json = minimum_json or all_lossless
+		self.minimum_json = minimum_json or all_lossless or fast_json
 		self.json_search_rounds = int(json_search_rounds) or (1 if all_lossless else 0)
 		if self.json_search_rounds < 0:
 			raise ValueError("json_search_rounds must be nonnegative")
@@ -8421,6 +9145,7 @@ class Options:
 def apply_transforms(project, opts: Options, assets=None):
 	if opts.lossless:
 		return Counter()
+	inherited_dangling = [_dangling_block_ids(target) for target in project.get("targets", [])]
 	stats = minify_blocks(project)
 	if opts.convert_wav_to_mp3 and assets is not None:
 		opts.wav_conversions = convert_wav_sounds_to_mp3(project, assets, stats)
@@ -8551,8 +9276,8 @@ def apply_transforms(project, opts: Options, assets=None):
 		strip_reference_names(project, stats)
 	if opts.remove_unused_extensions:
 		remove_unused_extensions(project, stats, opts)
-	for target in project.get("targets", []):
-		stats["dangling_block_refs_fixed"] += _repair_dangling_block_refs(target)
+	for ti, target in enumerate(project.get("targets", [])):
+		stats["dangling_block_refs_fixed"] += _repair_dangling_block_refs(target, preserve_comments=not opts.comments, preserve_refs=inherited_dangling[ti])
 	return stats
 
 
@@ -8845,25 +9570,32 @@ def _find_dangling_broadcast(value, valid):
 	return None
 
 
-def _check_block_references_resolve(project):
-	for target in project.get("targets", []):
+def _check_block_references_resolve(project, original=None):
+	original_targets = original.get("targets", []) if original is not None else []
+	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks", {})
+		old_blocks = original_targets[ti].get("blocks", {}) if ti < len(original_targets) else {}
 		for bid, block in blocks.items():
 			if not isinstance(block, dict):
 				continue
+			old_block = old_blocks.get(bid)
+			if not isinstance(old_block, dict): old_block = {}
 			parent = block.get("parent")
 			if (
 				isinstance(parent, str)
 				and parent not in blocks
 				and not _is_known_orphan_argument_reporter(block, blocks)
+				and not (parent not in old_blocks and old_block.get("parent") == parent)
 			):
 				return f"{target.get('name')!r}/{bid!r}: parent points to missing block {parent!r}"
 			nxt = block.get("next")
-			if isinstance(nxt, str) and nxt not in blocks:
+			if isinstance(nxt, str) and nxt not in blocks and not (nxt not in old_blocks and old_block.get("next") == nxt):
 				return f"{target.get('name')!r}/{bid!r}: next points to missing block {nxt!r}"
 			for name, value in (block.get("inputs") or {}).items():
 				for child_id in _iter_input_block_refs(value):
 					if child_id not in blocks:
+						if child_id not in old_blocks and any(child_id in _iter_input_block_refs(value) for value in (old_block.get("inputs") or {}).values()):
+							continue
 						return f"{target.get('name')!r}/{bid!r}: input {name!r} points to missing block {child_id!r}"
 	return None
 
@@ -9524,11 +10256,14 @@ def _serialized_input_refs(value, out):
 	out.update(_iter_input_block_refs(value))
 
 
-def _validate_block_structure(project, label):
+def _validate_block_structure(project, label, original=None):
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks", {})
 		if not isinstance(blocks, dict):
 			return f"{label}, target {ti} ({target.get('name')!r}): blocks is not an object"
+		original_targets = original.get("targets", []) if original is not None else []
+		original_target = original_targets[ti] if ti < len(original_targets) else {}
+		original_blocks = original_target.get("blocks", {})
 
 		input_parents = {}
 		for bid, block in blocks.items():
@@ -9543,16 +10278,17 @@ def _validate_block_structure(project, label):
 				return f"{where}: block is neither object nor variable/list primitive"
 			if not isinstance(block.get("opcode"), str) or not block.get("opcode"):
 				return f"{where}: missing/invalid opcode"
-			_orphan_parent_quirk = False
 			for key in ("next", "parent"):
 				ref = block.get(key)
 				if ref is not None and not isinstance(ref, str):
 					return f"{where}: {key} must be null or a string"
 				if isinstance(ref, str) and ref not in blocks:
+					old_block = original_blocks.get(bid)
+					if ref not in original_blocks and isinstance(old_block, dict) and old_block.get(key) == ref:
+						continue
 					if key == "parent" and _is_known_orphan_argument_reporter(
 						block, blocks
 					):
-						_orphan_parent_quirk = True
 						continue
 					return f"{where}: {key} points to missing block {ref!r}"
 			if not isinstance(block.get("inputs"), dict) or not isinstance(
@@ -9597,20 +10333,35 @@ def _validate_block_structure(project, label):
 			if isinstance(nxt, str):
 				child = blocks.get(nxt)
 				if isinstance(child, dict) and child.get("parent") != bid:
-					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: next -> {nxt!r} but child.parent is {child.get('parent')!r}"
+					old_block, old_child = original_blocks.get(bid), original_blocks.get(nxt)
+					if not (isinstance(old_block, dict) and old_block.get("next") == nxt
+						and isinstance(old_child, dict) and old_child.get("parent") == child.get("parent")):
+						return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: next -> {nxt!r} but child.parent is {child.get('parent')!r}"
 			parent = block.get("parent")
-			if isinstance(parent, str) and not _orphan_parent_quirk:
+			if isinstance(parent, str) and parent in blocks:
 				pb = blocks.get(parent)
 				if not isinstance(pb, dict):
 					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent is not an object"
 				if pb.get("next") != bid and parent not in input_parents.get(
 					bid, set()
 				):
-					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent {parent!r} does not reference this block"
+					old_block, old_parent = original_blocks.get(bid), original_blocks.get(parent)
+					inherited = (
+						isinstance(old_block, dict) and old_block.get("parent") == parent
+						and isinstance(old_parent, dict) and old_parent.get("next") != bid
+						and isinstance(old_parent.get("inputs"), dict)
+						and not any(bid in _iter_input_block_refs(value) for value in old_parent["inputs"].values())
+					)
+					if not inherited:
+						return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent {parent!r} does not reference this block"
 			for child in input_parents.get(bid, set()):
 				cb = blocks.get(bid)
 				if isinstance(cb, dict) and cb.get("parent") != child:
-					return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: input owner {child!r} disagrees with parent {cb.get('parent')!r}"
+					old_block, old_owner = original_blocks.get(bid), original_blocks.get(child)
+					if not (isinstance(old_block, dict) and old_block.get("parent") == cb.get("parent")
+						and isinstance(old_owner, dict) and isinstance(old_owner.get("inputs"), dict)
+						and any(bid in _iter_input_block_refs(value) for value in old_owner["inputs"].values())):
+						return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: input owner {child!r} disagrees with parent {cb.get('parent')!r}"
 	return None
 
 
@@ -9860,7 +10611,7 @@ def _reference_primitive_head_equal(original, minified, opts):
 
 def verify(original_path, minified_path, opts):
 	if opts.lossless:
-		return _verify_lossless(original_path, minified_path, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids, opts.strip_reference_names)
+		return _verify_lossless(original_path, minified_path, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids, opts.strip_reference_names, opts.prune_orphan_arguments, opts.compact_procedure_symbols, opts.compact_reporter_defaults, opts.strip_covered_shadows, opts.strip_editor_comments, opts.strip_script_positions, opts.prune_unused_data, opts.rebuild_procedure_displays, opts.compact_terminal_links)
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
 		if a.testzip() is not None:
 			return False, f"input zip '{original_path}' failed CRC test"
@@ -9927,7 +10678,9 @@ def verify(original_path, minified_path, opts):
 		err = _validate_asset_entries(orig, a, "original project")
 		if err:
 			return False, err
-		err = _validate_block_structure(mini, "minified project")
+		if opts.rename_block_ids:
+			_restore_block_ids(mini, opts.renamed_block_ids)
+		err = _validate_block_structure(mini, "minified project", orig)
 		if err:
 			return False, err
 
@@ -9941,12 +10694,10 @@ def verify(original_path, minified_path, opts):
 		err = _check_broadcast_ids_resolve(mini_raw_project)
 		if err:
 			return False, err
-		err = _check_block_references_resolve(mini_raw_project)
+		err = _check_block_references_resolve(mini_raw_project, orig)
 		if err:
 			return False, err
 
-		if opts.rename_block_ids:
-			_restore_block_ids(mini, opts.renamed_block_ids)
 		if opts.rename_variable_ids or opts.rename_list_ids:
 			_restore_data_ids(mini, opts.renamed_variable_ids, opts.renamed_list_ids)
 		if opts.rename_broadcast_ids:
@@ -10402,10 +11153,10 @@ def verify(original_path, minified_path, opts):
 		err = _check_broadcast_ids_resolve(mini)
 		if err:
 			return False, err
-		err = _check_block_references_resolve(mini)
+		err = _check_block_references_resolve(mini, orig)
 		if err:
 			return False, err
-		err = _validate_block_structure(mini, "minified project (final)")
+		err = _validate_block_structure(mini, "minified project (final)", orig)
 		if err:
 			return False, err
 	return True, "ok"
@@ -10744,7 +11495,7 @@ def format_size_report(before_json, after_json, before_archive, after_archive):
 	)
 
 
-def _verify_lossless(original_path, minified_path, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False, compact_reference_names=False):
+def _verify_lossless(original_path, minified_path, compact_defaults=False, compact_costume_references=False, compact_block_flags=False, relabel_block_ids=False, compact_reference_names=False, prune_orphan_arguments=False, compact_procedure_symbols=False, compact_reporter_defaults=False, strip_covered_shadows=False, strip_editor_comments=False, strip_script_positions=False, prune_unused_data=False, rebuild_procedure_displays=False, compact_terminal_links=False):
 	try:
 		with zipfile.ZipFile(original_path) as original, zipfile.ZipFile(minified_path) as result:
 			for archive in (original, result):
@@ -10757,7 +11508,7 @@ def _verify_lossless(original_path, minified_path, compact_defaults=False, compa
 				return False, "archive comment changed"
 			left = loads_exact(original.read("project.json"))
 			right = loads_exact(result.read("project.json"))
-			difference = exact_difference(left, right, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids, compact_reference_names)
+			difference = exact_difference(left, right, compact_defaults, compact_costume_references, compact_block_flags, relabel_block_ids, compact_reference_names, prune_orphan_arguments, compact_procedure_symbols, compact_reporter_defaults, strip_covered_shadows, strip_editor_comments, strip_script_positions, prune_unused_data, rebuild_procedure_displays, compact_terminal_links)
 			if difference:
 				return False, difference
 			for info in original.infolist():
@@ -10767,7 +11518,17 @@ def _verify_lossless(original_path, minified_path, compact_defaults=False, compa
 						return False, f"ZIP metadata {field} changed: {info.filename!r}"
 				if info.filename != "project.json" and original.read(info) != result.read(other):
 					return False, f"asset byte-for-byte mismatch: {info.filename!r}"
-		if compact_block_flags or relabel_block_ids or compact_reference_names:
+		if rebuild_procedure_displays:
+			return True, "procedure display reconstruction and approved representation changes verified; executing blocks, procedure bindings, runtime configuration, ZIP metadata and asset bytes preserved; procedure editing state changes"
+		if prune_unused_data:
+			return True, "unused data pruning and approved representation changes verified; retained data, executing blocks, runtime configuration, ZIP metadata and asset bytes preserved"
+		if strip_editor_comments or strip_script_positions:
+			return True, "selected editor metadata removal and approved representation changes verified; executing inputs, saved variables/lists, runtime configuration, ZIP metadata and asset bytes preserved"
+		if strip_covered_shadows:
+			return True, "approved representation changes and removal of covered editing defaults verified; executing inputs, saved data, ZIP metadata and asset bytes preserved"
+		if prune_orphan_arguments:
+			return True, "approved representation changes and unused argument shadows verified; every other JSON value, execution order, ZIP metadata and asset byte preserved"
+		if compact_block_flags or relabel_block_ids or compact_reference_names or compact_procedure_symbols or compact_reporter_defaults or compact_terminal_links:
 			return True, "approved block and reference representation changes verified; every other JSON value, execution order, ZIP metadata and asset byte preserved"
 		return True, "every JSON value, collection order, ZIP metadata and asset byte preserved"
 	except (ValueError, OSError, KeyError, zipfile.BadZipFile, zlib.error) as error:
@@ -10810,11 +11571,23 @@ def _minify_lossless_sb3(src, dst, opts):
 			project = loads_exact(raw)
 			if not isinstance(project, dict) or not isinstance(project.get("targets"), list):
 				raise ValueError("project.json must contain a project object with a targets array")
-			print(Ansi.heading("Optimizing project.json (exact values and collection order preserved)..."), flush=True)
+			print(Ansi.heading("Optimizing project.json (preserving active blocks and asset bytes)..." if opts.prune_orphan_arguments or opts.strip_covered_shadows or opts.strip_editor_comments or opts.strip_script_positions or opts.prune_unused_data else "Optimizing project.json (exact values and collection order preserved)..."), flush=True)
+			if opts.strip_covered_shadows:
+				print("Covered input defaults will be removed; fallbacks exposed during editing change.", flush=True)
+			if opts.strip_editor_comments:
+				print("Sprite editor comments will be removed; Stage and TurboWarp configuration comments are retained.", flush=True)
+			if opts.strip_script_positions:
+				print("Script workspace coordinates will be removed; the editor's script layout changes.", flush=True)
+			if opts.prune_unused_data:
+				print("Unreferenced variable/list declarations may be removed; their saved authoring data is discarded.", flush=True)
+			if opts.rebuild_procedure_displays:
+				print("Procedure argument displays will be rebuilt by the editor; prototype movement/deletion and argument shadow states can change.", flush=True)
+			if opts.fast_json:
+				print("Fast JSON mode: full raw-size reductions; limited ZIP layout search.", flush=True)
 			out_json, compressed, stats = optimize_project_json(
 				project, opts.compression_level, opts.zopfli, opts.zopfli_iterations, opts.zopfli_required,
 				opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags,
-				opts.minimum_json, opts.json_search_rounds, opts.relabel_block_ids, opts.strip_reference_names
+				opts.minimum_json, opts.json_search_rounds, opts.relabel_block_ids, opts.strip_reference_names, opts.prune_orphan_arguments, opts.compact_procedure_symbols, opts.compact_reporter_defaults, opts.fast_json, opts.strip_covered_shadows, opts.strip_editor_comments, opts.strip_script_positions, opts.prune_unused_data, opts.rebuild_procedure_displays, opts.compact_terminal_links
 			)
 			json_info = source.getinfo("project.json")
 			original_wins = ((len(raw), json_info.compress_size) <= (len(out_json), len(compressed))) if opts.minimum_json else json_info.compress_size <= len(compressed)
@@ -10822,6 +11595,13 @@ def _minify_lossless_sb3(src, dst, opts):
 				out_json = raw
 				compressed = read_compressed_entry(source, json_info)
 				stats["json_encoding"] = "original entry (already smaller)"
+				stats["orphan_argument_blocks_removed"] = 0
+				stats["procedure_display_blocks_removed"] = 0
+				stats["terminal_links_removed"] = 0
+				stats["editor_comments_removed"] = 0
+				stats["unused_data_declarations_removed"] = 0
+				stats["script_position_values_removed"] = 0
+				stats["covered_defaults_removed"] = 0
 			new_json_info = copy.copy(json_info)
 			new_json_info.compress_type = zipfile.ZIP_DEFLATED
 			new_json_info.file_size = len(out_json)
@@ -10847,8 +11627,8 @@ def _minify_lossless_sb3(src, dst, opts):
 					if time.monotonic() - last_progress >= 20:
 						print(f"  Entries checked: {index:,}/{len(entries):,}; asset bytes saved: {stats.get('asset_deflate_bytes_saved', 0):,}", flush=True)
 						last_progress = time.monotonic()
-			print(Ansi.heading("Verifying exact project data and every asset byte..."), flush=True)
-			ok, message = _verify_lossless(src, temporary, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids, opts.strip_reference_names)
+			print(Ansi.heading("Verifying approved JSON changes and every asset byte..."), flush=True)
+			ok, message = _verify_lossless(src, temporary, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids, opts.strip_reference_names, opts.prune_orphan_arguments, opts.compact_procedure_symbols, opts.compact_reporter_defaults, opts.strip_covered_shadows, opts.strip_editor_comments, opts.strip_script_positions, opts.prune_unused_data, opts.rebuild_procedure_displays, opts.compact_terminal_links)
 			if not ok:
 				raise ValueError(f"lossless verification failed: {message}")
 		os.replace(temporary, dst)
@@ -10858,10 +11638,24 @@ def _minify_lossless_sb3(src, dst, opts):
 		for line in format_size_report(len(raw), len(out_json), os.path.getsize(src), os.path.getsize(dst)):
 			print(line)
 		print(f"JSON DEFLATE : {json_info.compress_size:,} -> {len(compressed):,} bytes")
+		if opts.prune_orphan_arguments:
+			print(f"Unused argument shadows removed: {stats['orphan_argument_blocks_removed']:,}")
+		if opts.rebuild_procedure_displays:
+			print(f"Procedure argument displays to rebuild: {stats['procedure_display_blocks_removed']:,}")
+		if opts.compact_terminal_links:
+			print(f"Synchronous terminal links omitted: {stats['terminal_links_removed']:,}")
+		if opts.strip_covered_shadows:
+			print(f"Covered editing defaults removed: {stats['covered_defaults_removed']:,}")
+		if opts.strip_editor_comments:
+			print(f"Sprite editor comments removed: {stats['editor_comments_removed']:,}")
+		if opts.strip_script_positions:
+			print(f"Script workspace coordinates removed: {stats['script_position_values_removed']:,}")
+		if opts.prune_unused_data:
+			print(f"Unused data declarations removed: {stats['unused_data_declarations_removed']:,}")
 		floor = stats["json_minimum"]["minimum_bytes"]
 		print(f"JSON lower bound under selected model: {floor:,} bytes; gap: {len(out_json) - floor:,} bytes (fixed representation model)")
 		print(f"asset DEFLATE: {stats.get('asset_deflate_bytes_saved', 0):,} bytes saved across {stats.get('assets_recompressed', 0):,} assets")
-		if opts.all_lossless and not zopfli:
+		if opts.all_lossless and opts.zopfli and not zopfli:
 			print("Optional Zopfli was unavailable; all built-in lossless methods ran. Install zopfli for stronger compression.")
 		print(Ansi.success(f"Verified successfully: {message}."))
 		return 0
@@ -11079,9 +11873,19 @@ if __name__ == "__main__":
 		print(Ansi.error("Usage: ") + Ansi.warning("python minify_sb3.py path/to/project.sb3 --flags"))
 		sys.exit(1)
 	
+	if "--strip-covered-shadows" in flags and "--keep-covered" in flags:
+		print(Ansi.error("--strip-covered-shadows is incompatible with --keep-covered"))
+		sys.exit(1)
+	for strip, keep in (("--strip-editor-comments", "--keep-comments"), ("--strip-script-positions", "--keep-positions"), ("--prune-unused-data", "--keep-unused-data"), ("--rebuild-procedure-displays", "--keep-procedure-displays"), ("--compact-terminal-links", "--keep-terminal-links")):
+		if strip in flags and keep in flags:
+			print(Ansi.error(f"{strip} is incompatible with {keep}"))
+			sys.exit(1)
+	if "--fast-json" in flags and "--thorough-json" in flags:
+		print(Ansi.error("--fast-json is incompatible with --thorough-json"))
+		sys.exit(1)
 	all_flags = "--all-flags" in flags or "--all-optimizations" in flags
 	all_safe = any(flag in flags for flag in ("--all-lossless", "--all-safe", "--all-safe-flags"))
-	lossless = "--lossless" in flags or all_safe or all_flags
+	lossless = "--lossless" in flags or all_safe or all_flags or any(flag in flags for flag in ("--prune-orphan-arguments", "--compact-procedure-symbols", "--compact-reporter-defaults", "--strip-covered-shadows", "--strip-editor-comments", "--strip-script-positions", "--prune-unused-data", "--rebuild-procedure-displays", "--compact-terminal-links", "--fast-json", "--thorough-json"))
 	if lossless:
 		allowed = {
 			"--lossless", "--all-lossless", "--all-flags", "--all-optimizations", "--optimize-json", "--optimize-assets",
@@ -11089,6 +11893,10 @@ if __name__ == "__main__":
 			"--compact-block-defaults", "--compact-costume-references", "--compact-block-flags",
 			"--all-safe", "--all-safe-flags", "--minimum-json", "--json-search-rounds", "--relabel-block-ids",
 			"--strip-reference-names", "--drop-reference-names", "--empty-reference-names",
+			"--prune-orphan-arguments", "--compact-procedure-symbols", "--compact-reporter-defaults", "--strip-covered-shadows", "--fast-json", "--thorough-json",
+			"--strip-editor-comments", "--strip-script-positions", "--prune-unused-data", "--keep-unused-data",
+			"--rebuild-procedure-displays", "--keep-procedure-displays",
+			"--compact-terminal-links", "--keep-terminal-links",
 			"--keep-comments", "--keep-positions", "--keep-covered", "--keep-monitors",
 			"--keep-sound-metadata", "--preserve-asset-compression", "--compress-assets",
 		}
@@ -11098,10 +11906,20 @@ if __name__ == "__main__":
 			sys.exit(1)
 	opts = Options(
 		lossless=lossless,
+		rebuild_procedure_displays=(all_flags and "--keep-procedure-displays" not in flags) or "--rebuild-procedure-displays" in flags,
+		compact_terminal_links=(all_flags and "--keep-terminal-links" not in flags) or "--compact-terminal-links" in flags,
+		fast_json="--fast-json" in flags or (all_flags and "--thorough-json" not in flags),
+		prune_orphan_arguments=all_flags or "--prune-orphan-arguments" in flags,
+		compact_procedure_symbols=all_flags or "--compact-procedure-symbols" in flags,
+		compact_reporter_defaults=all_flags or "--compact-reporter-defaults" in flags,
+		strip_covered_shadows=(all_flags and "--keep-covered" not in flags) or "--strip-covered-shadows" in flags,
+		strip_editor_comments=(all_flags and "--keep-comments" not in flags) or "--strip-editor-comments" in flags,
+		prune_unused_data=(all_flags and "--keep-unused-data" not in flags) or "--prune-unused-data" in flags,
+		strip_script_positions=(all_flags and "--keep-positions" not in flags) or "--strip-script-positions" in flags,
 		all_lossless=all_safe or all_flags,
 		compact_costume_references="--compact-costume-references" in flags,
 		compact_block_flags=all_flags or "--compact-block-flags" in flags,
-		minimum_json=all_flags or "--minimum-json" in flags,
+		minimum_json=all_flags or "--minimum-json" in flags or "--thorough-json" in flags,
 		json_search_rounds=values.get("--json-search-rounds", 0),
 		relabel_block_ids=all_flags or "--relabel-block-ids" in flags,
 		auto_zopfli=all_flags,
