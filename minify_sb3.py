@@ -4,7 +4,10 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import re
+from concurrent.futures import ProcessPoolExecutor
+from types import SimpleNamespace
 import subprocess
 import shutil
 import sys
@@ -10408,6 +10411,176 @@ def _reference_primitive_head_equal(original, minified, opts):
 		and original[2] == minified[2]
 	)
 
+
+VERIFY_PARALLEL_MIN_BLOCKS = 3000
+VERIFY_PARALLEL_MAX_WORKERS = 4
+_VERIFY_WORKER_STATE = None
+_VERIFY_WORKER_STATE_PATH = None
+
+_VERIFY_BLOCK_OPT_ATTRS = (
+    "comments", "positions", "covered", "remove_unreachable",
+    "remove_unused_procedures", "compact_field_ids",
+    "compact_mutation_hasnext", "compact_mutation_metadata",
+    "rename_argument_ids", "strip_reference_names", "normalize_epsilon",
+    "normalize_numbers", "optimize_json", "minimum_json", "compact_numeric_inputs",
+)
+_VERIFY_BLOCK_MAP_ATTRS = (
+    "variable_setter_input_edits", "variable_setter_link_edits",
+    "procedure_argument_input_edits", "procedure_argument_mutation_edits",
+    "procedure_argument_removed_inputs",
+    "folded_constant_expression_inputs", "folded_constant_expression_link_edits",
+    "folded_constant_expression_opcode_edits",
+    "grouped_sequence_input_edits", "grouped_sequence_link_edits",
+    "script_rewrite_input_edits", "script_rewrite_link_edits",
+    "script_rewrite_opcode_edits", "script_rewrite_removed_inputs",
+    "simplified_block_input_edits", "simplified_block_link_edits",
+    "simplified_block_opcode_edits", "folded_constant_variables",
+    "folded_constant_variable_literals",
+)
+
+def _filter_verify_map(mapping, target_index):
+    if not isinstance(mapping, dict):
+        return {}
+    return {
+        key: value
+        for key, value in mapping.items()
+        if isinstance(key, tuple) and key and key[0] == target_index
+    }
+
+def _make_verify_worker_state(to, tm, opts, target_index, changed):
+    attrs = {}
+    for name in _VERIFY_BLOCK_OPT_ATTRS:
+        attrs[name] = getattr(opts, name, False)
+    for name in _VERIFY_BLOCK_MAP_ATTRS:
+        value = getattr(opts, name, None)
+        if name in ("folded_constant_variables", "folded_constant_variable_literals"):
+            attrs[name] = dict(value) if isinstance(value, dict) else {}
+        else:
+            attrs[name] = _filter_verify_map(value, target_index)
+
+    verify_project = getattr(opts, "_verify_project", None) or {}
+    owner_targets = [
+        {
+            "variables": target.get("variables", {}),
+            "isStage": bool(target.get("isStage", False)),
+        }
+        for target in verify_project.get("targets", [])
+        if isinstance(target, dict)
+    ]
+    attrs["_verify_project"] = {"targets": owner_targets}
+
+    return {
+        "checks": changed,
+        "remaining_blocks": set(tm.get("blocks", {})),
+        "target_index": target_index,
+        "target_name": to.get("name", f"target_{target_index}"),
+        "opts": SimpleNamespace(**attrs),
+    }
+
+def _init_verify_worker(state_path):
+    global _VERIFY_WORKER_STATE, _VERIFY_WORKER_STATE_PATH
+    if _VERIFY_WORKER_STATE_PATH != state_path:
+        with open(state_path, "rb") as handle:
+            _VERIFY_WORKER_STATE = pickle.load(handle)
+        _VERIFY_WORKER_STATE_PATH = state_path
+
+def _verify_one_changed_block(item, state):
+    position, bid, bo, bm = item
+    opts = state["opts"]
+    target_index = state["target_index"]
+    target_name = state["target_name"]
+    remaining_blocks = state["remaining_blocks"]
+    where = f"Target {target_index} ({target_name!r})"
+
+    if isinstance(bo, list) or isinstance(bm, list):
+        ok = (
+            isinstance(bo, list)
+            and isinstance(bm, list)
+            and len(bo) == len(bm)
+            and _reference_primitive_head_equal(bo, bm, opts)
+            and all(_num_eq(x, y, opts.normalize_epsilon) or x == y for x, y in zip(bo[3:], bm[3:]))
+        )
+        if not (ok and (opts.positions or bo == bm)):
+            return position, f"{where}, primitive block {bid!r} changed from {bo!r} to {bm!r}"
+        return None
+
+    err = _check_blocks(
+        bo, bm, opts, f"{where}, block {bid!r}",
+        None, remaining_blocks, target_index, bid
+    )
+    if err:
+        return position, err
+    if not isinstance(bm.get("inputs"), dict) or not isinstance(bm.get("fields"), dict):
+        return position, f"{where}, block {bid!r} ({bm.get('opcode')}): inputs or fields is not a dict (violates Scratch VM format)"
+    if "next" not in bm or "parent" not in bm:
+        return position, f"{where}, block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute"
+    mu = bm.get("mutation")
+    if mu is not None:
+        if not isinstance(mu, dict):
+            return position, f"{where}, block {bid!r} ({bm.get('opcode')}): mutation is not an object"
+        if not getattr(opts, "compact_mutation_metadata", False) and ("tagName" not in mu or "children" not in mu):
+            return position, f"{where}, block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children"
+    return None
+
+def _verify_block_chunk(bounds):
+    state = _VERIFY_WORKER_STATE
+    start, stop = bounds
+    checks = state["checks"]
+    for index in range(start, stop):
+        result = _verify_one_changed_block(checks[index], state)
+        if result is not None:
+            return result
+    return None
+
+def _verify_target_blocks(to, tm, opts, target_index):
+    original_blocks = to.get("blocks", {})
+    minified_blocks = tm.get("blocks", {})
+    remaining_blocks = set(minified_blocks)
+    changed = []
+
+    # Most Scratch projects contain far more unchanged blocks than changed blocks;
+    # there is no reason to serialize and process those just to rediscover that they are equal.
+    for position, bid in enumerate(original_blocks):
+        if bid not in minified_blocks:
+            continue
+        bo = original_blocks[bid]
+        bm = minified_blocks[bid]
+        if bo != bm:
+            changed.append((position, bid, bo, bm))
+
+    if not changed:
+        return None
+
+    if len(changed) < 1200:
+        state = _make_verify_worker_state(to, tm, opts, target_index, changed)
+        for item in changed:
+            result = _verify_one_changed_block(item, state)
+            if result is not None:
+                return result[1]
+        return None
+
+    workers = min(VERIFY_PARALLEL_MAX_WORKERS, max(2, (os.cpu_count() or 2) - 1))
+    chunk_count = min(len(changed), workers * 2)
+    chunk_size = (len(changed) + chunk_count - 1) // chunk_count
+    state = _make_verify_worker_state(to, tm, opts, target_index, changed)
+
+    with tempfile.TemporaryDirectory(prefix=".minify-verify-") as temp_dir:
+        state_path = os.path.join(temp_dir, "state.pkl")
+        with open(state_path, "wb") as handle:
+            pickle.dump(state, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        bounds = [
+            (start, min(start + chunk_size, len(changed)))
+            for start in range(0, len(changed), chunk_size)
+        ]
+        results = []
+        with ProcessPoolExecutor(max_workers=workers, initializer=_init_verify_worker, initargs=(state_path,)) as pool:
+            for result in pool.map(_verify_block_chunk, bounds):
+                if result is not None:
+                    results.append(result)
+        if results:
+            return min(results, key=lambda item: item[0])[1]
+    return None
+
 def verify(original_path, minified_path, opts):
 	if opts.lossless:
 		return _verify_lossless(original_path, minified_path, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids)
@@ -10812,62 +10985,9 @@ def verify(original_path, minified_path, opts):
 					f"Target {ti} ({name!r}): block(s) were removed even though the original "
 					f"project proves they were reachable/live: {sorted(illegal_missing)[:10]}"
 				)
-			for bid, bo in to["blocks"].items():
-				if bid not in tm["blocks"]:
-					continue
-				bm = tm["blocks"][bid]
-				if isinstance(bo, list) or isinstance(bm, list):
-					ok = (
-						isinstance(bo, list)
-						and isinstance(bm, list)
-						and len(bo) == len(bm)
-						and _reference_primitive_head_equal(bo, bm, opts)
-						and all(_num_eq(x, y, opts.normalize_epsilon) or x == y for x, y in zip(bo[3:], bm[3:]))
-					)
-					if not (ok and (opts.positions or bo == bm)):
-						return (
-							False,
-							f"Target {ti} ({name!r}), primitive block {bid!r} changed from {bo!r} to {bm!r}",
-						)
-					continue
-				err = _check_blocks(
-					bo,
-					bm,
-					opts,
-					f"Target {ti} ({name!r}), block {bid!r}",
-					to["blocks"],
-					set(tm["blocks"]),
-					ti,
-					bid,
-				)
-				if err:
-					return False, err
-				if not isinstance(bm.get("inputs"), dict) or not isinstance(
-					bm.get("fields"), dict
-				):
-					return (
-						False,
-						f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): inputs or fields is not a dict (violates Scratch VM format)",
-					)
-				if "next" not in bm or "parent" not in bm:
-					return (
-						False,
-						f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute",
-					)
-				mu = bm.get("mutation")
-				if mu is not None:
-					if not isinstance(mu, dict):
-						return (
-							False,
-							f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): mutation is not an object",
-						)
-					if not opts.compact_mutation_metadata and (
-						"tagName" not in mu or "children" not in mu
-					):
-						return (
-							False,
-							f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children",
-						)
+			err = _verify_target_blocks(to, tm, opts, ti)
+			if err:
+				return False, err
 
 			co, cm = to.get("comments", {}), tm.get("comments", {})
 			if not isinstance(cm, dict):
