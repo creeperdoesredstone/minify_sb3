@@ -576,7 +576,6 @@ def relabel_blocks(project):
 
 
 def restore_block_labels(original, result):
-	"""Infer bijections independently from semantic record order, not optimizer maps."""
 	if len(original.get("targets", [])) != len(result.get("targets", [])):
 		raise ValueError("target count changed")
 	result = copy.deepcopy(result)
@@ -940,7 +939,6 @@ def read_compressed_entry(archive, info):
 
 
 def write_compressed_entry(archive, info, compressed):
-	"""Write a checked raw stream using the same ZIP bookkeeping as ZipFile."""
 	info = copy.copy(info)
 	info.flag_bits &= ~0x08
 	info.compress_size = len(compressed)
@@ -1052,6 +1050,7 @@ def _progress_stage_count(opts):
 	count += bool(opts.simplify_blocks)
 	count += bool(opts.group_similar_sequences)
 	count += bool(opts.compact_procedure_prototypes)
+	count += bool(opts.clear_procedure_definition_shadows)
 	count += bool(opts.optimize_procedure_arguments)
 	count += bool(opts.merge_duplicate_procedures)
 	count += bool(opts.specialize_procedures)
@@ -5382,6 +5381,38 @@ def inline_single_use_procedures(project, stats, opts):
 	return total
 
 
+def _clear_procedure_definition_shadow(target, proto_id):
+	blocks = target.get("blocks") or {}
+	proto = blocks.get(proto_id)
+	if not isinstance(proto, dict):
+		return False
+	parent = blocks.get(proto.get("parent"))
+	if not isinstance(parent, dict):
+		return False
+	inputs = parent.get("inputs") or {}
+	custom = inputs.get("custom_block")
+	if not isinstance(custom, list) or not custom or _scratch_numeric_tag(custom[0]) != 3:
+		return False
+	if len(custom) < 2 or custom[1] != proto_id:
+		return False
+	# [3, proto, shadow] -> [2, proto]
+	custom[:] = [2, proto_id]
+	return True
+
+
+def clear_procedure_definition_shadows(project, stats, opts):
+	total = 0
+	for target in project.get("targets", []):
+		blocks = target.get("blocks") or {}
+		for proto_id, proto in list(blocks.items()):
+			if not isinstance(proto, dict) or proto.get("opcode") != "procedures_prototype":
+				continue
+			if _clear_procedure_definition_shadow(target, proto_id):
+				total += 1
+	stats["procedure_definition_shadows_cleared"] += total
+	return total
+
+
 def compact_procedure_prototypes(project, stats, opts):
 	"""
 	Canonicalize procedures_prototype blocks to the representation produced by
@@ -8267,7 +8298,6 @@ def _script_input_root(value, blocks):
 
 
 def _script_condition_is_pure(value, blocks, graph):
-	
 	seen = set()
 	stack = list(_input_block_ids(value, blocks))
 	while stack:
@@ -8524,7 +8554,6 @@ def _branch_factor_segment_closure(blocks, sequence, graph):
 
 
 def _branch_factor_value_equal(left, right, blocks, left_closure, right_closure, memo, active):
-	
 	if left is right:
 		return True
 	if isinstance(left, str) or isinstance(right, str):
@@ -10259,6 +10288,7 @@ class Options:
 		simplify_blocks=False,
 		deduplicate_assets=False,
 		compact_procedure_prototypes=False,
+		clear_procedure_definition_shadows=False,
 		optimize_procedure_arguments=False,
 		merge_duplicate_procedures=False,
 		inline_single_use_procedures=False,
@@ -10387,6 +10417,7 @@ class Options:
 		self.simplify_blocks = simplify_blocks
 		self.deduplicate_assets = deduplicate_assets
 		self.compact_procedure_prototypes = compact_procedure_prototypes
+		self.clear_procedure_definition_shadows = clear_procedure_definition_shadows
 		self.optimize_procedure_arguments = optimize_procedure_arguments
 		self.merge_duplicate_procedures = merge_duplicate_procedures
 		self.inline_single_use_procedures = inline_single_use_procedures
@@ -10570,6 +10601,9 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.optimize_procedure_arguments:
 		stage('Optimize procedure arguments')
 		optimize_procedure_arguments(project, stats, opts)
+	if opts.clear_procedure_definition_shadows:
+		stage('Clear procedure definition shadows')
+		clear_procedure_definition_shadows(project, stats, opts)
 	if opts.compact_procedure_prototypes:
 		stage('Compact procedure prototypes')
 		compact_procedure_prototypes(project, stats, opts)
@@ -13211,15 +13245,18 @@ def _print_transform_stats(stats, opts):
 					("procedure_specialization_passes", "specialization passes completed"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.clear_procedure_definition_shadows:
+				print(Ansi.subheading("  12e. Clear procedure definition shadows"))
+				print(Ansi.muted(f"    {'procedure definition shadows cleared':40} {stats['procedure_definition_shadows_cleared']:>8,}"))
 			if opts.compact_procedure_prototypes:
-				print(Ansi.subheading("  12e. Compact procedure prototypes"))
+				print(Ansi.subheading("  12f. Compact procedure prototypes"))
 				for key, label in (
 					("procedure_prototypes_compacted", "procedure prototypes compacted"),
 					("procedure_prototype_argument_reporters_removed", "prototype argument reporters removed"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.optimize_procedure_arguments:
-				print(Ansi.subheading("  12f. Optimize custom procedure arguments"))
+				print(Ansi.subheading("  12g. Optimize custom procedure arguments"))
 				for key, label in (
 					("procedure_arguments_removed", "procedure arguments removed"),
 					("procedure_constant_arguments_folded", "constant procedure arguments folded"),
@@ -13729,6 +13766,14 @@ if __name__ == "__main__":
 				"--procedure-prototype-compaction",
 				"--compact-procedure-prototypes",
 				"--compact-custom-procedure-prototypes",
+			)
+		),
+		clear_procedure_definition_shadows=all_optimizations or any(
+			f in flags
+			for f in (
+				"--clear-procedure-definition-shadows",
+				"--compact-procedure-definition-shadows",
+				"--remove-procedure-definition-shadows",
 			)
 		),
 		optimize_procedure_arguments=all_optimizations or any(
