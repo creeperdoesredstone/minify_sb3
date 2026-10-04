@@ -1057,7 +1057,7 @@ def _progress_stage_count(opts):
 	count += bool(opts.remove_unreachable or opts.remove_unused_procedures)
 	count += bool(opts.folded_constant_variables)
 	count += bool(opts.script_constant_propagation)
-	count += bool(opts.branch_swapping or opts.trivial_loops or opts.nested_conditionals)
+	count += bool(opts.branch_swapping or opts.branch_factoring or opts.trivial_loops or opts.nested_conditionals)
 	count += bool(opts.associative_constant_merging)
 	count += bool(opts.fold_constant_expressions)
 	count += bool(opts.simplify_boolean_control or opts.trivial_loops)
@@ -8457,6 +8457,451 @@ def _script_plan_nested_if(blocks, outer_id, incoming_refs, graph, commented):
 		"new_block": new_block, "body_raw": copy.deepcopy(body_raw), "body_root": body_root}
 
 
+
+def _branch_factor_sequence(blocks, root, closure):
+	"""Follow the lexical next-chain of one substack."""
+	if not isinstance(root, str) or root not in closure:
+		return None
+	sequence = []
+	current = root
+	seen = set()
+	while isinstance(current, str) and current in closure and current not in seen:
+		block = blocks.get(current)
+		if not isinstance(block, dict):
+			return None
+		seen.add(current)
+		sequence.append(current)
+		nxt = block.get("next")
+		if nxt is None:
+			return sequence
+		if not isinstance(nxt, str) or nxt not in closure:
+			return None
+		current = nxt
+	return None
+
+
+def _branch_factor_segment_closure(blocks, sequence, graph):
+	"""Return statement blocks plus their nested reporter/substack input closures."""
+	closure = set(sequence)
+	stack = []
+	for bid in sequence:
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		for value in (block.get("inputs") or {}).values():
+			stack.extend(_direct_input_block_refs(value, blocks))
+	while stack:
+		bid = stack.pop()
+		if bid in closure or bid not in blocks:
+			continue
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		closure.add(bid)
+		stack.extend(graph.edges.get(bid, ()))
+	return closure
+
+
+def _branch_factor_value_equal(left, right, blocks, left_closure, right_closure, memo, active):
+	"""Structural comparison of Scratch inputs modulo branch-local block IDs."""
+	if left is right:
+		return True
+	if isinstance(left, str) or isinstance(right, str):
+		if not isinstance(left, str) or not isinstance(right, str):
+			return False
+		left_local = left in left_closure
+		right_local = right in right_closure
+		if left_local or right_local:
+			if not (left_local and right_local):
+				return False
+			return _branch_factor_block_equal(
+				left, right, blocks, left_closure, right_closure, memo, active, True
+			)
+		return left == right
+	if isinstance(left, list) or isinstance(right, list):
+		if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+			return False
+		return all(
+			_branch_factor_value_equal(a, b, blocks, left_closure, right_closure, memo, active)
+			for a, b in zip(left, right)
+		)
+	if isinstance(left, dict) or isinstance(right, dict):
+		if not isinstance(left, dict) or not isinstance(right, dict) or left.keys() != right.keys():
+			return False
+		return all(
+			_branch_factor_value_equal(left[k], right[k], blocks, left_closure, right_closure, memo, active)
+			for k in left
+		)
+	return left == right
+
+
+def _branch_factor_block_equal(
+	a_id, b_id, blocks, left_closure, right_closure, memo, active, include_next=False
+):
+	pair = (a_id, b_id, include_next)
+	if pair in memo:
+		return memo[pair]
+	if pair in active:
+		return True
+	if a_id not in left_closure or b_id not in right_closure:
+		result = a_id == b_id
+		memo[pair] = result
+		return result
+	active.add(pair)
+	a = blocks.get(a_id)
+	b = blocks.get(b_id)
+	if not isinstance(a, dict) or not isinstance(b, dict):
+		active.discard(pair)
+		memo[pair] = False
+		return False
+
+	ignored = {"next", "parent", "topLevel", "x", "y"}
+	if a.get("opcode") != b.get("opcode"):
+		active.discard(pair); memo[pair] = False; return False
+	if {k: v for k, v in a.items() if k not in ignored} != {k: v for k, v in b.items() if k not in ignored}:
+		# The remaining values may contain branch-local references, so compare the
+		# individual structural fields rather than relying on raw dictionary equality.
+		for key in set(a) | set(b):
+			if key in ignored:
+				continue
+			if key not in a or key not in b:
+				active.discard(pair); memo[pair] = False; return False
+			if key in ("inputs",):
+				continue
+			if a[key] != b[key]:
+				active.discard(pair); memo[pair] = False; return False
+
+	ain = a.get("inputs") or {}
+	bin_ = b.get("inputs") or {}
+	if ain.keys() != bin_.keys():
+		active.discard(pair); memo[pair] = False; return False
+	for name in ain:
+		if not _branch_factor_value_equal(
+			ain[name], bin_[name], blocks, left_closure, right_closure, memo, active
+		):
+			active.discard(pair); memo[pair] = False; return False
+
+	if include_next:
+		an = a.get("next")
+		bn = b.get("next")
+		if an is None or bn is None:
+			if an is not None or bn is not None:
+				active.discard(pair); memo[pair] = False; return False
+		else:
+			if not _branch_factor_value_equal(
+				an, bn, blocks, left_closure, right_closure, memo, active
+			):
+				active.discard(pair); memo[pair] = False; return False
+
+	active.discard(pair)
+	memo[pair] = True
+	return True
+
+
+def _branch_factor_common_prefix(left, right, blocks, left_closure, right_closure):
+	limit = min(len(left), len(right))
+	memo = {}
+	count = 0
+	for i in range(limit):
+		if not _branch_factor_block_equal(
+			left[i], right[i], blocks, left_closure, right_closure, memo, set(), False
+		):
+			break
+		count += 1
+	return count
+
+
+def _branch_factor_common_suffix(left, right, blocks, left_closure, right_closure):
+	limit = min(len(left), len(right))
+	memo = {}
+	count = 0
+	for offset in range(1, limit + 1):
+		if not _branch_factor_block_equal(
+			left[-offset], right[-offset], blocks, left_closure, right_closure, memo, set(), False
+		):
+			break
+		count += 1
+	return count
+
+
+def _branch_factor_set_substack(inputs, name, root):
+	value = inputs.get(name)
+	if not isinstance(value, list) or len(value) < 2 or value[0] not in (1, 2, 3):
+		return None
+	new = copy.deepcopy(value)
+	new[1] = root
+	return new
+
+
+def _branch_factor_record_removed_input(opts, ti, block_id, name):
+	if getattr(opts, "script_rewrite_removed_inputs", None) is None:
+		opts.script_rewrite_removed_inputs = {}
+	opts.script_rewrite_removed_inputs.setdefault((ti, block_id), set()).add(name)
+
+
+def _branch_factor_owner_replace(blocks, control_id, new_id):
+	owner = _control_owner_edge(blocks, control_id)
+	if owner is None:
+		return None
+	owner_id, edge_kind, edge_name = owner
+	owner_block = blocks.get(owner_id)
+	if not isinstance(owner_block, dict):
+		return None
+	preview = copy.deepcopy(owner_block)
+	if _control_input_replacement(preview, edge_kind, edge_name, control_id, new_id) is None:
+		return None
+	return owner_id, edge_kind, edge_name, owner_block, preview
+
+
+def _branch_factor_plan(target, control_id, graph, commented):
+	blocks = target.get("blocks") or {}
+	control = blocks.get(control_id)
+	if not isinstance(control, dict) or control.get("opcode") != "control_if_else":
+		return None
+	inputs = control.get("inputs") or {}
+	then_value = inputs.get("SUBSTACK")
+	else_value = inputs.get("SUBSTACK2")
+	then_root = _control_substack(then_value, blocks)
+	else_root = _control_substack(else_value, blocks)
+	if then_root is None or else_root is None:
+		return None
+	incoming = graph.incoming
+	then_closure, then_tail = _substack_closure(then_value, blocks, control_id, incoming, graph)
+	else_closure, else_tail = _substack_closure(else_value, blocks, control_id, incoming, graph)
+	if then_closure is None or else_closure is None or then_closure & else_closure:
+		return None
+	then_sequence = _branch_factor_sequence(blocks, then_root, then_closure)
+	else_sequence = _branch_factor_sequence(blocks, else_root, else_closure)
+	if not then_sequence or not else_sequence:
+		return None
+
+	allow_prefix = control.get("topLevel") is not True and _control_owner_edge(blocks, control_id) is not None
+	prefix_len = _branch_factor_common_prefix(
+		then_sequence, else_sequence, blocks, then_closure, else_closure
+	) if allow_prefix else 0
+	suffix_len = _branch_factor_common_suffix(
+		then_sequence, else_sequence, blocks, then_closure, else_closure
+	)
+
+	# Identical complete branches can delete the conditional itself. This is
+	# deliberately restricted to nested conditionals so topLevel bookkeeping stays
+	# untouched by this first implementation.
+	if prefix_len == len(then_sequence) == len(else_sequence):
+		keep_closure = _branch_factor_segment_closure(blocks, then_sequence, graph)
+		remove_closure = _branch_factor_segment_closure(blocks, else_sequence, graph)
+		condition_closure = _exclusive_input_block_subtree_fast(
+			inputs.get("CONDITION"), blocks, control_id, incoming, graph=graph
+		)
+		if condition_closure is None:
+			return None
+		removed = {control_id} | remove_closure | condition_closure
+		owner = _branch_factor_owner_replace(blocks, control_id, then_sequence[0])
+		if owner is not None and not (removed & commented):
+			return {
+				"kind": "eliminate",
+				"control_id": control_id,
+				"keep_root": then_sequence[0],
+				"keep_tail": then_sequence[-1],
+				"remove": removed,
+				"owner": owner,
+			}
+		return None
+
+	if prefix_len > 0:
+		remove_segment = else_sequence[:prefix_len]
+		remove = _branch_factor_segment_closure(blocks, remove_segment, graph)
+		if remove & commented:
+			return None
+		return {
+			"kind": "prefix", "control_id": control_id,
+			"keep_segment": then_sequence[:prefix_len], "remove": remove,
+			"then_sequence": then_sequence, "else_sequence": else_sequence,
+			"prefix_len": prefix_len,
+			"owner": _branch_factor_owner_replace(blocks, control_id, then_sequence[0]),
+		}
+
+	if suffix_len > 0 and not (suffix_len == len(then_sequence) == len(else_sequence)):
+		remove_segment = else_sequence[-suffix_len:]
+		remove = _branch_factor_segment_closure(blocks, remove_segment, graph)
+		if remove & commented:
+			return None
+		return {
+			"kind": "suffix", "control_id": control_id,
+			"keep_segment": then_sequence[-suffix_len:], "remove": remove,
+			"then_sequence": then_sequence, "else_sequence": else_sequence,
+			"suffix_len": suffix_len,
+		}
+	return None
+
+
+def _branch_factor_apply(target, plan, opts, stats, ti):
+	blocks = target.get("blocks") or {}
+	control_id = plan["control_id"]
+	control = blocks.get(control_id)
+	if not isinstance(control, dict):
+		return False
+
+	if plan["kind"] == "eliminate":
+		owner_id, edge_kind, edge_name, _owner_block, preview = plan["owner"]
+		keep_root = plan["keep_root"]
+		keep_tail = plan["keep_tail"]
+		old_next = control.get("next")
+		if edge_kind == "next":
+			preview["next"] = keep_root
+			opts.script_rewrite_link_edits[(ti, owner_id, "next")] = keep_root
+		else:
+			opts.script_rewrite_input_edits[(ti, owner_id, edge_name)] = copy.deepcopy(
+				preview.get("inputs", {}).get(edge_name)
+			)
+		blocks[owner_id] = preview
+		blocks[keep_root]["parent"] = owner_id
+		opts.script_rewrite_link_edits[(ti, keep_root, "parent")] = owner_id
+		blocks[keep_tail]["next"] = old_next
+		opts.script_rewrite_link_edits[(ti, keep_tail, "next")] = old_next
+		if isinstance(old_next, str) and old_next in blocks:
+			blocks[old_next]["parent"] = keep_tail
+			opts.script_rewrite_link_edits[(ti, old_next, "parent")] = keep_tail
+		_script_record_removed(opts, ti, plan["remove"])
+		for bid in plan["remove"]:
+			blocks.pop(bid, None)
+		stats["branch_controls_factored"] += 1
+		stats["branch_factor_blocks_removed"] += len(plan["remove"])
+		return True
+
+	inputs = control.setdefault("inputs", {})
+	if plan["kind"] == "prefix":
+		owner = plan["owner"]
+		if owner is None:
+			return False
+		owner_id, edge_kind, edge_name, _owner_block, preview = owner
+		prefix_root = plan["keep_segment"][0]
+		prefix_tail = plan["keep_segment"][-1]
+		if edge_kind == "next":
+			preview["next"] = prefix_root
+			opts.script_rewrite_link_edits[(ti, owner_id, "next")] = prefix_root
+		else:
+			new_value = preview.get("inputs", {}).get(edge_name)
+			opts.script_rewrite_input_edits[(ti, owner_id, edge_name)] = copy.deepcopy(new_value)
+		blocks[owner_id] = preview
+		blocks[prefix_root]["parent"] = owner_id
+		opts.script_rewrite_link_edits[(ti, prefix_root, "parent")] = owner_id
+		blocks[prefix_tail]["next"] = control_id
+		opts.script_rewrite_link_edits[(ti, prefix_tail, "next")] = control_id
+		control["parent"] = prefix_tail
+		opts.script_rewrite_link_edits[(ti, control_id, "parent")] = prefix_tail
+		for name, sequence in (("SUBSTACK", plan["then_sequence"]), ("SUBSTACK2", plan["else_sequence"])):
+			remaining = sequence[plan["prefix_len"]:]
+			if remaining:
+				new_value = _branch_factor_set_substack(inputs, name, remaining[0])
+				if new_value is None:
+					return False
+				inputs[name] = new_value
+				blocks[remaining[0]]["parent"] = control_id
+				opts.script_rewrite_input_edits[(ti, control_id, name)] = copy.deepcopy(new_value)
+				opts.script_rewrite_link_edits[(ti, remaining[0], "parent")] = control_id
+			else:
+				inputs.pop(name, None)
+				_branch_factor_record_removed_input(opts, ti, control_id, name)
+		_script_record_removed(opts, ti, plan["remove"])
+		for bid in plan["remove"]:
+			blocks.pop(bid, None)
+		stats["branch_prefixes_factored"] += 1
+		stats["branch_factor_blocks_removed"] += len(plan["remove"])
+		return True
+
+	# Common suffix.
+	suffix = plan["keep_segment"]
+	suffix_root = suffix[0]
+	suffix_tail = suffix[-1]
+	then_seq = plan["then_sequence"]
+	else_seq = plan["else_sequence"]
+	split_then = len(then_seq) - plan["suffix_len"]
+	split_else = len(else_seq) - plan["suffix_len"]
+	if split_then:
+		prev = blocks[then_seq[split_then - 1]]
+		prev["next"] = None
+		opts.script_rewrite_link_edits[(ti, then_seq[split_then - 1], "next")] = None
+	else:
+		inputs.pop("SUBSTACK", None)
+		_branch_factor_record_removed_input(opts, ti, control_id, "SUBSTACK")
+	if split_else:
+		prev = blocks[else_seq[split_else - 1]]
+		prev["next"] = None
+		opts.script_rewrite_link_edits[(ti, else_seq[split_else - 1], "next")] = None
+	else:
+		inputs.pop("SUBSTACK2", None)
+		_branch_factor_record_removed_input(opts, ti, control_id, "SUBSTACK2")
+
+	old_next = control.get("next")
+	control["next"] = suffix_root
+	opts.script_rewrite_link_edits[(ti, control_id, "next")] = suffix_root
+	blocks[suffix_root]["parent"] = control_id
+	opts.script_rewrite_link_edits[(ti, suffix_root, "parent")] = control_id
+	blocks[suffix_tail]["next"] = old_next
+	opts.script_rewrite_link_edits[(ti, suffix_tail, "next")] = old_next
+	if isinstance(old_next, str) and old_next in blocks:
+		blocks[old_next]["parent"] = suffix_tail
+		opts.script_rewrite_link_edits[(ti, old_next, "parent")] = suffix_tail
+	for name, sequence, split in (("SUBSTACK", then_seq, split_then), ("SUBSTACK2", else_seq, split_else)):
+		if split:
+			value = _branch_factor_set_substack(inputs, name, sequence[0])
+			if value is None:
+				return False
+			inputs[name] = value
+			blocks[sequence[0]]["parent"] = control_id
+			opts.script_rewrite_input_edits[(ti, control_id, name)] = copy.deepcopy(value)
+			opts.script_rewrite_link_edits[(ti, sequence[0], "parent")] = control_id
+	_script_record_removed(opts, ti, plan["remove"])
+	for bid in plan["remove"]:
+		blocks.pop(bid, None)
+	stats["branch_suffixes_factored"] += 1
+	stats["branch_factor_blocks_removed"] += len(plan["remove"])
+	return True
+
+
+def factor_branches(project, stats, opts):
+	"""Factor identical if/else prefixes and suffixes when the exact JSON gets smaller."""
+	total = 0
+	for ti, target in enumerate(project.get("targets", [])):
+		while True:
+			graph = _ScratchGraphIndex(target)
+			commented = _script_comment_ids(target)
+			candidates = [
+				bid for bid, block in list((target.get("blocks") or {}).items())
+				if isinstance(block, dict) and block.get("opcode") == "control_if_else"
+			]
+			changed = False
+			for control_id in candidates:
+				if control_id not in (target.get("blocks") or {}):
+					continue
+				plan = _branch_factor_plan(target, control_id, graph, commented)
+				if plan is None:
+					continue
+				before = _json_len(target)
+				candidate_target = copy.deepcopy(target)
+				trial = Options()
+				try:
+					_branch_factor_apply(candidate_target, copy.deepcopy(plan), trial, Counter(), ti)
+				except Exception:
+					continue
+				after = _json_len(candidate_target)
+				if after >= before:
+					stats["branch_factor_rejected_size"] += 1
+					continue
+				local = Counter()
+				if not _branch_factor_apply(target, plan, opts, local, ti):
+					continue
+				stats["branch_factor_bytes_saved"] += before - after
+				for key, value in local.items():
+					stats[key] += value
+				total += 1
+				changed = True
+				break
+			if not changed:
+				break
+	return total
+
+
 def simplify_script_structures(project, stats, opts):
 	"""Apply local control rewrites with explicit verifier bookkeeping."""
 	targets = project.get("targets", [])
@@ -8568,7 +9013,9 @@ def simplify_script_structures(project, stats, opts):
 						blocks.pop(plan["inner_id"], None)
 						graph.refresh_blocks((bid, new_id, plan["inner_id"])); stats["nested_if_merges"] += 1; changed = True; break
 			if not changed: break
-	return sum(stats.get(k,0) for k in ("branch_swaps","empty_then_rewrites","repeat_until_not_rewrites","nested_if_merges"))
+	if opts.branch_factoring:
+		factor_branches(project, stats, opts)
+	return sum(stats.get(k,0) for k in ("branch_swaps","empty_then_rewrites","repeat_until_not_rewrites","nested_if_merges")) + stats.get("branch_prefixes_factored", 0) + stats.get("branch_suffixes_factored", 0) + stats.get("branch_controls_factored", 0)
 
 
 def _script_associative_plan(blocks, outer_id, graph, commented):
@@ -8917,7 +9364,7 @@ def _build_script_cfg(target):
 			else:
 				add_edge(bid, nxt, root)
 
-			for succ in successors.get(bid, ()) - before:
+			for succ in (successors.get(bid, set())) - before:
 				queue.append(succ)
 
 	# Restrict edges to nodes belonging to each individual root. A custom
@@ -9844,6 +10291,7 @@ class Options:
 		procedure_specialization_passes=4,
 		procedure_specialization_min_calls=2,
 		branch_swapping=False,
+		branch_factoring=False,
 		trivial_loops=False,
 		nested_conditionals=False,
 		associative_constant_merging=False,
@@ -9897,7 +10345,7 @@ class Options:
 						"compact_numeric_inputs", "compact_field_ids", "compact_mutation_hasnext",
 						"compact_mutation_metadata", "deduplicate_assets", "group_similar_sequences",
 						"optimize_procedure_arguments", "merge_duplicate_procedures", "inline_single_use_procedures", "specialize_procedures",
-						"branch_swapping", "trivial_loops", "nested_conditionals",
+						"branch_swapping", "branch_factoring", "trivial_loops", "nested_conditionals",
 						"associative_constant_merging", "script_constant_propagation",
 						"strip_reference_names", "compact_data_literals", "remove_unused_extensions",
 						"frequency_block_ids", "frequency_data_ids")
@@ -9976,6 +10424,7 @@ class Options:
 		if self.procedure_specialization_min_calls < 2:
 			raise ValueError("procedure_specialization_min_calls must be at least 2")
 		self.branch_swapping = branch_swapping
+		self.branch_factoring = branch_factoring
 		self.trivial_loops = trivial_loops
 		self.nested_conditionals = nested_conditionals
 		self.associative_constant_merging = associative_constant_merging
@@ -10114,7 +10563,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.script_constant_propagation:
 		stage('Propagate script constants')
 		propagate_script_constants(project, stats, opts)
-	if opts.branch_swapping or opts.trivial_loops or opts.nested_conditionals:
+	if opts.branch_swapping or opts.branch_factoring or opts.trivial_loops or opts.nested_conditionals:
 		stage('Rewrite script control structures')
 		simplify_script_structures(project, stats, opts)
 	if opts.associative_constant_merging:
@@ -11262,19 +11711,21 @@ def _check_blocks(
 			simplified_link_edits = getattr(opts, "simplified_block_link_edits", None) or {}
 			if k in ("next", "parent"):
 				link_key = (target_index, block_id, k)
-				expected_link = link_edits.get(link_key)
-				if expected_link is None:
-					expected_link = fold_link_edits.get(link_key)
-				if expected_link is None:
-					inlined_link_edits = getattr(opts, "inlined_procedure_link_edits", {}) or {}
-					expected_link = inlined_link_edits.get(link_key)
-				if expected_link is None:
-					expected_link = group_link_edits.get(link_key)
-				if expected_link is None:
-					expected_link = simplified_link_edits.get(link_key)
-				if expected_link is None:
-					expected_link = script_link_edits.get(link_key)
-				if expected_link is not None and m[k] == expected_link:
+				found_link = False
+				expected_link = None
+				for mapping in (
+					link_edits,
+					fold_link_edits,
+					getattr(opts, "inlined_procedure_link_edits", {}) or {},
+					group_link_edits,
+					simplified_link_edits,
+					script_link_edits,
+				):
+					if link_key in mapping:
+						expected_link = mapping[link_key]
+						found_link = True
+						break
+				if found_link and m[k] == expected_link:
 					continue
 			if (
 				k == "parent"
@@ -12759,6 +13210,17 @@ def _print_transform_stats(stats, opts):
 					("control_branch_blocks_removed", "branch/condition blocks removed"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.branch_factoring:
+				print(Ansi.subheading("  12d. Factor common branch sequences"))
+				for key, label in (
+					("branch_prefixes_factored", "common prefixes factored"),
+					("branch_suffixes_factored", "common suffixes factored"),
+					("branch_controls_factored", "identical conditionals eliminated"),
+					("branch_factor_blocks_removed", "duplicate branch blocks removed"),
+					("branch_factor_bytes_saved", "branch factoring JSON bytes saved"),
+					("branch_factor_rejected_size", "candidates rejected for size"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.specialize_procedures:
 				print(Ansi.subheading("  12d. Specialize custom procedures"))
 				for key, label in (
@@ -13313,6 +13775,7 @@ if __name__ == "__main__":
 		procedure_specialization_passes=values.get("--procedure-specialization-passes", 4),
 		procedure_specialization_min_calls=values.get("--procedure-specialization-min-calls", 2),
 		branch_swapping=all_optimizations or any(f in flags for f in ("--branch-swapping", "--swap-branches", "--branch-swap")),
+		branch_factoring=all_optimizations or "--branch-factoring" in flags,
 		trivial_loops=all_optimizations or any(f in flags for f in ("--trivial-loops", "--simplify-trivial-loops")),
 		nested_conditionals=all_optimizations or any(f in flags for f in ("--nested-conditionals", "--merge-nested-conditionals", "--merge-nested-ifs")),
 		associative_constant_merging=any(f in flags for f in ("--associative-constants", "--merge-associative-constants", "--reassociate-constants")),

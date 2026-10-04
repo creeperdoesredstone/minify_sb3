@@ -80,6 +80,7 @@ toggles = {
 	"--merge-duplicate-custom-blocks",
 	"--deduplicate-procedures",
 	"--branch-swapping",
+	"--branch-factoring",
 	"--swap-branches",
 	"--branch-swap",
 	"--trivial-loops",
@@ -186,6 +187,7 @@ groups = {
 	),
 	"--control-flow": (
 		"--branch-swapping",
+		"--branch-factoring",
 		"--trivial-loops",
 		"--nested-conditionals",
 		"--associative-constants",
