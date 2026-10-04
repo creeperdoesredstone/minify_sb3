@@ -2035,6 +2035,15 @@ def _rename_id_map(ids, existing_ids=(), prefix=""):
 	return result
 
 
+def _frequency_optimal_id_map(ids, frequencies=None, existing_ids=(), prefix=""):
+	ids = list(ids)
+	if not ids:
+		return {}
+	frequencies = frequencies or {}
+	ordered = sorted(ids, key=lambda value: (-frequencies.get(value, 0), value))
+	return _rename_id_map(ordered, existing_ids=existing_ids, prefix=prefix)
+
+
 def _replace_field_id(block, field_names, mapping):
 	if not isinstance(block, dict):
 		return 0
@@ -2499,6 +2508,17 @@ def rename_identifiers(
 	variable_new_names = {}
 	list_new_names = {}
 
+	var_refs, list_refs, broadcast_refs = _collect_data_references(project)
+	variable_frequencies = Counter()
+	list_frequencies = Counter()
+	broadcast_frequencies = Counter()
+	for key, refs in var_refs.items():
+		variable_frequencies[key] += 1 + len(refs)
+	for key, refs in list_refs.items():
+		list_frequencies[key] += 1 + len(refs)
+	for key, refs in broadcast_refs.items():
+		broadcast_frequencies[key] += len(refs)
+
 	stage_variable_names = set()
 	stage_list_names = set()
 
@@ -2542,12 +2562,16 @@ def rename_identifiers(
 		}
 
 		stage_var_map = (
-			_rename_id_map(sorted(valid_variables), reserved_variables)
+			_frequency_optimal_id_map(
+				valid_variables, variable_frequencies, reserved_variables
+			)
 			if rename_variable_names
 			else {}
 		)
 		stage_list_map = (
-			_rename_id_map(sorted(valid_lists), reserved_lists)
+			_frequency_optimal_id_map(
+				valid_lists, list_frequencies, reserved_lists
+			)
 			if rename_list_names
 			else {}
 		)
@@ -2624,12 +2648,16 @@ def rename_identifiers(
 		)
 
 		var_map = (
-			_rename_id_map(sorted(valid_variables), reserved_variables)
+			_frequency_optimal_id_map(
+				valid_variables, variable_frequencies, reserved_variables
+			)
 			if rename_variable_names
 			else {}
 		)
 		list_map = (
-			_rename_id_map(sorted(valid_lists), reserved_lists)
+			_frequency_optimal_id_map(
+				valid_lists, list_frequencies, reserved_lists
+			)
 			if rename_list_names
 			else {}
 		)
@@ -2689,9 +2717,11 @@ def rename_identifiers(
 				changed += 1
 
 	stage_broadcast_names = {}
+	broadcast_definition_frequencies = Counter()
 	conflicting_broadcast_ids = set()
 	for target in targets:
 		for bid, name in (target.get("broadcasts") or {}).items():
+			broadcast_definition_frequencies[bid] += 1
 			if not isinstance(bid, str) or not isinstance(name, str):
 				continue
 			previous = stage_broadcast_names.get(bid)
@@ -2709,7 +2739,11 @@ def rename_identifiers(
 		for bid, name in stage_broadcast_names.items()
 		if bid in conflicting_broadcast_ids
 	}
-	broadcast_new_names = _rename_id_map(valid_broadcast_ids, reserved_broadcast_names)
+	for bid, count in broadcast_definition_frequencies.items():
+		broadcast_frequencies[bid] += count
+	broadcast_new_names = _frequency_optimal_id_map(
+		valid_broadcast_ids, broadcast_frequencies, reserved_broadcast_names
+	)
 	for bid, new_name in broadcast_new_names.items():
 		old_name = stage_broadcast_names[bid]
 		if old_name != new_name:
@@ -2720,7 +2754,7 @@ def rename_identifiers(
 	if rename_procedure_names:
 		for ti, target in enumerate(targets):
 			blocks = target.get("blocks") or {}
-			old_proccodes = set()
+			procedure_frequencies = Counter()
 			for block in blocks.values():
 				if not isinstance(block, dict) or block.get("opcode") not in (
 					"procedures_prototype",
@@ -2730,9 +2764,12 @@ def rename_identifiers(
 				mutation = block.get("mutation")
 				proccode = mutation.get("proccode") if isinstance(mutation, dict) else None
 				if isinstance(proccode, str) and proccode:
-					old_proccodes.add(proccode)
+					procedure_frequencies[proccode] += 1
 
-			# procedure names use a smaller alphabet so generated names cannot accidentally introduce Scratch block/icon syntax
+			old_proccodes = list(procedure_frequencies)
+			# Procedure names use a smaller alphabet so generated names cannot
+			# accidentally introduce Scratch block/icon syntax. The name portion
+			# is optimized by frequency; the %... suffix is preserved exactly.
 			procedure_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 			def short_procedure_name(index):
 				base = len(procedure_alphabet)
@@ -2744,7 +2781,9 @@ def rename_identifiers(
 					if n == 0:
 						return name
 
-			for index, old_proccode in enumerate(sorted(old_proccodes)):
+			for index, old_proccode in enumerate(
+				sorted(old_proccodes, key=lambda p: (-procedure_frequencies[p], p))
+			):
 				new_name = short_procedure_name(index)
 				percent = old_proccode.find("%")
 				if percent >= 0:
@@ -2778,7 +2817,7 @@ def rename_identifiers(
 	argument_new_names = {}
 	for ti, target in enumerate(targets):
 		blocks = target.get("blocks") or {}
-		old_argument_names = set()
+		argument_frequencies = Counter()
 		for block in blocks.values() if rename_argument_names else ():
 			if not isinstance(block, dict):
 				continue
@@ -2793,12 +2832,15 @@ def rename_identifiers(
 				if isinstance(decoded, list) and all(
 					isinstance(name, str) for name in decoded
 				):
-					old_argument_names.update(decoded)
+					argument_frequencies.update(decoded)
 			if block.get("opcode", "").startswith("argument_reporter_"):
 				field = (block.get("fields") or {}).get("VALUE")
 				if isinstance(field, list) and field and isinstance(field[0], str):
-					old_argument_names.add(field[0])
-		new_names = _rename_id_map(sorted(old_argument_names))
+					argument_frequencies[field[0]] += 1
+		old_argument_names = list(argument_frequencies)
+		new_names = _frequency_optimal_id_map(
+			old_argument_names, argument_frequencies
+		)
 		argument_new_names[ti] = new_names
 		argument_names.update(
 			{(ti, new): old for old, new in new_names.items() if old != new}
@@ -10393,7 +10435,6 @@ def _target_default_properties(target):
 		"draggable": False,
 		"rotationStyle": "all around",
 	}
-
 
 
 def _reference_primitive_head_equal(original, minified, opts):
