@@ -782,6 +782,10 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 	) >= FAST_JSON_BLOCK_THRESHOLD
 	search_level = FAST_JSON_SEARCH_LEVEL if large_project else level
 	best_compressed = deflate(best_raw, search_level)
+	# Always initialize the encoding label from the baseline candidate. Some valid
+	# projects have no candidate that beats the baseline, but the later Zopfli/
+	# DEFLATE checks still need a defined label.
+	best_label = "minimum/raw-zlib" if minimum_json else "original-order/zlib"
 	rank = (lambda encoded, raw: (len(raw), len(encoded))) if minimum_json else (lambda encoded, raw: (len(encoded), len(raw)))
 	pool = []
 	def remember(raw, compressed):
@@ -1061,6 +1065,7 @@ def _progress_stage_count(opts):
 	count += bool(opts.group_similar_sequences)
 	count += bool(opts.optimize_procedure_arguments)
 	count += bool(opts.merge_duplicate_procedures)
+	count += bool(opts.inline_single_use_procedures)
 	count += bool(opts.remove_unused_procedures and (opts.optimize_procedure_arguments or opts.merge_duplicate_procedures))
 	count += bool(opts.remove_unused_variables or opts.remove_unused_lists)
 	count += True
@@ -2036,6 +2041,12 @@ def _rename_id_map(ids, existing_ids=(), prefix=""):
 
 
 def _frequency_optimal_id_map(ids, frequencies=None, existing_ids=(), prefix=""):
+	"""Assign the shortest available identifiers to the most frequent symbols.
+
+	Generated identifiers have strictly increasing JSON payload length under
+	_short_id(), so descending reference frequency is the byte-optimal assignment
+	for this identifier alphabet. Ties are deterministic by the original name.
+	"""
 	ids = list(ids)
 	if not ids:
 		return {}
@@ -2508,6 +2519,10 @@ def rename_identifiers(
 	variable_new_names = {}
 	list_new_names = {}
 
+	# Count semantic uses before any names are rewritten. Definitions count as one
+	# serialized occurrence, while _collect_data_references() captures references
+	# through fields, inputs, sensing_of, and monitors. This lets the shortest
+	# generated names go to the identifiers that actually dominate project.json.
 	var_refs, list_refs, broadcast_refs = _collect_data_references(project)
 	variable_frequencies = Counter()
 	list_frequencies = Counter()
@@ -4682,6 +4697,339 @@ def _procedure_update_mutation(mut, arg_ids, arg_names, removed_indices, new_pro
 			)
 	out["proccode"] = new_proccode
 	return out
+
+
+def _procedure_warp_enabled(value):
+    """Return whether a procedure is explicitly configured to run without screen refresh."""
+    return value is True or (isinstance(value, str) and value.lower() == "true")
+
+
+def _procedure_recursive_set(by_proc):
+    """Find procedures that participate in recursive call cycles."""
+    call_graph = {proc: set() for proc in by_proc}
+    for proc, infos in by_proc.items():
+        for info in infos:
+            blocks = info.get("blocks", {})
+            for bid in info["closure"]:
+                block = blocks.get(bid)
+                if not isinstance(block, dict) or block.get("opcode") != "procedures_call":
+                    continue
+                called = _procedure_key(block)
+                if called in by_proc:
+                    call_graph[proc].add(called)
+
+    recursive = set()
+    for start in call_graph:
+        stack = list(call_graph[start])
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current == start:
+                recursive.add(start)
+                break
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(call_graph.get(current, ()))
+    return recursive
+
+
+def _inline_argument_reporter_refs(value, reporter_ids, replacement):
+    """Replace references to formal-argument reporters with a safe literal."""
+    if not isinstance(value, list) or not value:
+        return value, False
+    tag = value[0]
+    if tag in (1, 2, 3):
+        positions = (1, 2) if tag == 3 else (1,)
+        for index in positions:
+            if index >= len(value):
+                continue
+            item = value[index]
+            if isinstance(item, str) and item in reporter_ids:
+                return copy.deepcopy(replacement), True
+            if isinstance(item, (list, dict)):
+                new_item, changed = _inline_argument_reporter_refs(item, reporter_ids, replacement)
+                if changed:
+                    value[index] = new_item
+                    if index == 1 and _is_bare_literal_input(new_item):
+                        return new_item, True
+                    return value, True
+        return value, False
+    for index in range(1, len(value)):
+        item = value[index]
+        if isinstance(item, (list, dict)):
+            new_item, changed = _inline_argument_reporter_refs(item, reporter_ids, replacement)
+            if changed:
+                value[index] = new_item
+                return value, True
+    return value, False
+
+
+def inline_single_use_procedures(project, stats, opts):
+    """Inline single-use custom procedures only when both sides are warp/no-refresh."""
+    targets = project.get("targets", [])
+    opts.inlined_procedure_removed_blocks = [set() for _ in targets]
+    opts.inlined_procedure_link_edits = {}
+    opts.inlined_procedure_input_edits = {}
+
+    max_passes = max(1, int(getattr(opts, "procedure_inline_passes", 8)))
+    total = 0
+    total_removed = 0
+    total_reporters = 0
+    completed_passes = 0
+
+    for _pass in range(max_passes):
+        changed_this_pass = False
+
+        for ti, target in enumerate(targets):
+            blocks = target.get("blocks") or {}
+            if not blocks:
+                continue
+            by_proc, graph = _procedure_infos(target)
+            if not by_proc:
+                continue
+            for infos in by_proc.values():
+                for info in infos:
+                    info["blocks"] = blocks
+
+            recursive = _procedure_recursive_set(by_proc)
+            warp_owners = {}
+            for proc, infos in by_proc.items():
+                if len(infos) != 1:
+                    continue
+                info = infos[0]
+                if not _procedure_warp_enabled(info["mutation"].get("warp")):
+                    continue
+                for owned_id in info["closure"]:
+                    warp_owners.setdefault(owned_id, set()).add(proc)
+
+            calls_by_proc = {}
+            for call_id, block in blocks.items():
+                if not isinstance(block, dict) or block.get("opcode") != "procedures_call":
+                    continue
+                proc = _procedure_key(block)
+                if proc is not None:
+                    calls_by_proc.setdefault(proc, []).append((call_id, block))
+
+            for proc, infos in list(by_proc.items()):
+                if len(infos) != 1 or len(calls_by_proc.get(proc, ())) != 1:
+                    continue
+                if proc in recursive:
+                    continue
+                info = infos[0]
+                if not _procedure_warp_enabled(info["mutation"].get("warp")):
+                    continue
+
+                call_id, call = calls_by_proc[proc][0]
+                if len(warp_owners.get(call_id, set())) != 1:
+                    continue
+
+                definition_id = info["definition_id"]
+                prototype_id = info["prototype_id"]
+                closure = set(info["closure"])
+                definition = blocks.get(definition_id)
+                prototype = blocks.get(prototype_id)
+                if not isinstance(definition, dict) or not isinstance(prototype, dict):
+                    continue
+
+                body_root = definition.get("next")
+                if not isinstance(body_root, str) or body_root not in blocks or body_root not in closure:
+                    continue
+
+                body_sequence = []
+                seen_body = set()
+                current = body_root
+                valid_body_chain = False
+                while isinstance(current, str):
+                    if current in seen_body or current not in closure:
+                        break
+                    block = blocks.get(current)
+                    if not isinstance(block, dict):
+                        break
+                    body_sequence.append(current)
+                    seen_body.add(current)
+                    nxt = block.get("next")
+                    if nxt is None:
+                        valid_body_chain = True
+                        break
+                    if not isinstance(nxt, str):
+                        break
+                    current = nxt
+                if not valid_body_chain:
+                    continue
+                tail_id = body_sequence[-1]
+
+                parent_id = call.get("parent")
+                if not isinstance(parent_id, str) or parent_id not in blocks:
+                    continue
+                if graph.parents.get(call_id, set()) != {parent_id}:
+                    continue
+                call_next = call.get("next")
+                if call_next is not None and (not isinstance(call_next, str) or call_next not in blocks):
+                    continue
+
+                parent_block = blocks.get(parent_id)
+                if not isinstance(parent_block, dict):
+                    continue
+                parent_mode = None
+                parent_input_name = None
+                parent_input_replacement = None
+                if parent_block.get("next") == call_id:
+                    parent_mode = "next"
+                else:
+                    for input_name, raw in (parent_block.get("inputs") or {}).items():
+                        replaced = _sequence_replace_direct_ref(raw, call_id, body_root)
+                        if replaced is not None:
+                            parent_mode = "input"
+                            parent_input_name = input_name
+                            parent_input_replacement = replaced
+                            break
+                if parent_mode is None:
+                    continue
+
+                # Argument reporter shadows attached to the prototype are part of
+                # the procedure scaffold, not actual body uses. Exclude them from
+                # the usage analysis while still removing them with the prototype.
+                prototype_owned = {prototype_id}
+                prototype_stack = [prototype_id]
+                while prototype_stack:
+                    owned_id = prototype_stack.pop()
+                    for ref in graph.edges.get(owned_id, ()):
+                        if ref in closure and ref not in prototype_owned:
+                            prototype_owned.add(ref)
+                            prototype_stack.append(ref)
+                body_info = dict(info)
+                body_info["closure"] = closure - prototype_owned - {definition_id}
+                used, reporter_map, _arg_names = _procedure_body_argument_uses(body_info, blocks)
+                if used is None:
+                    continue
+                formal_ids = list(info["argument_ids"])
+                call_ids = _parse_argumentids(call.get("mutation"))
+                if call_ids is None or len(call_ids) != len(formal_ids):
+                    continue
+
+                replacements = {}
+                can_inline = True
+                for idx, formal_id in enumerate(formal_ids):
+                    raw = (call.get("inputs") or {}).get(call_ids[idx])
+                    if raw is None:
+                        can_inline = False
+                        break
+                    if idx in used:
+                        literal = _procedure_input_literal(raw)
+                        if literal is None:
+                            can_inline = False
+                            break
+                        replacement, _ = _constant_to_scratch_input(literal, blocks, None)
+                        if replacement is None:
+                            can_inline = False
+                            break
+                        replacements[formal_id] = (set(reporter_map.get(idx, ())), replacement)
+                    elif not _procedure_input_is_discardable(raw, blocks, graph):
+                        can_inline = False
+                        break
+                if not can_inline:
+                    continue
+
+                all_reporters = set().union(*(set(v) for v in reporter_map.values())) if reporter_map else set()
+                removed = {call_id, definition_id} | prototype_owned | all_reporters
+                comments = target.get("comments") or {}
+                if any(
+                    isinstance(comment, dict) and comment.get("blockId") in removed
+                    for comment in comments.values()
+                ):
+                    continue
+
+                planned_inputs = {}
+                for survivor_id in closure - removed:
+                    block = blocks.get(survivor_id)
+                    if not isinstance(block, dict):
+                        continue
+                    for input_name, raw in (block.get("inputs") or {}).items():
+                        new_raw = copy.deepcopy(raw)
+                        changed_input = False
+                        for reporter_ids, replacement in replacements.values():
+                            if not reporter_ids:
+                                continue
+                            new_raw, replaced = _inline_argument_reporter_refs(
+                                new_raw, reporter_ids, replacement
+                            )
+                            changed_input |= replaced
+                        if changed_input:
+                            planned_inputs[(survivor_id, input_name)] = new_raw
+
+                # Ensure no surviving block will continue to reference the removed
+                # procedure scaffolding or argument reporters.
+                for survivor_id in closure - removed:
+                    block = blocks.get(survivor_id)
+                    if not isinstance(block, dict):
+                        continue
+                    for key in ("next", "parent"):
+                        ref = block.get(key)
+                        if ref in removed:
+                            if survivor_id == body_root and key == "parent" and ref == definition_id:
+                                continue
+                            can_inline = False
+                            break
+                    if not can_inline:
+                        break
+                    for input_name, raw in (block.get("inputs") or {}).items():
+                        check_value = planned_inputs.get((survivor_id, input_name), raw)
+                        if any(ref in removed for ref in _iter_input_block_refs(check_value)):
+                            can_inline = False
+                            break
+                    if not can_inline:
+                        break
+                if not can_inline:
+                    continue
+
+                root_block = blocks.get(body_root)
+                tail_block = blocks.get(tail_id)
+                next_block = blocks.get(call_next) if call_next is not None else None
+                if (
+                    not isinstance(root_block, dict)
+                    or not isinstance(tail_block, dict)
+                    or (call_next is not None and not isinstance(next_block, dict))
+                ):
+                    continue
+
+                for (survivor_id, input_name), new_raw in planned_inputs.items():
+                    blocks[survivor_id].setdefault("inputs", {})[input_name] = new_raw
+                    opts.inlined_procedure_input_edits[(ti, survivor_id, input_name)] = copy.deepcopy(new_raw)
+
+                root_block["parent"] = parent_id
+                opts.inlined_procedure_link_edits[(ti, body_root, "parent")] = parent_id
+                tail_block["next"] = call_next
+                opts.inlined_procedure_link_edits[(ti, tail_id, "next")] = call_next
+                if call_next is not None:
+                    next_block["parent"] = tail_id
+                    opts.inlined_procedure_link_edits[(ti, call_next, "parent")] = tail_id
+
+                if parent_mode == "next":
+                    parent_block["next"] = body_root
+                    opts.inlined_procedure_link_edits[(ti, parent_id, "next")] = body_root
+                else:
+                    parent_block["inputs"][parent_input_name] = parent_input_replacement
+                    opts.inlined_procedure_input_edits[(ti, parent_id, parent_input_name)] = copy.deepcopy(parent_input_replacement)
+
+                for remove_id in removed:
+                    blocks.pop(remove_id, None)
+                opts.inlined_procedure_removed_blocks[ti].update(removed)
+
+                total += 1
+                total_removed += len(removed)
+                total_reporters += len(all_reporters)
+                changed_this_pass = True
+
+        if not changed_this_pass:
+            break
+        completed_passes += 1
+
+    stats["procedure_inlined"] += total
+    stats["procedure_inline_blocks_removed"] += total_removed
+    stats["procedure_inline_argument_reporters_removed"] += total_reporters
+    stats["procedure_inline_passes"] += completed_passes
+    return total
 
 
 def optimize_procedure_arguments(project, stats, opts):
@@ -8608,6 +8956,8 @@ class Options:
 		deduplicate_assets=False,
 		optimize_procedure_arguments=False,
 		merge_duplicate_procedures=False,
+		inline_single_use_procedures=False,
+		procedure_inline_passes=8,
 		branch_swapping=False,
 		trivial_loops=False,
 		nested_conditionals=False,
@@ -8661,7 +9011,7 @@ class Options:
 					or name in ("normalize_numbers", "convert_wav_to_mp3", "sort_keys",
 						"compact_numeric_inputs", "compact_field_ids", "compact_mutation_hasnext",
 						"compact_mutation_metadata", "deduplicate_assets", "group_similar_sequences",
-						"optimize_procedure_arguments", "merge_duplicate_procedures",
+						"optimize_procedure_arguments", "merge_duplicate_procedures", "inline_single_use_procedures",
 						"branch_swapping", "trivial_loops", "nested_conditionals",
 						"associative_constant_merging", "script_constant_propagation",
 						"strip_reference_names", "compact_data_literals", "remove_unused_extensions",
@@ -8729,6 +9079,10 @@ class Options:
 		self.deduplicate_assets = deduplicate_assets
 		self.optimize_procedure_arguments = optimize_procedure_arguments
 		self.merge_duplicate_procedures = merge_duplicate_procedures
+		self.inline_single_use_procedures = inline_single_use_procedures
+		self.procedure_inline_passes = int(procedure_inline_passes)
+		if self.procedure_inline_passes < 1:
+			raise ValueError("procedure_inline_passes must be positive")
 		self.branch_swapping = branch_swapping
 		self.trivial_loops = trivial_loops
 		self.nested_conditionals = nested_conditionals
@@ -8781,6 +9135,9 @@ class Options:
 		self.procedure_argument_input_edits = {}
 		self.procedure_argument_removed_blocks = []
 		self.merged_procedure_removed_blocks = []
+		self.inlined_procedure_removed_blocks = []
+		self.inlined_procedure_link_edits = {}
+		self.inlined_procedure_input_edits = {}
 
 		self.script_rewrite_removed_blocks = []
 		self.script_rewrite_new_blocks = []
@@ -8889,6 +9246,9 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.merge_duplicate_procedures:
 		stage('Merge duplicate procedures')
 		merge_duplicate_procedures(project, stats, opts)
+	if opts.inline_single_use_procedures:
+		stage('Inline safe single-use procedures')
+		inline_single_use_procedures(project, stats, opts)
 	if opts.remove_unused_procedures and (
 		opts.optimize_procedure_arguments or opts.merge_duplicate_procedures
 	):
@@ -9778,7 +10138,11 @@ def _check_blocks(
 		extra = set(m) - set(o)
 		if extra or not (opts.comments and gone <= {"comment"}):
 			return f"{where} (opcode: {o.get('opcode')}): block keys changed. Missing keys: {sorted(gone)}, unexpected extra keys: {sorted(extra)}"
-	allow_repairs = opts.remove_unreachable or opts.remove_unused_procedures
+	allow_repairs = (
+		opts.remove_unreachable
+		or opts.remove_unused_procedures
+		or getattr(opts, "inline_single_use_procedures", False)
+	)
 	for k in o:
 		if k not in m:
 			continue
@@ -9845,28 +10209,31 @@ def _check_blocks(
 			recorded_substack = script_input_edits.get((target_index, block_id, "SUBSTACK"))
 			script_removed = getattr(opts, "script_rewrite_removed_inputs", {}) or {}
 			recorded_removed = set(script_removed.get((target_index, block_id), set()))
+			schema_match = False
 			if (
 				o.get("opcode") == "control_if_else"
 				and expected_script_opcode == "control_if"
 				and gone_inputs == {"SUBSTACK2"}
 				and extra_inputs == {"SUBSTACK"}
 				and "SUBSTACK2" in recorded_removed
-				and (
-					_check_inputs_match(
-						o["inputs"]["SUBSTACK2"],
-						m["inputs"]["SUBSTACK"],
-						opts, original_blocks, remaining_blocks, target_index
-					)
-					or (
-						recorded_substack is not None
-						and _check_inputs_match(
-							recorded_substack,
-						m["inputs"]["SUBSTACK"],
-						opts, original_blocks, remaining_blocks, target_index
-						)
-					)
-				)
 			):
+				schema_match = _check_inputs_match(
+					o["inputs"]["SUBSTACK2"],
+					m["inputs"]["SUBSTACK"],
+					opts, original_blocks, remaining_blocks, target_index
+				)
+				if not schema_match and recorded_substack is not None:
+					schema_match = _check_inputs_match(
+					recorded_substack,
+					m["inputs"]["SUBSTACK"],
+					opts, original_blocks, remaining_blocks, target_index
+				)
+				if not schema_match:
+					inlined_substack = (
+						getattr(opts, "inlined_procedure_input_edits", {}) or {}
+					).get((target_index, block_id, "SUBSTACK"))
+					schema_match = inlined_substack is not None and inlined_substack == m["inputs"]["SUBSTACK"]
+			if schema_match:
 				gone_inputs.clear()
 				extra_inputs.clear()
 
@@ -9900,6 +10267,20 @@ def _check_blocks(
 						remaining_blocks,
 						target_index,
 					)
+				):
+					continue
+				inlined_inputs = getattr(opts, "inlined_procedure_input_edits", {}) or {}
+				inlined_input = inlined_inputs.get((target_index, block_id, name))
+				if inlined_input is not None and (
+					inlined_input == mi
+					or _check_inputs_match(
+						inlined_input,
+					mi,
+					opts,
+					original_blocks,
+					remaining_blocks,
+					target_index,
+				)
 				):
 					continue
 				folded_inputs = getattr(opts, "folded_constant_expression_inputs", {})
@@ -9964,6 +10345,9 @@ def _check_blocks(
 				if expected_link is None:
 					expected_link = fold_link_edits.get(link_key)
 				if expected_link is None:
+					inlined_link_edits = getattr(opts, "inlined_procedure_link_edits", {}) or {}
+					expected_link = inlined_link_edits.get(link_key)
+				if expected_link is None:
 					expected_link = group_link_edits.get(link_key)
 				if expected_link is None:
 					expected_link = simplified_link_edits.get(link_key)
@@ -9971,6 +10355,18 @@ def _check_blocks(
 					expected_link = script_link_edits.get(link_key)
 				if expected_link is not None and m[k] == expected_link:
 					continue
+			if (
+				k == "parent"
+				and m[k] is None
+				and isinstance(o[k], str)
+				and _is_known_orphan_argument_reporter(o, original_blocks or {})
+				and o[k] not in (original_blocks or {})
+			):
+				# Scratch projects can contain shadow argument reporters whose parent
+				# points at an already-missing prototype shadow block. The structural
+				# validator explicitly permits this quirk; accept its canonicalization
+				# here as well without opening generic parent-link repair.
+				continue
 			if (
 				allow_repairs
 				and k in ("next", "parent")
@@ -10407,6 +10803,9 @@ def _expected_removed_blocks(project, opts):
 		merged_removed = getattr(opts, "merged_procedure_removed_blocks", ())
 		if ti < len(merged_removed):
 			ids.update(merged_removed[ti])
+		inlined_removed = getattr(opts, "inlined_procedure_removed_blocks", ())
+		if ti < len(inlined_removed):
+			ids.update(inlined_removed[ti])
 		script_removed = getattr(opts, "script_rewrite_removed_blocks", ())
 		if ti < len(script_removed):
 			ids.update(script_removed[ti])
@@ -10437,6 +10836,7 @@ def _target_default_properties(target):
 	}
 
 
+
 def _reference_primitive_head_equal(original, minified, opts):
 	if not (isinstance(original, list) and isinstance(minified, list)):
 		return False
@@ -10453,6 +10853,10 @@ def _reference_primitive_head_equal(original, minified, opts):
 	)
 
 
+# Process-based verification is used only for large block tables. The block
+# checker is mostly Python code, so threads cannot exploit multiple cores.
+# Each worker receives one serialized target state and verifies a disjoint
+# slice of that target's surviving blocks.
 VERIFY_PARALLEL_MIN_BLOCKS = 3000
 VERIFY_PARALLEL_MAX_WORKERS = 4
 _VERIFY_WORKER_STATE = None
@@ -10464,6 +10868,7 @@ _VERIFY_BLOCK_OPT_ATTRS = (
     "compact_mutation_hasnext", "compact_mutation_metadata",
     "rename_argument_ids", "strip_reference_names", "normalize_epsilon",
     "normalize_numbers", "optimize_json", "minimum_json", "compact_numeric_inputs",
+    "inline_single_use_procedures",
 )
 _VERIFY_BLOCK_MAP_ATTRS = (
     "variable_setter_input_edits", "variable_setter_link_edits",
@@ -10472,6 +10877,7 @@ _VERIFY_BLOCK_MAP_ATTRS = (
     "folded_constant_expression_inputs", "folded_constant_expression_link_edits",
     "folded_constant_expression_opcode_edits",
     "grouped_sequence_input_edits", "grouped_sequence_link_edits",
+    "inlined_procedure_input_edits", "inlined_procedure_link_edits",
     "script_rewrite_input_edits", "script_rewrite_link_edits",
     "script_rewrite_opcode_edits", "script_rewrite_removed_inputs",
     "simplified_block_input_edits", "simplified_block_link_edits",
@@ -10494,6 +10900,10 @@ def _make_verify_worker_state(to, tm, opts, target_index, changed):
         attrs[name] = getattr(opts, name, False)
     for name in _VERIFY_BLOCK_MAP_ATTRS:
         value = getattr(opts, name, None)
+        # These two maps are indexed by the *owner* target of the folded
+        # variable, not by the target containing the use. A stage/global
+        # constant can therefore be folded inside another target, so filtering
+        # them to target_index would make the verifier forget the legal rewrite.
         if name in ("folded_constant_variables", "folded_constant_variable_literals"):
             attrs[name] = dict(value) if isinstance(value, dict) else {}
         else:
@@ -10573,14 +10983,16 @@ def _verify_block_chunk(bounds):
             return result
     return None
 
-def _verify_target_blocks(to, tm, opts, target_index):
+def _verify_target_blocks_parallel(to, tm, opts, target_index):
     original_blocks = to.get("blocks", {})
     minified_blocks = tm.get("blocks", {})
     remaining_blocks = set(minified_blocks)
     changed = []
 
-    # Most Scratch projects contain far more unchanged blocks than changed blocks;
-    # there is no reason to serialize and process those just to rediscover that they are equal.
+    # The equality fast path is intentionally kept in the parent process. Most
+    # Scratch projects contain far more unchanged blocks than changed blocks;
+    # there is no reason to serialize and process those just to rediscover that
+    # they are equal.
     for position, bid in enumerate(original_blocks):
         if bid not in minified_blocks:
             continue
@@ -11026,7 +11438,7 @@ def verify(original_path, minified_path, opts):
 					f"Target {ti} ({name!r}): block(s) were removed even though the original "
 					f"project proves they were reachable/live: {sorted(illegal_missing)[:10]}"
 				)
-			err = _verify_target_blocks(to, tm, opts, ti)
+			err = _verify_target_blocks_parallel(to, tm, opts, ti)
 			if err:
 				return False, err
 
@@ -11437,6 +11849,15 @@ def _print_transform_stats(stats, opts):
 					("duplicate_procedure_blocks_removed", "duplicate procedure blocks removed"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.inline_single_use_procedures:
+				print(Ansi.subheading("  12f. Inline safe single-use procedures"))
+				for key, label in (
+					("procedure_inlined", "single-use procedures inlined"),
+					("procedure_inline_blocks_removed", "procedure scaffolding blocks removed"),
+					("procedure_inline_argument_reporters_removed", "argument reporters removed during inlining"),
+					("procedure_inline_passes", "inlining passes completed"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 
 
 
@@ -11790,7 +12211,7 @@ if __name__ == "__main__":
 		print(Ansi.error(f"Unknown or malformed option(s): {bad}"))
 		print(
 			Ansi.muted(
-				f"Valid: {sorted(toggles)} and --list-bytes=N --list-items=N --sequence-threshold=N --zopfli-iterations=N --json-search-rounds=N (positive), --compression-level=N (0-9), --normalize-epsilon=N (positive)"
+				f"Valid: {sorted(toggles)} and --list-bytes=N --list-items=N --sequence-threshold=N --zopfli-iterations=N --json-search-rounds=N --procedure-inline-passes=N (positive), --compression-level=N (0-9), --normalize-epsilon=N (positive)"
 			)
 		)
 		sys.exit(1)
@@ -11918,6 +12339,15 @@ if __name__ == "__main__":
 				"--deduplicate-procedures",
 			)
 		),
+		inline_single_use_procedures=all_optimizations or any(
+			f in flags
+			for f in (
+				"--inline-single-use-procedures",
+				"--inline-single-use-custom-procedures",
+				"--procedure-inlining",
+			)
+		),
+		procedure_inline_passes=values.get("--procedure-inline-passes", 8),
 		branch_swapping=all_optimizations or any(f in flags for f in ("--branch-swapping", "--swap-branches", "--branch-swap")),
 		trivial_loops=all_optimizations or any(f in flags for f in ("--trivial-loops", "--simplify-trivial-loops")),
 		nested_conditionals=all_optimizations or any(f in flags for f in ("--nested-conditionals", "--merge-nested-conditionals", "--merge-nested-ifs")),
