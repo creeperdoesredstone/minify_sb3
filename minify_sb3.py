@@ -1407,10 +1407,23 @@ def _is_boolean_slot(block, input_name):
 	return input_name in _boolean_input_names(block)
 
 
+def _scratch_numeric_tag(value):
+	"""Return a Scratch JSON numeric tag as an int, including JsonNumber tags."""
+	if isinstance(value, JsonNumber):
+		try:
+			return int(value)
+		except (TypeError, ValueError, OverflowError):
+			return None
+	if type(value) is int:
+		return value
+	return None
+
+
 def _is_bare_literal_input(value):
 	if not (isinstance(value, list) and len(value) > 1):
 		return False
-	if value[0] in (1, 3):
+	tag = _scratch_numeric_tag(value[0])
+	if tag in (1, 3):
 		return isinstance(value[1], list)
 	return False
 
@@ -7840,9 +7853,13 @@ def _replace_owner_block_ref(parent_block, old_id, new_id):
 
 
 def _control_substack(value, blocks):
-	if not isinstance(value, list) or not value or value[0] not in (1, 2, 3):
+	# `loads_exact()` represents JSON numbers as JsonNumber (a str subclass),
+	# so comparing the tag directly with integer literals is not reliable.
+	# Normalize the Scratch input tag before testing it.
+	if not isinstance(value, list) or not value:
 		return None
-	if len(value) <= 1:
+	tag = _input_tag(value[0])
+	if tag not in (1, 2, 3) or len(value) <= 1:
 		return None
 	ref = value[1]
 	return ref if isinstance(ref, str) and ref in blocks else None
@@ -8307,12 +8324,13 @@ def _script_record_new(opts, ti, created):
 
 
 def _script_literal_from_input(value):
-	if not (isinstance(value, list) and len(value) == 2 and value[0] == 1):
+	if not (isinstance(value, list) and len(value) == 2 and _scratch_numeric_tag(value[0]) == 1):
 		return None
 	literal = value[1]
 	if not (isinstance(literal, list) and len(literal) == 2):
 		return None
 	tag, raw = literal
+	tag = _scratch_numeric_tag(tag)
 	if tag in _NUMERIC_TAGS and not isinstance(raw, bool) and isinstance(raw, (str, int, float)):
 		if isinstance(raw, float) and not math.isfinite(raw):
 			return None
@@ -9102,12 +9120,12 @@ def _script_var_id(block):
 def _script_replace_known_reads(value, env, blocks, owner_id, ti, opts, graph, allow_literal=True):
 	if not isinstance(value, list) or not value:
 		return value, False, set()
-	if len(value) >= 3 and value[0] == 12 and isinstance(value[2], str) and value[2] in env:
+	if len(value) >= 3 and _scratch_numeric_tag(value[0]) == 12 and isinstance(value[2], str) and value[2] in env:
 		if not allow_literal:
 			return value, False, set()
 		entry = env[value[2]]
 		return [1, copy.deepcopy(entry)], True, set()
-	if value[0] in (1,2,3) and len(value) > 1 and isinstance(value[1], str):
+	if _scratch_numeric_tag(value[0]) in (1, 2, 3) and len(value) > 1 and isinstance(value[1], str):
 		ref = value[1]
 		child = blocks.get(ref)
 		if isinstance(child, dict) and child.get("opcode") == "data_variable":
@@ -9117,7 +9135,7 @@ def _script_replace_known_reads(value, env, blocks, owner_id, ti, opts, graph, a
 				if owned == {ref}:
 					return [1, copy.deepcopy(env[vid])], True, {ref}
 		return value, False, set()
-	if value[0] == 3:
+	if _scratch_numeric_tag(value[0]) == 3:
 		changed = False; removed = set()
 		for i in (1,2):
 			if i >= len(value) or not isinstance(value[i], list): continue
@@ -9243,146 +9261,134 @@ def _cfg_substack_may_fall_through(blocks, root, memo=None, active=None):
 
 def _build_script_cfg(target):
 	"""
-	Build a statement-level CFG for every executable root in one Scratch target.
+	Build a structured statement-level CFG for one Scratch target.
 
-	Reporter/input blocks are deliberately excluded: they are expression trees,
-	not control-flow statements. Control substacks introduce branch/loop edges;
-	their lexical tails fall through to the enclosing control's `next` where
-	appropriate.
+	Scratch substacks are represented as ordinary ``next`` chains whose final
+	statement has ``next: null``.  The important detail is that a null ``next``
+	does *not* necessarily mean script termination: the statement may be the
+	last statement of an enclosing ``if``/loop substack and must fall through to
+	that enclosing control's continuation (or loop header).  The previous CFG
+	builder lost those edges, which could incorrectly preserve a constant across
+	a nested conditional.
 	"""
 	blocks = target.get("blocks") or {}
 	roots = _cfg_statement_roots(blocks)
 	successors = {bid: set() for bid in roots}
 	predecessors = {bid: set() for bid in roots}
 	seen_by_root = {root: set() for root in roots}
-	falls_memo = {}
 
 	def add_node(root, bid):
-		if bid not in blocks or not isinstance(blocks.get(bid), dict):
+		if not isinstance(bid, str) or bid not in blocks or not isinstance(blocks.get(bid), dict):
 			return False
-		seen = seen_by_root[root]
-		if bid in seen:
-			return True
-		seen.add(bid)
+		seen_by_root[root].add(bid)
 		successors.setdefault(bid, set())
 		predecessors.setdefault(bid, set())
 		return True
 
 	def add_edge(a, b, root):
+		if not add_node(root, a):
+			return
 		if not isinstance(b, str) or b not in blocks or not isinstance(blocks.get(b), dict):
 			return
 		add_node(root, b)
-		successors.setdefault(a, set()).add(b)
-		predecessors.setdefault(b, set()).add(a)
+		successors[a].add(b)
+		predecessors[b].add(a)
 
-	for root in roots:
-		if not add_node(root, root):
-			continue
-		queue = [root]
-		while queue:
-			bid = queue.pop()
-			block = blocks.get(bid)
+	def process_chain(first, fallthrough, root, active=None):
+		"""Process one lexical statement chain with an explicit continuation."""
+		if active is None:
+			active = set()
+		current = first
+		local_seen = set()
+		while isinstance(current, str) and current in blocks and current not in local_seen:
+			local_seen.add(current)
+			if current in active:
+				# A malformed/cyclic lexical chain. The node is already represented;
+				# do not recurse forever.
+				return
+			active.add(current)
+			block = blocks.get(current)
 			if not isinstance(block, dict):
-				continue
+				active.discard(current)
+				return
+			add_node(root, current)
 			op = block.get("opcode", "")
 			inputs = block.get("inputs") or {}
 			nxt = block.get("next")
-			before = set(successors.get(bid, ()))
+			continuation = nxt if isinstance(nxt, str) and nxt in blocks else fallthrough
 
 			if op == "control_if":
 				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
 				if body_root is not None:
-					add_edge(bid, body_root, root)
-					queue.append(body_root)
-				else:
-					add_edge(bid, nxt, root)
-				if body_root is not None:
-					tail = _cfg_linear_tail(blocks, body_root)
-					if tail is not None and _cfg_substack_may_fall_through(blocks, body_root, falls_memo, set()):
-						if isinstance(nxt, str) and nxt in blocks:
-							add_edge(tail, nxt, root)
-							queue.append(tail)
-					else:
-						queue.append(tail) if tail is not None else None
+					add_edge(current, body_root, root)
+					process_chain(body_root, continuation, root, active)
+				# False branch skips the body.
+				if continuation is not None:
+					add_edge(current, continuation, root)
+
 			elif op == "control_if_else":
 				then_root = _control_substack(inputs.get("SUBSTACK"), blocks)
 				else_root = _control_substack(inputs.get("SUBSTACK2"), blocks)
 				if then_root is not None:
-					add_edge(bid, then_root, root)
-					queue.append(then_root)
-				elif isinstance(nxt, str) and nxt in blocks:
-					add_edge(bid, nxt, root)
+					add_edge(current, then_root, root)
+					process_chain(then_root, continuation, root, active)
+				elif continuation is not None:
+					add_edge(current, continuation, root)
 				if else_root is not None:
-					add_edge(bid, else_root, root)
-					queue.append(else_root)
-				elif isinstance(nxt, str) and nxt in blocks:
-					# The missing else branch falls through directly.
-					add_edge(bid, nxt, root)
-				for branch_root in (then_root, else_root):
-					if branch_root is None:
-						continue
-					tail = _cfg_linear_tail(blocks, branch_root)
-					if tail is not None:
-						if _cfg_substack_may_fall_through(blocks, branch_root, falls_memo, set()):
-							if isinstance(nxt, str) and nxt in blocks:
-								add_edge(tail, nxt, root)
-							queue.append(tail)
-						else:
-							queue.append(tail)
+					add_edge(current, else_root, root)
+					process_chain(else_root, continuation, root, active)
+				elif continuation is not None:
+					add_edge(current, continuation, root)
+
 			elif op in {"control_repeat", "control_repeat_until", "control_while"}:
 				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+				# Loop condition/count can exit before the body executes.
+				if continuation is not None:
+					add_edge(current, continuation, root)
 				if body_root is not None:
-					add_edge(bid, body_root, root)
-					queue.append(body_root)
-				if isinstance(nxt, str) and nxt in blocks:
-					add_edge(bid, nxt, root)
-				if body_root is not None:
-					tail = _cfg_linear_tail(blocks, body_root)
-					if tail is not None:
-						if _cfg_substack_may_fall_through(blocks, body_root, falls_memo, set()):
-							add_edge(tail, bid, root)
-							queue.append(tail)
+					add_edge(current, body_root, root)
+					# Falling off the body starts the next iteration.
+					process_chain(body_root, current, root, active)
+
 			elif op == "control_forever":
 				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
 				if body_root is not None:
-					add_edge(bid, body_root, root)
-					queue.append(body_root)
-					tail = _cfg_linear_tail(blocks, body_root)
-					if tail is not None and _cfg_substack_may_fall_through(blocks, body_root, falls_memo, set()):
-						add_edge(tail, bid, root)
+					add_edge(current, body_root, root)
+					process_chain(body_root, current, root, active)
+
 			elif op in {"control_stop", "control_stop_all", "control_stop_other_scripts", "control_delete_this_clone"}:
-				# These statement-level stops have no normal fall-through in the
-				# forms that terminate the current script. `control_stop` with the
-				# "other scripts" option is handled below as a conservative barrier.
+				# These terminate the current script/clone.  The special
+				# "other scripts in sprite" form leaves this script running.
 				if op == "control_stop":
-					option = None
 					field = (block.get("fields") or {}).get("STOP_OPTION")
-					if isinstance(field, list) and field and isinstance(field[0], str):
-						option = field[0]
-					if option == "other scripts in sprite":
-						add_edge(bid, nxt, root)
+					option = field[0] if isinstance(field, list) and field and isinstance(field[0], str) else None
+					if option == "other scripts in sprite" and continuation is not None:
+						add_edge(current, continuation, root)
+
 			else:
-				add_edge(bid, nxt, root)
+				if continuation is not None:
+					add_edge(current, continuation, root)
 
-			for succ in (successors.get(bid, set())) - before:
-				queue.append(succ)
+			active.discard(current)
+			# Continue along the lexical chain. For a control statement whose
+			# body was processed recursively, its own `next` is still the lexical
+			# successor of the control in the enclosing chain.
+			if not isinstance(nxt, str) or nxt not in blocks:
+				return
+			current = nxt
 
-	# Restrict edges to nodes belonging to each individual root. A custom
-	# procedure's CFG must not accidentally meet facts from an unrelated script.
-	root_of = {}
+	for root in roots:
+		if not add_node(root, root):
+			continue
+		process_chain(root, None, root)
+
+	# Restrict each root to its own graph. A malformed project can contain shared
+	# links; constant facts must never leak between unrelated scripts/procedures.
 	for root, nodes in seen_by_root.items():
 		for bid in nodes:
-			root_of.setdefault(bid, root)
-	for bid in list(successors):
-		owner = root_of.get(bid)
-		if owner is None:
-			continue
-		successors[bid].intersection_update(seen_by_root[owner])
-	for bid in list(predecessors):
-		owner = root_of.get(bid)
-		if owner is None:
-			continue
-		predecessors[bid].intersection_update(seen_by_root[owner])
+			successors.setdefault(bid, set()).intersection_update(nodes)
+			predecessors.setdefault(bid, set()).intersection_update(nodes)
+
 	return roots, seen_by_root, successors, predecessors
 
 
@@ -9479,7 +9485,7 @@ def _cfg_propagate_root_constants(
 			changes += 1
 
 		if node_changed:
-			for succ in successors.get(bid, ()):
+			for succ in successors.get(bid, set()):
 				if succ not in queued:
 					worklist.append(succ)
 					queued.add(succ)
