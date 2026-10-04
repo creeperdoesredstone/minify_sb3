@@ -4,8 +4,12 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import re
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from types import SimpleNamespace
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -13,7 +17,6 @@ import zipfile
 import zlib
 import uuid
 from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
 
 from functools import lru_cache
 from itertools import permutations, product
@@ -154,6 +157,100 @@ def _encode_parts(value, short_numbers):
 def dumps_exact(project, short_numbers=False):
 	return "".join(_encode_parts(project, short_numbers)).encode("utf-8", "backslashreplace")
 
+
+def dumps_exact_layout(project, order, short_numbers=False):
+	"""Serialize while changing only the property order of block records.
+
+	Unlike ``_layout`` this does not clone every target/block dictionary for
+	each candidate. It emits the requested order directly, which is much
+	cheaper for multi-megabyte project.json candidates.
+	"""
+	parts = []
+	quote = _quote
+	short = _short_number
+	order_tuple = tuple(order or ())
+
+	def emit(value, is_block=False):
+		if isinstance(value, JsonNumber):
+			parts.append(short(value) if short_numbers else value)
+		elif isinstance(value, str):
+			parts.append(quote(value))
+		elif value is None:
+			parts.append("null")
+		elif value is True:
+			parts.append("true")
+		elif value is False:
+			parts.append("false")
+		elif isinstance(value, dict):
+			parts.append("{")
+			if is_block and order_tuple:
+				keys = dict.fromkeys((*order_tuple, *value))
+				items = ((key, value[key]) for key in keys if key in value)
+			else:
+				items = value.items()
+			first = True
+			for key, item in items:
+				if not first:
+					parts.append(",")
+				first = False
+				parts.append(quote(key))
+				parts.append(":")
+				emit(item, False)
+			parts.append("}")
+		elif isinstance(value, list):
+			parts.append("[")
+			for index, item in enumerate(value):
+				if index:
+					parts.append(",")
+				emit(item, False)
+			parts.append("]")
+		else:
+			raise TypeError(f"unsupported exact JSON value: {type(value).__name__}")
+
+	# Special-case only the targets[*].blocks mapping so ordinary dictionaries
+	# retain their original property order.
+	parts.append("{")
+	first_target_key = True
+	for pkey, pvalue in project.items():
+		if not first_target_key:
+			parts.append(",")
+		first_target_key = False
+		parts.append(quote(pkey)); parts.append(":")
+		if pkey != "targets" or not isinstance(pvalue, list):
+			emit(pvalue); continue
+		parts.append("[")
+		for ti, target in enumerate(pvalue):
+			if ti: parts.append(",")
+			if not isinstance(target, dict):
+				emit(target); continue
+			parts.append("{")
+			first_key = True
+			for key, item in target.items():
+				if not first_key: parts.append(",")
+				first_key = False
+				parts.append(quote(key)); parts.append(":")
+				if key == "blocks" and isinstance(item, dict):
+					parts.append("{")
+					first_block = True
+					for bid, block in item.items():
+						if not first_block: parts.append(",")
+						first_block = False
+						parts.append(quote(bid)); parts.append(":")
+						emit(block, isinstance(block, dict))
+					parts.append("}")
+				else:
+					emit(item)
+			parts.append("}")
+		parts.append("]")
+	parts.append("}")
+	return "".join(parts).encode("utf-8", "backslashreplace")
+
+
+FAST_JSON_RAW_THRESHOLD = 1_500_000
+FAST_JSON_BLOCK_THRESHOLD = 8_000
+FAST_JSON_ORDER_COUNT = 2
+FAST_JSON_SCREEN_LEVEL = 1
+FAST_JSON_SEARCH_LEVEL = 3
 
 BLOCK_KEY_ORDERS = (
 	("opcode", "next", "parent", "inputs", "fields"),
@@ -1249,11 +1346,6 @@ def _sample_blocks(project, width=64):
 	return result
 
 
-def _render_layout(parts, order=None, shapes=None):
-	if shapes is None: shapes = {}
-	return b"".join(part if isinstance(part, bytes) else part.render(order, shapes) for part in parts)
-
-
 def _screen_record_orders(project, level):
 	"""Screen all core-property permutations without serializing values again."""
 	parts = _layout_parts(_sample_blocks(project))
@@ -1524,6 +1616,120 @@ def optimize_asset(data, level=9, original=None, use_zopfli=False, iterations=15
 BLOCK_ID_ALPHABET = "!@#$%^*()+_-={}|[]:;?,./~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
+class ProgressBar:
+	def __init__(self, total, enabled=None, width=30):
+		self.total = max(1, int(total))
+		self.enabled = sys.stdout.isatty() if enabled is None else enabled
+		self.width = max(10, int(width))
+		self.completed = 0
+		self.current = ""
+		self.detail_text = ""
+		self.started = time.monotonic()
+		self.last_render = 0.0
+
+	def _render(self, force=False):
+		if not self.enabled:
+			return
+		now = time.monotonic()
+		if not force and now - self.last_render < 0.10:
+			return
+		self.last_render = now
+		fraction = min(1.0, self.completed / self.total)
+		filled = int(self.width * fraction)
+		bar = Ansi.success("#" * filled) + Ansi.muted("." * (self.width - filled))
+		percent = fraction * 100.0
+		elapsed = now - self.started
+		detail = f" | {self.detail_text}" if self.detail_text else ""
+		line = f"\r[{bar}] {self.completed:>2}/{self.total:<2} {percent:5.1f}% | {self.current}{detail} | {elapsed:6.1f}s"
+		try:
+			terminal_width = shutil.get_terminal_size((120, 20)).columns
+		except OSError:
+			terminal_width = 120
+		width = max(40, terminal_width)
+		print(line[:width - 1].ljust(width - 1), end="", flush=True)
+
+	def next(self, label):
+		if self.current:
+			self.completed = min(self.total, self.completed + 1)
+		self.current = label
+		self.detail_text = ""
+		self._render(force=True)
+
+	def detail(self, text):
+		self.detail_text = str(text)
+		self._render()
+
+	def finish(self, label="Complete"):
+		self.completed = self.total
+		self.current = label
+		self.detail_text = ""
+		self._render(force=True)
+		if self.enabled:
+			print()
+
+	def close(self):
+		if self.enabled:
+			print()
+
+
+def _progress_stage_count(opts):
+	count = 1  # normalize block defaults
+	count += bool(opts.convert_wav_to_mp3)
+	count += bool(opts.deduplicate_assets)
+	count += bool(opts.comments)
+	count += bool(opts.positions)
+	count += bool(opts.covered)
+	count += bool(opts.monitors)
+	count += bool(opts.cleared_lists)
+	count += bool(opts.remove_unreachable)
+	count += bool(opts.remove_unused_procedures)
+	count += bool(opts.remove_unreachable or opts.remove_unused_procedures)
+	count += bool(opts.folded_constant_variables)
+	count += bool(opts.script_constant_propagation)
+	count += bool(opts.branch_swapping or opts.branch_factoring or opts.trivial_loops or opts.nested_conditionals)
+	count += bool(opts.associative_constant_merging)
+	count += bool(opts.fold_constant_expressions)
+	count += bool(opts.simplify_boolean_control or opts.trivial_loops)
+	count += bool(opts.simplify_blocks)
+	count += bool(opts.group_similar_sequences)
+	count += bool(opts.compact_procedure_prototypes)
+	count += bool(opts.clear_procedure_definition_shadows)
+	count += bool(opts.optimize_procedure_arguments)
+	count += bool(opts.merge_duplicate_procedures)
+	count += bool(opts.specialize_procedures)
+	count += bool(opts.inline_single_use_procedures)
+	count += bool(opts.remove_unused_procedures and (opts.optimize_procedure_arguments or opts.merge_duplicate_procedures))
+	count += bool(opts.remove_unused_variables or opts.remove_unused_lists)
+	count += True
+	count += bool(opts.remove_unused_broadcasts)
+	count += bool(opts.rename_identifiers or opts.rename_variable_names or opts.rename_list_names or opts.rename_broadcast_names or opts.rename_argument_names or opts.rename_procedure_names)
+	count += bool(opts.rename_variable_ids or opts.rename_list_ids)
+	count += bool(opts.rename_broadcast_ids)
+	count += bool(opts.rename_argument_ids)
+	count += bool(opts.rename_block_ids)
+	count += bool(opts.compact_numeric_inputs)
+	count += bool(opts.compact_field_ids)
+	count += bool(opts.compact_mutation_hasnext)
+	count += bool(opts.compact_mutation_metadata)
+	count += bool(opts.normalize_numbers)
+	count += bool(not opts.keep_sound_metadata)
+	count += bool(opts.remove_empty_fields)
+	count += bool(opts.remove_empty_inputs)
+	count += bool(opts.remove_costume_metadata)
+	count += bool(opts.remove_default_target_properties)
+	count += bool(opts.remove_empty_target_containers)
+	count += bool(opts.remove_project_meta)
+	count += bool(opts.compact_data_literals)
+	count += bool(opts.strip_reference_names)
+	count += bool(opts.remove_unused_extensions)
+	count += True
+	count += bool(opts.relabel_block_ids)
+	count += bool(opts.optimize_json)
+	count += True
+	count += True
+	return count
+
+
 class AnsiPrint:
 	RESET = "\033[0m"
 	BOLD = "\033[1m"
@@ -1624,6 +1830,40 @@ def _count_block_references(target):
 	return refs
 
 
+def _analyze_block_ids(target):
+	"""Collect reference frequencies and dangling IDs in a single graph scan."""
+	blocks = target.get("blocks", {})
+	ids = set(blocks)
+	refs = Counter({bid: 1 for bid in blocks})
+	dangling = set()
+	for block in blocks.values():
+		if not isinstance(block, dict):
+			continue
+		for key in ("next", "parent"):
+			v = block.get(key)
+			if not isinstance(v, str):
+				continue
+			if v in ids:
+				refs[v] += 1
+			else:
+				dangling.add(v)
+		for value in (block.get("inputs") or {}).values():
+			for ref in _iter_input_block_refs(value):
+				if ref in ids:
+					refs[ref] += 1
+				else:
+					dangling.add(ref)
+	for comment in (target.get("comments") or {}).values():
+		if isinstance(comment, dict):
+			cbid = comment.get("blockId")
+			if isinstance(cbid, str):
+				if cbid in ids:
+					refs[cbid] += 1
+				else:
+					dangling.add(cbid)
+	return refs, dangling
+
+
 def rename_block_ids(project, stats, frequency_order=False):
 	total_stats = 0
 	all_maps = {}
@@ -1636,10 +1876,10 @@ def rename_block_ids(project, stats, frequency_order=False):
 			continue
 
 		if frequency_order:
-			refs = _count_block_references(target)
+			refs, dangling = _analyze_block_ids(target)
 			old_ids = sorted(old_ids, key=lambda x: (-refs[x], x))
-
-		dangling = _dangling_block_ids(target)
+		else:
+			_, dangling = _analyze_block_ids(target)
 		block_ids = _rename_id_map(old_ids, existing_ids=dangling)
 		all_maps[ti] = block_ids
 
@@ -1668,27 +1908,6 @@ def rename_block_ids(project, stats, frequency_order=False):
 	stats["block_ids"] += total_stats
 	stats["dangling_refs_skipped"] += dangling_skipped
 	return all_maps
-
-
-def _dangling_block_ids(target):
-	blocks = target.get("blocks", {})
-	ids = set(blocks)
-	dangling = set()
-	for block in blocks.values():
-		if not isinstance(block, dict):
-			continue
-		for key in ("next", "parent"):
-			v = block.get(key)
-			if isinstance(v, str) and v not in ids:
-				dangling.add(v)
-		for value in (block.get("inputs") or {}).values():
-			_collect_dangling_in_input(value, ids, dangling)
-	for comment in (target.get("comments") or {}).values():
-		if isinstance(comment, dict):
-			bid = comment.get("blockId")
-			if isinstance(bid, str) and bid not in ids:
-				dangling.add(bid)
-	return dangling
 
 
 def _collect_dangling_in_input(value, ids, dangling):
@@ -1732,6 +1951,7 @@ def minify_blocks(project):
 				elif w == "false":
 					mut["warp"] = False
 					stats["warp"] += 1
+
 	return stats
 
 
@@ -1819,10 +2039,22 @@ def _is_boolean_slot(block, input_name):
 	return input_name in _boolean_input_names(block)
 
 
+def _scratch_numeric_tag(value):
+	if isinstance(value, JsonNumber):
+		try:
+			return int(value)
+		except (TypeError, ValueError, OverflowError):
+			return None
+	if type(value) is int:
+		return value
+	return None
+
+
 def _is_bare_literal_input(value):
 	if not (isinstance(value, list) and len(value) > 1):
 		return False
-	if value[0] in (1, 3):
+	tag = _scratch_numeric_tag(value[0])
+	if tag in (1, 3):
 		return isinstance(value[1], list)
 	return False
 
@@ -2455,17 +2687,27 @@ def _collect_data_ids(project):
 
 
 def _rename_id_map(ids, existing_ids=(), prefix=""):
-	reserved = set(existing_ids)
+	used = set(existing_ids)
 	result = {}
 	n = 0
 	for old in ids:
 		new = f"{prefix}{_short_id(n)}"
-		while new in reserved or new in result.values():
+		while new in used:
 			n += 1
 			new = f"{prefix}{_short_id(n)}"
 		result[old] = new
+		used.add(new)
 		n += 1
 	return result
+
+
+def _frequency_optimal_id_map(ids, frequencies=None, existing_ids=(), prefix=""):
+	ids = list(ids)
+	if not ids:
+		return {}
+	frequencies = frequencies or {}
+	ordered = sorted(ids, key=lambda value: (-frequencies.get(value, 0), value))
+	return _rename_id_map(ordered, existing_ids=existing_ids, prefix=prefix)
 
 
 def _replace_field_id(block, field_names, mapping):
@@ -2932,6 +3174,17 @@ def rename_identifiers(
 	variable_new_names = {}
 	list_new_names = {}
 
+	var_refs, list_refs, broadcast_refs = _collect_data_references(project)
+	variable_frequencies = Counter()
+	list_frequencies = Counter()
+	broadcast_frequencies = Counter()
+	for key, refs in var_refs.items():
+		variable_frequencies[key] += 1 + len(refs)
+	for key, refs in list_refs.items():
+		list_frequencies[key] += 1 + len(refs)
+	for key, refs in broadcast_refs.items():
+		broadcast_frequencies[key] += len(refs)
+
 	stage_variable_names = set()
 	stage_list_names = set()
 
@@ -2975,12 +3228,16 @@ def rename_identifiers(
 		}
 
 		stage_var_map = (
-			_rename_id_map(sorted(valid_variables), reserved_variables)
+			_frequency_optimal_id_map(
+				valid_variables, variable_frequencies, reserved_variables
+			)
 			if rename_variable_names
 			else {}
 		)
 		stage_list_map = (
-			_rename_id_map(sorted(valid_lists), reserved_lists)
+			_frequency_optimal_id_map(
+				valid_lists, list_frequencies, reserved_lists
+			)
 			if rename_list_names
 			else {}
 		)
@@ -3057,12 +3314,16 @@ def rename_identifiers(
 		)
 
 		var_map = (
-			_rename_id_map(sorted(valid_variables), reserved_variables)
+			_frequency_optimal_id_map(
+				valid_variables, variable_frequencies, reserved_variables
+			)
 			if rename_variable_names
 			else {}
 		)
 		list_map = (
-			_rename_id_map(sorted(valid_lists), reserved_lists)
+			_frequency_optimal_id_map(
+				valid_lists, list_frequencies, reserved_lists
+			)
 			if rename_list_names
 			else {}
 		)
@@ -3122,9 +3383,11 @@ def rename_identifiers(
 				changed += 1
 
 	stage_broadcast_names = {}
+	broadcast_definition_frequencies = Counter()
 	conflicting_broadcast_ids = set()
 	for target in targets:
 		for bid, name in (target.get("broadcasts") or {}).items():
+			broadcast_definition_frequencies[bid] += 1
 			if not isinstance(bid, str) or not isinstance(name, str):
 				continue
 			previous = stage_broadcast_names.get(bid)
@@ -3142,7 +3405,11 @@ def rename_identifiers(
 		for bid, name in stage_broadcast_names.items()
 		if bid in conflicting_broadcast_ids
 	}
-	broadcast_new_names = _rename_id_map(valid_broadcast_ids, reserved_broadcast_names)
+	for bid, count in broadcast_definition_frequencies.items():
+		broadcast_frequencies[bid] += count
+	broadcast_new_names = _frequency_optimal_id_map(
+		valid_broadcast_ids, broadcast_frequencies, reserved_broadcast_names
+	)
 	for bid, new_name in broadcast_new_names.items():
 		old_name = stage_broadcast_names[bid]
 		if old_name != new_name:
@@ -3153,7 +3420,7 @@ def rename_identifiers(
 	if rename_procedure_names:
 		for ti, target in enumerate(targets):
 			blocks = target.get("blocks") or {}
-			old_proccodes = set()
+			procedure_frequencies = Counter()
 			for block in blocks.values():
 				if not isinstance(block, dict) or block.get("opcode") not in (
 					"procedures_prototype",
@@ -3163,9 +3430,11 @@ def rename_identifiers(
 				mutation = block.get("mutation")
 				proccode = mutation.get("proccode") if isinstance(mutation, dict) else None
 				if isinstance(proccode, str) and proccode:
-					old_proccodes.add(proccode)
+					procedure_frequencies[proccode] += 1
 
-			# procedure names use a smaller alphabet so generated names cannot accidentally introduce Scratch block/icon syntax
+			old_proccodes = list(procedure_frequencies)
+			# Procedure names use a smaller alphabet so generated names cannot
+			# accidentally introduce Scratch block/icon syntax.
 			procedure_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 			def short_procedure_name(index):
 				base = len(procedure_alphabet)
@@ -3177,7 +3446,9 @@ def rename_identifiers(
 					if n == 0:
 						return name
 
-			for index, old_proccode in enumerate(sorted(old_proccodes)):
+			for index, old_proccode in enumerate(
+				sorted(old_proccodes, key=lambda p: (-procedure_frequencies[p], p))
+			):
 				new_name = short_procedure_name(index)
 				percent = old_proccode.find("%")
 				if percent >= 0:
@@ -3211,7 +3482,7 @@ def rename_identifiers(
 	argument_new_names = {}
 	for ti, target in enumerate(targets):
 		blocks = target.get("blocks") or {}
-		old_argument_names = set()
+		argument_frequencies = Counter()
 		for block in blocks.values() if rename_argument_names else ():
 			if not isinstance(block, dict):
 				continue
@@ -3226,12 +3497,15 @@ def rename_identifiers(
 				if isinstance(decoded, list) and all(
 					isinstance(name, str) for name in decoded
 				):
-					old_argument_names.update(decoded)
+					argument_frequencies.update(decoded)
 			if block.get("opcode", "").startswith("argument_reporter_"):
 				field = (block.get("fields") or {}).get("VALUE")
 				if isinstance(field, list) and field and isinstance(field[0], str):
-					old_argument_names.add(field[0])
-		new_names = _rename_id_map(sorted(old_argument_names))
+					argument_frequencies[field[0]] += 1
+		old_argument_names = list(argument_frequencies)
+		new_names = _frequency_optimal_id_map(
+			old_argument_names, argument_frequencies
+		)
 		argument_new_names[ti] = new_names
 		argument_names.update(
 			{(ti, new): old for old, new in new_names.items() if old != new}
@@ -3819,7 +4093,6 @@ def _is_hat(block):
 
 
 class _ScratchGraphIndex:
-	"""Cached block graph and reverse edges for a single Scratch target."""
 	__slots__ = ("target", "edges", "parents", "incoming")
 
 	def __init__(self, target):
@@ -3854,6 +4127,68 @@ class _ScratchGraphIndex:
 		self.edges = edges
 		self.parents = parents
 		self.incoming = incoming
+		return self
+
+	def refresh_blocks(self, block_ids):
+		blocks = self.target.get("blocks", {})
+		for bid in set(block_ids):
+			old_out = self.edges.get(bid, ())
+			for ref in old_out:
+				owners = self.parents.get(ref)
+				if owners is not None:
+					owners.discard(bid)
+					if not owners:
+						del self.parents[ref]
+				count = self.incoming.get(ref, 0) - 1
+				if count > 0:
+					self.incoming[ref] = count
+				else:
+					del self.incoming[ref]
+
+			block = blocks.get(bid)
+			if not isinstance(block, dict):
+				self.edges.pop(bid, None)
+				continue
+
+			new_out = set()
+			nxt = block.get("next")
+			if isinstance(nxt, str) and nxt in blocks:
+				new_out.add(nxt)
+			for value in (block.get("inputs") or {}).values():
+				for ref in set(_iter_input_block_refs(value)):
+					if ref in blocks:
+						new_out.add(ref)
+			self.edges[bid] = new_out
+			for ref in new_out:
+				self.parents.setdefault(ref, set()).add(bid)
+				self.incoming[ref] += 1
+		return self
+
+	def refresh_after_mutation(self, changed=(), removed=()):
+		removed = set(removed)
+		changed = set(changed) - removed
+
+		for bid in removed:
+			changed.update(self.parents.get(bid, ()))
+		changed.difference_update(removed)
+
+		for bid in removed:
+			for ref in self.edges.get(bid, ()):
+				owners = self.parents.get(ref)
+				if owners is not None:
+					owners.discard(bid)
+					if not owners:
+						del self.parents[ref]
+				count = self.incoming.get(ref, 0) - 1
+				if count > 0:
+					self.incoming[ref] = count
+				else:
+					del self.incoming[ref]
+			self.edges.pop(bid, None)
+			self.parents.pop(bid, None)
+			self.incoming.pop(bid, None)
+
+		self.refresh_blocks(changed)
 		return self
 
 
@@ -4792,7 +5127,10 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			stats["sequence_blocks_removed"] += len(removed)
 			stats["sequence_blocks_added"] += len(generated)
 			stats["sequence_bytes_saved"] += byte_delta
-			graph.rebuild()
+			graph.refresh_after_mutation(
+				changed=set(owner_previews) | set(generated),
+				removed=removed,
+			)
 
 
 
@@ -4908,6 +5246,8 @@ def _procedure_body_argument_uses(info, blocks):
 	used = set()
 	reporter_ids = {}
 	for bid in info["closure"]:
+		if bid == info["prototype_id"]:
+			continue
 		block = blocks.get(bid)
 		if not isinstance(block, dict):
 			continue
@@ -4925,7 +5265,6 @@ def _procedure_body_argument_uses(info, blocks):
 
 
 def _procedure_input_is_discardable(value, blocks, graph):
-	"""Return True when evaluating an argument cannot have a protected effect."""
 	roots = _input_block_ids(value, blocks)
 	if not roots:
 		return True
@@ -4942,7 +5281,7 @@ def _procedure_input_is_discardable(value, blocks, graph):
 		op = block.get("opcode")
 		if op in _PROCEDURE_EFFECTFUL_ARGUMENT_OPCODES:
 			return False
-		# Unknown command-ish blocks are conservatively treated as effectful.
+		
 		if isinstance(op, str):
 			if op.startswith(("event_", "control_")):
 				return False
@@ -4967,7 +5306,6 @@ def _procedure_input_is_discardable(value, blocks, graph):
 
 
 def _replace_argument_reporter_refs(value, reporter_ids, replacement):
-	"""Replace argument-reporter references with a complete Scratch input literal."""
 	if not isinstance(value, list) or not value:
 		return value, False
 
@@ -5042,15 +5380,776 @@ def _procedure_update_mutation(mut, arg_ids, arg_names, removed_indices, new_pro
 	return out
 
 
-def optimize_procedure_arguments(project, stats, opts):
-	"""
-	Remove formal arguments which are never read, and fold non-boolean
-	arguments whose every call supplies the same literal.
+def _procedure_warp_enabled(value):
+	return value is True or (isinstance(value, str) and value.lower() == "true")
 
-	An unused argument is removed only when discarding its actual call input is
-	known to be effect-free. A constant argument is folded only from literal
-	call inputs, so it cannot discard random/procedure-call evaluation.
+
+def _procedure_recursive_set(by_proc):
+	call_graph = {proc: set() for proc in by_proc}
+	for proc, infos in by_proc.items():
+		for info in infos:
+			blocks = info.get("blocks", {})
+			for bid in info["closure"]:
+				block = blocks.get(bid)
+				if not isinstance(block, dict) or block.get("opcode") != "procedures_call":
+					continue
+				called = _procedure_key(block)
+				if called in by_proc:
+					call_graph[proc].add(called)
+
+	recursive = set()
+	for start in call_graph:
+		stack = list(call_graph[start])
+		seen = set()
+		while stack:
+			current = stack.pop()
+			if current == start:
+				recursive.add(start)
+				break
+			if current in seen:
+				continue
+			seen.add(current)
+			stack.extend(call_graph.get(current, ()))
+	return recursive
+
+
+def _inline_argument_reporter_refs(value, reporter_ids, replacement):
+	if not isinstance(value, list) or not value:
+		return value, False
+	tag = value[0]
+	if tag in (1, 2, 3):
+		positions = (1, 2) if tag == 3 else (1,)
+		for index in positions:
+			if index >= len(value):
+				continue
+			item = value[index]
+			if isinstance(item, str) and item in reporter_ids:
+				return copy.deepcopy(replacement), True
+			if isinstance(item, (list, dict)):
+				new_item, changed = _inline_argument_reporter_refs(item, reporter_ids, replacement)
+				if changed:
+					value[index] = new_item
+					if index == 1 and _is_bare_literal_input(new_item):
+						return new_item, True
+					return value, True
+		return value, False
+	for index in range(1, len(value)):
+		item = value[index]
+		if isinstance(item, (list, dict)):
+			new_item, changed = _inline_argument_reporter_refs(item, reporter_ids, replacement)
+			if changed:
+				value[index] = new_item
+				return value, True
+	return value, False
+
+
+def _specialized_proccode(proccode, serial):
+	if not isinstance(proccode, str):
+		return None
+	percent = proccode.find("%")
+	if percent >= 0:
+		prefix = proccode[:percent]
+		suffix_start = percent
+		while suffix_start > 0 and proccode[suffix_start - 1].isspace():
+			suffix_start -= 1
+		return f"{prefix} !s{serial}{proccode[suffix_start:]}"
+	return f"{proccode} !s{serial}"
+
+
+def _clone_procedure_closure(target, info, specialized_proccode, constant_replacements, stats, opts):
+	blocks = target.get("blocks") or {}
+	closure = set(info["closure"])
+	if not closure:
+		return None
+	graph = _ScratchGraphIndex(target)
+
+	comments = target.get("comments") or {}
+	if any(
+		isinstance(comment, dict) and comment.get("blockId") in closure
+		for comment in comments.values()
+	):
+		return None
+
+	for old_id in closure:
+		block = blocks.get(old_id)
+		if not isinstance(block, dict):
+			return None
+		nxt = block.get("next")
+		if isinstance(nxt, str) and nxt not in closure:
+			return None
+		parent = block.get("parent")
+		if isinstance(parent, str) and parent not in closure:
+			return None
+		for raw in (block.get("inputs") or {}).values():
+			if any(ref not in closure for ref in _iter_input_block_refs(raw)):
+				return None
+
+	old_ids = list(closure)
+	new_ids = {}
+	for old_id in old_ids:
+		new_id = _create_scratch_id()
+		while new_id in blocks or new_id in new_ids.values():
+			new_id = _create_scratch_id()
+		new_ids[old_id] = new_id
+
+	clones = {}
+	for old_id in old_ids:
+		old = blocks.get(old_id)
+		new = copy.deepcopy(old)
+		if isinstance(new.get("next"), str):
+			new["next"] = new_ids.get(new["next"], new["next"])
+		if isinstance(new.get("parent"), str):
+			new["parent"] = new_ids.get(new["parent"], new["parent"])
+		if isinstance(new.get("inputs"), dict):
+			for raw in new["inputs"].values():
+				_replace_input_block_ids(raw, new_ids)
+		if old_id == info["definition_id"]:
+			new["parent"] = None
+		clones[new_ids[old_id]] = new
+
+	new_prototype_id = new_ids[info["prototype_id"]]
+	new_definition_id = new_ids[info["definition_id"]]
+	new_root = clones[new_definition_id].get("next")
+	if not isinstance(new_root, str) or new_root not in clones:
+		return None
+
+	prototype = clones[new_prototype_id]
+	prototype_mutation = prototype.get("mutation")
+	if not isinstance(prototype_mutation, dict):
+		return None
+	prototype_mutation["proccode"] = specialized_proccode
+
+	body_info = dict(info)
+	prototype_owned = {info["prototype_id"]}
+	stack = [info["prototype_id"]]
+	while stack:
+		current = stack.pop()
+		for ref in graph.edges.get(current, ()):
+			if ref in closure and ref not in prototype_owned:
+				prototype_owned.add(ref)
+				stack.append(ref)
+	body_info["closure"] = closure - prototype_owned - {info["definition_id"]}
+	used, reporter_map, _ = _procedure_body_argument_uses(body_info, blocks)
+	if used is None:
+		return None
+
+	removed_reporters = set()
+	for arg_index, replacement in constant_replacements.items():
+		reporter_ids = set(reporter_map.get(arg_index, ()))
+		if not reporter_ids:
+			continue
+		cloned_reporters = {new_ids[rid] for rid in reporter_ids if rid in new_ids}
+		if not cloned_reporters:
+			continue
+		for block_id in list(clones):
+			if block_id in cloned_reporters:
+				continue
+			block = clones.get(block_id)
+			if not isinstance(block, dict):
+				continue
+			for name, raw in list((block.get("inputs") or {}).items()):
+				new_raw = copy.deepcopy(raw)
+				new_raw, changed = _inline_argument_reporter_refs(
+					new_raw, cloned_reporters, replacement
+				)
+				if changed:
+					block.setdefault("inputs", {})[name] = new_raw
+		still_referenced = False
+		for block_id, block in clones.items():
+			if not isinstance(block, dict):
+				continue
+			if any(
+				rid in cloned_reporters
+				for raw in (block.get("inputs") or {}).values()
+				for rid in _iter_input_block_refs(raw)
+			):
+				still_referenced = True
+				break
+		if still_referenced:
+			return None
+		for reporter_id in cloned_reporters:
+			clones.pop(reporter_id, None)
+		removed_reporters.update(cloned_reporters)
+
+	for block in clones.values():
+		if not isinstance(block, dict):
+			continue
+		for key in ("next", "parent"):
+			ref = block.get(key)
+			if isinstance(ref, str) and ref not in clones and ref not in (None,):
+				return None
+		for raw in (block.get("inputs") or {}).values():
+			refs = set(_iter_input_block_refs(raw))
+			if any(ref not in clones for ref in refs):
+				return None
+
+	return clones, new_ids, new_definition_id, new_prototype_id, len(removed_reporters)
+
+
+def specialize_procedures(project, stats, opts):
+	"""Specialize a procedure only when the specialized closure replaces the generic one profitably.
+
+	Unlike safe single-use inlining, specialization does not require a warp
+	caller/callee because the call boundary remains intact. To make this a
+	minification optimization rather than code duplication, the default mode
+	only specializes a literal signature shared by every live call. The generic
+	procedure is then replaced by the specialized closure, and an exact
+	serialized-size check must prove a strict win before anything is committed.
 	"""
+	targets = project.get("targets", [])
+	opts.specialized_procedure_new_blocks = [set() for _ in targets]
+	opts.specialized_procedure_removed_blocks = [set() for _ in targets]
+	opts.specialized_procedure_call_proccodes = {}
+	opts.specialized_procedure_block_origins = {}
+
+	max_passes = max(1, int(getattr(opts, "procedure_specialization_passes", 4)))
+	min_calls = max(2, int(getattr(opts, "procedure_specialization_min_calls", 2)))
+	total_variants = 0
+	total_calls = 0
+	completed_passes = 0
+	serial = 0
+
+	for _pass in range(max_passes):
+		changed_this_pass = False
+		for ti, target in enumerate(targets):
+			blocks = target.get("blocks") or {}
+			if not blocks:
+				continue
+			by_proc, graph = _procedure_infos(target)
+			if not by_proc:
+				continue
+			for infos in by_proc.values():
+				for info in infos:
+					info["blocks"] = blocks
+			recursive = _procedure_recursive_set(by_proc)
+
+			calls_by_proc = {}
+			for call_id, block in blocks.items():
+				if not isinstance(block, dict) or block.get("opcode") != "procedures_call":
+					continue
+				proc = _procedure_key(block)
+				if proc is not None:
+					calls_by_proc.setdefault(proc, []).append((call_id, block))
+
+			for proc, infos in list(by_proc.items()):
+				if proc in recursive or len(infos) != 1:
+					continue
+				calls = calls_by_proc.get(proc, ())
+				if len(calls) < min_calls:
+					continue
+				info = infos[0]
+
+				prototype_owned = {info["prototype_id"]}
+				stack = [info["prototype_id"]]
+				while stack:
+					current = stack.pop()
+					for ref in graph.edges.get(current, ()):
+						if ref in info["closure"] and ref not in prototype_owned:
+							prototype_owned.add(ref)
+							stack.append(ref)
+				body_info = dict(info)
+				body_info["closure"] = set(info["closure"]) - prototype_owned - {info["definition_id"]}
+				used, reporter_map, _arg_names = _procedure_body_argument_uses(body_info, blocks)
+				if used is None or not used:
+					continue
+
+				groups = {}
+				for call_id, call in calls:
+					call_ids = _parse_argumentids(call.get("mutation"))
+					if call_ids is None or len(call_ids) != len(info["argument_ids"]):
+						continue
+					signature_items = []
+					replacement_constants = {}
+					for idx in sorted(used):
+						if idx >= len(call_ids):
+							signature_items = []
+							break
+						raw = (call.get("inputs") or {}).get(call_ids[idx])
+						literal = _procedure_input_literal(raw)
+						if literal is None:
+							continue
+						signature_items.append((idx, literal[0], literal[1]))
+						replacement, _ = _constant_to_scratch_input(literal, blocks, None)
+						if replacement is not None:
+							replacement_constants[idx] = replacement
+					if not signature_items:
+						continue
+					signature = tuple(signature_items)
+					groups.setdefault(signature, []).append((call_id, call, replacement_constants))
+
+				qualifying = [
+					(signature, members)
+					for signature, members in groups.items()
+					if len(members) >= min_calls and len(members) == len(calls)
+				]
+				if not qualifying:
+					continue
+
+				body_size = len(body_info["closure"])
+				if body_size > 192:
+					continue
+				existing_variant_count = 0
+				for signature, members in qualifying[:8]:
+					if existing_variant_count >= 8:
+						break
+					representative_constants = members[0][2]
+					if not representative_constants:
+						continue
+					serial += 1
+					specialized_proc = _specialized_proccode(proc, serial)
+					if not specialized_proc or specialized_proc in by_proc:
+						continue
+					cloned = _clone_procedure_closure(
+						target,
+						info,
+						specialized_proc,
+						representative_constants,
+						stats,
+						opts,
+					)
+					if cloned is None:
+						continue
+					clones, id_map, new_definition_id, new_prototype_id, removed_reporter_count = cloned
+
+					def estimated_variant_block(block_id, block):
+						if not isinstance(block, dict):
+							return block
+						if not getattr(opts, "rename_procedure_names", False):
+							return block
+						if block_id != new_prototype_id:
+							return block
+						probe = copy.deepcopy(block)
+						mutation = probe.get("mutation")
+						if isinstance(mutation, dict) and mutation.get("proccode") == specialized_proc:
+							mutation["proccode"] = "a"
+						return probe
+
+					clone_cost = sum(
+						len(_quote(bid).encode("utf-8", "backslashreplace")) + 1
+						+ len(dumps_compact(estimated_variant_block(bid, block)).encode("utf-8", "backslashreplace"))
+						for bid, block in clones.items()
+					)
+					original_cost = sum(
+						len(_quote(bid).encode("utf-8", "backslashreplace")) + 1
+						+ len(dumps_compact(block).encode("utf-8", "backslashreplace"))
+						for bid, block in blocks.items()
+						if bid in info["closure"]
+					)
+					call_delta = 0
+					for call_id, call, _ in members:
+						before_call = len(dumps_compact(call).encode("utf-8", "backslashreplace"))
+						probe_call = copy.deepcopy(call)
+						probe_mutation = probe_call.get("mutation")
+						if isinstance(probe_mutation, dict):
+							probe_mutation["proccode"] = "a" if getattr(opts, "rename_procedure_names", False) else specialized_proc
+						after_call = len(dumps_compact(probe_call).encode("utf-8", "backslashreplace"))
+						call_delta += after_call - before_call
+
+					estimated_delta = clone_cost + call_delta - original_cost
+					if estimated_delta >= 0:
+						continue
+
+					blocks.update(clones)
+					for old_id in info["closure"]:
+						blocks.pop(old_id, None)
+					opts.specialized_procedure_removed_blocks[ti].update(info["closure"])
+					stats["procedure_specialization_blocks_added"] += len(clones)
+					stats["procedure_specialization_blocks_removed"] += len(info["closure"])
+					stats["procedure_specialization_argument_reporters_removed"] += removed_reporter_count
+
+					for old_id, new_id in id_map.items():
+						opts.specialized_procedure_block_origins[(ti, new_id)] = old_id
+					opts.specialized_procedure_new_blocks[ti].update(clones)
+					for call_id, call, _ in members:
+						mutation = call.get("mutation")
+						if not isinstance(mutation, dict):
+							continue
+						mutation["proccode"] = specialized_proc
+						opts.specialized_procedure_call_proccodes[(ti, call_id)] = specialized_proc
+					total_variants += 1
+					total_calls += len(members)
+					existing_variant_count += 1
+					changed_this_pass = True
+
+		if not changed_this_pass:
+			break
+		completed_passes += 1
+
+	stats["procedure_specialized"] += total_variants
+	stats["procedure_specialization_variants"] += total_variants
+	stats["procedure_specialization_calls"] += total_calls
+	stats["procedure_specialization_passes"] += completed_passes
+	return total_variants
+
+
+def inline_single_use_procedures(project, stats, opts):
+	targets = project.get("targets", [])
+	opts.inlined_procedure_removed_blocks = [set() for _ in targets]
+	opts.inlined_procedure_link_edits = {}
+	opts.inlined_procedure_input_edits = {}
+
+	max_passes = max(1, int(getattr(opts, "procedure_inline_passes", 8)))
+	total = 0
+	total_removed = 0
+	total_reporters = 0
+	completed_passes = 0
+
+	for _pass in range(max_passes):
+		changed_this_pass = False
+
+		for ti, target in enumerate(targets):
+			blocks = target.get("blocks") or {}
+			if not blocks:
+				continue
+			by_proc, graph = _procedure_infos(target)
+			if not by_proc:
+				continue
+			for infos in by_proc.values():
+				for info in infos:
+					info["blocks"] = blocks
+
+			recursive = _procedure_recursive_set(by_proc)
+			warp_owners = {}
+			for proc, infos in by_proc.items():
+				if len(infos) != 1:
+					continue
+				info = infos[0]
+				if not _procedure_warp_enabled(info["mutation"].get("warp")):
+					continue
+				for owned_id in info["closure"]:
+					warp_owners.setdefault(owned_id, set()).add(proc)
+
+			calls_by_proc = {}
+			for call_id, block in blocks.items():
+				if not isinstance(block, dict) or block.get("opcode") != "procedures_call":
+					continue
+				proc = _procedure_key(block)
+				if proc is not None:
+					calls_by_proc.setdefault(proc, []).append((call_id, block))
+
+			for proc, infos in list(by_proc.items()):
+				if len(infos) != 1 or len(calls_by_proc.get(proc, ())) != 1:
+					continue
+				if proc in recursive:
+					continue
+				info = infos[0]
+				if not _procedure_warp_enabled(info["mutation"].get("warp")):
+					continue
+
+				call_id, call = calls_by_proc[proc][0]
+				if len(warp_owners.get(call_id, set())) != 1:
+					continue
+
+				definition_id = info["definition_id"]
+				prototype_id = info["prototype_id"]
+				closure = set(info["closure"])
+				definition = blocks.get(definition_id)
+				prototype = blocks.get(prototype_id)
+				if not isinstance(definition, dict) or not isinstance(prototype, dict):
+					continue
+
+				body_root = definition.get("next")
+				if not isinstance(body_root, str) or body_root not in blocks or body_root not in closure:
+					continue
+
+				body_sequence = []
+				seen_body = set()
+				current = body_root
+				valid_body_chain = False
+				while isinstance(current, str):
+					if current in seen_body or current not in closure:
+						break
+					block = blocks.get(current)
+					if not isinstance(block, dict):
+						break
+					body_sequence.append(current)
+					seen_body.add(current)
+					nxt = block.get("next")
+					if nxt is None:
+						valid_body_chain = True
+						break
+					if not isinstance(nxt, str):
+						break
+					current = nxt
+				if not valid_body_chain:
+					continue
+				tail_id = body_sequence[-1]
+
+				parent_id = call.get("parent")
+				if not isinstance(parent_id, str) or parent_id not in blocks:
+					continue
+				if graph.parents.get(call_id, set()) != {parent_id}:
+					continue
+				call_next = call.get("next")
+				if call_next is not None and (not isinstance(call_next, str) or call_next not in blocks):
+					continue
+
+				parent_block = blocks.get(parent_id)
+				if not isinstance(parent_block, dict):
+					continue
+				parent_mode = None
+				parent_input_name = None
+				parent_input_replacement = None
+				if parent_block.get("next") == call_id:
+					parent_mode = "next"
+				else:
+					for input_name, raw in (parent_block.get("inputs") or {}).items():
+						replaced = _sequence_replace_direct_ref(raw, call_id, body_root)
+						if replaced is not None:
+							parent_mode = "input"
+							parent_input_name = input_name
+							parent_input_replacement = replaced
+							break
+				if parent_mode is None:
+					continue
+
+				prototype_owned = {prototype_id}
+				prototype_stack = [prototype_id]
+				while prototype_stack:
+					owned_id = prototype_stack.pop()
+					for ref in graph.edges.get(owned_id, ()):
+						if ref in closure and ref not in prototype_owned:
+							prototype_owned.add(ref)
+							prototype_stack.append(ref)
+				body_info = dict(info)
+				body_info["closure"] = closure - prototype_owned - {definition_id}
+				used, reporter_map, _arg_names = _procedure_body_argument_uses(body_info, blocks)
+				if used is None:
+					continue
+				formal_ids = list(info["argument_ids"])
+				call_ids = _parse_argumentids(call.get("mutation"))
+				if call_ids is None or len(call_ids) != len(formal_ids):
+					continue
+
+				replacements = {}
+				can_inline = True
+				for idx, formal_id in enumerate(formal_ids):
+					raw = (call.get("inputs") or {}).get(call_ids[idx])
+					if raw is None:
+						can_inline = False
+						break
+					if idx in used:
+						literal = _procedure_input_literal(raw)
+						if literal is None:
+							can_inline = False
+							break
+						replacement, _ = _constant_to_scratch_input(literal, blocks, None)
+						if replacement is None:
+							can_inline = False
+							break
+						replacements[formal_id] = (set(reporter_map.get(idx, ())), replacement)
+					elif not _procedure_input_is_discardable(raw, blocks, graph):
+						can_inline = False
+						break
+				if not can_inline:
+					continue
+
+				all_reporters = set().union(*(set(v) for v in reporter_map.values())) if reporter_map else set()
+				removed = {call_id, definition_id} | prototype_owned | all_reporters
+				comments = target.get("comments") or {}
+				if any(
+					isinstance(comment, dict) and comment.get("blockId") in removed
+					for comment in comments.values()
+				):
+					continue
+
+				planned_inputs = {}
+				for survivor_id in closure - removed:
+					block = blocks.get(survivor_id)
+					if not isinstance(block, dict):
+						continue
+					for input_name, raw in (block.get("inputs") or {}).items():
+						new_raw = copy.deepcopy(raw)
+						changed_input = False
+						for reporter_ids, replacement in replacements.values():
+							if not reporter_ids:
+								continue
+							new_raw, replaced = _inline_argument_reporter_refs(
+								new_raw, reporter_ids, replacement
+							)
+							changed_input |= replaced
+						if changed_input:
+							planned_inputs[(survivor_id, input_name)] = new_raw
+
+				for survivor_id in closure - removed:
+					block = blocks.get(survivor_id)
+					if not isinstance(block, dict):
+						continue
+					for key in ("next", "parent"):
+						ref = block.get(key)
+						if ref in removed:
+							if survivor_id == body_root and key == "parent" and ref == definition_id:
+								continue
+							can_inline = False
+							break
+					if not can_inline:
+						break
+					for input_name, raw in (block.get("inputs") or {}).items():
+						check_value = planned_inputs.get((survivor_id, input_name), raw)
+						if any(ref in removed for ref in _iter_input_block_refs(check_value)):
+							can_inline = False
+							break
+					if not can_inline:
+						break
+				if not can_inline:
+					continue
+
+				root_block = blocks.get(body_root)
+				tail_block = blocks.get(tail_id)
+				next_block = blocks.get(call_next) if call_next is not None else None
+				if (
+					not isinstance(root_block, dict)
+					or not isinstance(tail_block, dict)
+					or (call_next is not None and not isinstance(next_block, dict))
+				):
+					continue
+
+				for (survivor_id, input_name), new_raw in planned_inputs.items():
+					blocks[survivor_id].setdefault("inputs", {})[input_name] = new_raw
+					opts.inlined_procedure_input_edits[(ti, survivor_id, input_name)] = copy.deepcopy(new_raw)
+
+				root_block["parent"] = parent_id
+				opts.inlined_procedure_link_edits[(ti, body_root, "parent")] = parent_id
+				tail_block["next"] = call_next
+				opts.inlined_procedure_link_edits[(ti, tail_id, "next")] = call_next
+				if call_next is not None:
+					next_block["parent"] = tail_id
+					opts.inlined_procedure_link_edits[(ti, call_next, "parent")] = tail_id
+
+				if parent_mode == "next":
+					parent_block["next"] = body_root
+					opts.inlined_procedure_link_edits[(ti, parent_id, "next")] = body_root
+				else:
+					parent_block["inputs"][parent_input_name] = parent_input_replacement
+					opts.inlined_procedure_input_edits[(ti, parent_id, parent_input_name)] = copy.deepcopy(parent_input_replacement)
+
+				for remove_id in removed:
+					blocks.pop(remove_id, None)
+				opts.inlined_procedure_removed_blocks[ti].update(removed)
+
+				total += 1
+				total_removed += len(removed)
+				total_reporters += len(all_reporters)
+				changed_this_pass = True
+
+		if not changed_this_pass:
+			break
+		completed_passes += 1
+
+	stats["procedure_inlined"] += total
+	stats["procedure_inline_blocks_removed"] += total_removed
+	stats["procedure_inline_argument_reporters_removed"] += total_reporters
+	stats["procedure_inline_passes"] += completed_passes
+	return total
+
+
+def _clear_procedure_definition_shadow(target, proto_id):
+	blocks = target.get("blocks") or {}
+	proto = blocks.get(proto_id)
+	if not isinstance(proto, dict):
+		return False
+	parent = blocks.get(proto.get("parent"))
+	if not isinstance(parent, dict):
+		return False
+	inputs = parent.get("inputs") or {}
+	custom = inputs.get("custom_block")
+	if not isinstance(custom, list) or not custom or _scratch_numeric_tag(custom[0]) != 3:
+		return False
+	if len(custom) < 2 or custom[1] != proto_id:
+		return False
+	# [3, proto, shadow] -> [2, proto]
+	custom[:] = [2, proto_id]
+	return True
+
+
+def clear_procedure_definition_shadows(project, stats, opts):
+	total = 0
+	for target in project.get("targets", []):
+		blocks = target.get("blocks") or {}
+		for proto_id, proto in list(blocks.items()):
+			if not isinstance(proto, dict) or proto.get("opcode") != "procedures_prototype":
+				continue
+			if _clear_procedure_definition_shadow(target, proto_id):
+				total += 1
+	stats["procedure_definition_shadows_cleared"] += total
+	return total
+
+
+def compact_procedure_prototypes(project, stats, opts):
+	"""
+	Canonicalize procedures_prototype blocks to the representation produced by
+	Scratch VM's deserializeBlocks().
+
+	The VM treats a procedures_prototype as a non-shadow block, clears the
+	custom_block shadow on its parent procedures_definition, discards the
+	argument-reporter children, and materializes the prototype with no inputs.
+	Doing the same before serialization removes data which the VM immediately
+	reconstructs/normalizes during deserialization.
+	"""
+	targets = project.get("targets", [])
+	opts.procedure_prototype_compaction_removed_blocks = [set() for _ in targets]
+	opts.procedure_prototype_compaction_input_edits = {}
+	opts.procedure_prototype_compaction_shadow_edits = {}
+	total = 0
+	total_reporters = 0
+
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		for proto_id, proto in list(blocks.items()):
+			if not isinstance(proto, dict) or proto.get("opcode") != "procedures_prototype":
+				continue
+
+			parent_id = proto.get("parent")
+			parent = blocks.get(parent_id) if isinstance(parent_id, str) else None
+
+			if proto.get("shadow") is not False:
+				proto["shadow"] = False
+				opts.procedure_prototype_compaction_shadow_edits[(ti, proto_id)] = False
+
+			if isinstance(parent, dict):
+				inputs = parent.get("inputs") or {}
+				custom = inputs.get("custom_block")
+				if isinstance(custom, list) and len(custom) >= 2 and custom[0] == 1 and custom[1] == proto_id:
+					canonical = custom[:2]
+					if custom != canonical:
+						inputs["custom_block"] = canonical
+						parent["inputs"] = inputs
+						opts.procedure_prototype_compaction_input_edits[(ti, parent_id)] = {
+							"custom_block": copy.deepcopy(canonical)
+						}
+
+			removed = set()
+			for child_id, child in list(blocks.items()):
+				if child_id == proto_id or not isinstance(child, dict):
+					continue
+				if child.get("parent") != proto_id:
+					continue
+				if not str(child.get("opcode", "")).startswith("argument_reporter_"):
+					continue
+				removed.add(child_id)
+
+			for child_id in removed:
+				del blocks[child_id]
+			opts.procedure_prototype_compaction_removed_blocks[ti].update(removed)
+			total_reporters += len(removed)
+
+			old_inputs = proto.get("inputs") or {}
+			if old_inputs:
+				proto["inputs"] = {}
+				opts.procedure_prototype_compaction_input_edits[(ti, proto_id)] = {}
+			elif "inputs" not in proto:
+				pass
+			else:
+				proto["inputs"] = {}
+
+			total += 1
+
+	stats["procedure_prototypes_compacted"] += total
+	stats["procedure_prototype_argument_reporters_removed"] += total_reporters
+	return total
+
+
+def optimize_procedure_arguments(project, stats, opts):
 	opts.procedure_argument_mutation_edits = {}
 	opts.procedure_argument_removed_inputs = {}
 	opts.procedure_argument_input_edits = {}
@@ -5077,15 +6176,13 @@ def optimize_procedure_arguments(project, stats, opts):
 		for proc, infos in by_proc.items():
 			if not infos:
 				continue
-			# Multiple definitions sharing a proccode must agree on the formal
-			# signature before any argument can be optimized globally.
 			base_ids = infos[0]["argument_ids"]
 			base_mut = infos[0]["mutation"]
 			kinds = _procedure_argument_kinds(proc, len(base_ids))
 			if kinds is None:
 				continue
 			if any(info["argument_ids"] != base_ids for info in infos):
-				# Different argument IDs are okay, but the positions/count must agree.
+				# different argument IDs are OK, but the positions/count must agree
 				if any(len(info["argument_ids"]) != len(base_ids) for info in infos):
 					continue
 
@@ -5112,7 +6209,6 @@ def optimize_procedure_arguments(project, stats, opts):
 			for idx, kind in enumerate(kinds):
 				used = idx in used_any
 				if not used:
-					# Removing a call argument also removes its evaluation.
 					safe = True
 					for call_id, call in calls:
 						call_ids = _parse_argumentids(call.get("mutation"))
@@ -5127,9 +6223,6 @@ def optimize_procedure_arguments(project, stats, opts):
 						removable.append(idx)
 						continue
 
-				# Constant folding is deliberately restricted to %s/%n-like
-				# arguments; boolean literals are not serialized uniformly enough
-				# for a safe direct insertion into a boolean slot.
 				if used and kind == "%b":
 					continue
 				if not calls:
@@ -5197,8 +6290,6 @@ def optimize_procedure_arguments(project, stats, opts):
 				if not can_constant_fold:
 					break
 			if not can_constant_fold:
-				# Do not fold constants, but an unused argument may still be safe
-				# to remove independently.
 				only_unused = [
 					idx for idx in removable if idx not in constants
 				]
@@ -5243,14 +6334,8 @@ def optimize_procedure_arguments(project, stats, opts):
 				old_inputs = proto.get("inputs") or {}
 				for idx in removed_set:
 					old_inputs.pop(old_ids[idx], None)
-				if not old_inputs:
-					# Keep the dict: Scratch blocks are verifier-reinflated to
-					# the canonical shape later.
-					proto["inputs"] = {}
-				else:
-					proto["inputs"] = old_inputs
-
-				# Replace constant formal reporters inside this procedure body.
+				proto["inputs"] = old_inputs if old_inputs else {}
+				
 				for idx, literal in constants.items():
 					reporters = constant_reporters.get((info["definition_id"], idx), set())
 					if not reporters:
@@ -5279,7 +6364,7 @@ def optimize_procedure_arguments(project, stats, opts):
 						opts.procedure_argument_removed_blocks[ti].add(reporter_id)
 						total_reporters_removed += 1
 
-			# Rewrite every call with the same signature.
+			# rewrite every call with the same signature
 			for call_id, call in calls:
 				call_mut = call.get("mutation")
 				call_ids = _parse_argumentids(call_mut)
@@ -5309,6 +6394,30 @@ def optimize_procedure_arguments(project, stats, opts):
 					old_ids[i] for i in removed_set
 				}
 
+			reference_counts = _count_block_references(target)
+			old_names = json.loads(base_mut.get("argumentnames") or "[]")
+			removed_names = {old_names[i] for i in removed_set if i < len(old_names)}
+			for reporter_id, block in list(blocks.items()):
+				if not isinstance(block, dict) or block.get("opcode", "") not in (
+					"argument_reporter_string_number",
+					"argument_reporter_boolean",
+				):
+					continue
+				field = (block.get("fields") or {}).get("VALUE")
+				name = field[0] if isinstance(field, list) and field and isinstance(field[0], str) else None
+				if name not in removed_names or reference_counts.get(reporter_id, 1) != 1:
+					continue
+
+				if not any(
+					reporter_id in info["closure"]
+					or block.get("parent") == info["prototype_id"]
+					for info, _usage in body_uses
+				):
+					continue
+				blocks.pop(reporter_id, None)
+				opts.procedure_argument_removed_blocks[ti].add(reporter_id)
+				total_reporters_removed += 1
+
 			total_removed += len(removed_set)
 			total_constant += len(constants)
 
@@ -5318,15 +6427,31 @@ def optimize_procedure_arguments(project, stats, opts):
 	return total_removed
 
 
-def _canonicalize_procedure(target, info, graph=None):
-	"""Return a stable body/signature representation for duplicate detection."""
+def _canonicalize_procedure(target, info, graph=None, procedure_aliases=None):
+	"""Return a stable representation for semantic custom-procedure merging.
+
+	Procedure names and argument IDs/names are deliberately ignored. Calls to
+	already-merged procedures are represented by their canonical procedure code,
+	which lets merging propagate through layers of helper procedures over several
+	passes without treating differently-named but equivalent procedures as distinct.
+	"""
 	blocks = target.get("blocks") or {}
 	closure = info["closure"]
 	if graph is None:
 		graph = _ScratchGraphIndex(target)
+	procedure_aliases = procedure_aliases or {}
+	self_proc = info["mutation"].get("proccode")	
+	procedure_arg_ids = list(info.get("argument_ids") or [])
+	procedure_arg_id_map = {old: f"@arg{i}" for i, old in enumerate(procedure_arg_ids)}
+	procedure_arg_names = {}
+	raw_argument_names = info["mutation"].get("argumentnames")
+	try:
+		decoded_argument_names = json.loads(raw_argument_names) if isinstance(raw_argument_names, str) else None
+	except (TypeError, ValueError):
+		decoded_argument_names = None
+	if isinstance(decoded_argument_names, list) and len(decoded_argument_names) == len(procedure_arg_ids):
+		procedure_arg_names = {name: f"@arg{i}" for i, name in enumerate(decoded_argument_names) if isinstance(name, str)}
 
-	# Deterministically discover nodes from the definition root. Inputs are
-	# traversed in key order; next is visited first to preserve stack order.
 	order = []
 	seen = set()
 	stack = [info["definition_id"]]
@@ -5349,9 +6474,18 @@ def _canonicalize_procedure(target, info, graph=None):
 			stack.append(nxt)
 
 	labels = {bid: f"$B{index}" for index, bid in enumerate(order)}
-	arg_positions = {
-		"@arg" + str(i): i for i in range(len(info["argument_ids"]))
-	}
+
+	def canonical_proc_reference(proccode):
+		if not isinstance(proccode, str):
+			return proccode
+		alias = procedure_aliases.get(proccode, proccode)
+		return "@SELF" if alias == self_proc else f"@PROC:{alias}"
+
+	def canonical_proccode_signature(proccode, argument_count):
+		if not isinstance(proccode, str):
+			return None
+		kinds = tuple(re.findall(r"(?<!\S)(%s|%b)(?!\S)", proccode))
+		return kinds if len(kinds) == argument_count else None
 
 	def canonical_input(value, arg_id_map=None):
 		if not isinstance(value, list) or not value:
@@ -5376,26 +6510,38 @@ def _canonicalize_procedure(target, info, graph=None):
 					out[i] = canonical_input(item, arg_id_map)
 		return out
 
-	def canonical_mutation(block):
-		mut = block.get("mutation")
+	def canonical_mutation(block, is_prototype=False):
+		mut = block.get("mutation") if isinstance(block, dict) else None
 		if not isinstance(mut, dict):
 			return None
 		out = {}
+		argids = _parse_argumentids(mut)
+		arg_map = {old: f"@arg{i}" for i, old in enumerate(argids or [])}
 		for key in sorted(mut):
 			value = mut[key]
+			if key == "proccode":
+				if is_prototype:
+					out[key] = canonical_proccode_signature(value, len(argids or []))
+				else:
+					out[key] = canonical_proc_reference(value)
+				continue
 			if key == "argumentids":
-				ids = _parse_argumentids(mut)
-				if ids is not None:
-					out[key] = [
-						f"@arg{i}" for i in range(len(ids))
-					]
+				if argids is not None:
+					out[key] = [f"@arg{i}" for i in range(len(argids))]
+					continue
+			if key == "argumentnames":
+				try:
+					names = json.loads(value) if isinstance(value, str) else None
+				except (TypeError, ValueError):
+					names = None
+				if isinstance(names, list) and len(names) == len(argids or []):
+					out[key] = [f"@arg{i}" for i in range(len(names))]
 					continue
 			out[key] = copy.deepcopy(value)
 		return out
 
 	result = {
-		"proccode": info["mutation"].get("proccode"),
-		"prototype_mutation": canonical_mutation(info["prototype"]),
+		"prototype_mutation": canonical_mutation(info["prototype"], True),
 		"blocks": [],
 	}
 	for bid in order:
@@ -5409,15 +6555,24 @@ def _canonicalize_procedure(target, info, graph=None):
 			if key == "inputs":
 				inputs = {}
 				ids = _parse_argumentids(block.get("mutation"))
-				arg_map = {
-					old: f"@arg{i}" for i, old in enumerate(ids or [])
-				}
+				arg_map = {old: f"@arg{i}" for i, old in enumerate(ids or [])}
 				for name in sorted(block["inputs"]):
 					cname = arg_map.get(name, name)
 					inputs[cname] = canonical_input(block["inputs"][name], arg_map)
 				item[key] = inputs
 			elif key == "mutation":
-				item[key] = canonical_mutation(block)
+				item[key] = canonical_mutation(block, block.get("opcode") == "procedures_prototype")
+			elif key == "fields":
+				fields = {}
+				for name, value in block.get("fields", {}).items():
+					field = copy.deepcopy(value)
+					if block.get("opcode", "").startswith("argument_reporter_") and name == "VALUE" and isinstance(field, list):
+						if field and isinstance(field[0], str):
+							field[0] = procedure_arg_names.get(field[0], field[0])
+						if len(field) > 1 and isinstance(field[1], str):
+							field[1] = procedure_arg_id_map.get(field[1], field[1])
+					fields[name] = field
+				item[key] = fields
 			else:
 				item[key] = copy.deepcopy(block[key])
 		item["next"] = labels.get(block.get("next"))
@@ -5426,60 +6581,131 @@ def _canonicalize_procedure(target, info, graph=None):
 	return json.dumps(result, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
 
+def _procedure_merge_safe(target, info, graph, commented):
+	closure = set(info["closure"])
+	if closure & commented:
+		return False
+	return not any(
+		any(parent not in closure for parent in graph.parents.get(bid, set()))
+		for bid in closure
+	)
+
+
+def _rewrite_procedure_call_to_canonical(call, canonical_proc, canonical_ids):
+	mut = call.get("mutation")
+	old_ids = _parse_argumentids(mut)
+	if not isinstance(mut, dict) or old_ids is None or len(old_ids) != len(canonical_ids):
+		return False
+	inputs = call.get("inputs") or {}
+	new_inputs = {}
+	for index, old_id in enumerate(old_ids):
+		if old_id in inputs:
+			new_inputs[canonical_ids[index]] = inputs[old_id]
+	for key, value in inputs.items():
+		if key not in old_ids:
+			new_inputs[key] = value
+	new_mut = copy.deepcopy(mut)
+	new_mut["proccode"] = canonical_proc
+	new_mut["argumentids"] = json.dumps(canonical_ids, separators=(",", ":"), ensure_ascii=False)
+	call["mutation"] = new_mut
+	call["inputs"] = new_inputs
+	return True
+
+
 def merge_duplicate_procedures(project, stats, opts):
-	"""Merge whole custom procedures whose signatures and bodies are identical."""
-	opts.merged_procedure_removed_blocks = [
-		set() for _ in project.get("targets", [])
-	]
+	"""Merge semantically equivalent custom procedures, not merely identical names.
+
+	Procedures are canonicalized modulo human-readable procedure text, argument
+	names/IDs and block IDs. The pass repeats so equivalence can propagate through
+	helper procedures whose callees were merged on an earlier iteration.
+	"""
+	opts.merged_procedure_removed_blocks = [set() for _ in project.get("targets", [])]
+	stats["duplicate_procedures_merged"] += 0
+	stats["duplicate_procedure_blocks_removed"] += 0
 	total_procedures = 0
 	total_blocks = 0
 
 	for ti, target in enumerate(project.get("targets", [])):
-		by_proc, graph = _procedure_infos(target)
-		if not by_proc:
-			continue
-		blocks = target.get("blocks") or {}
-		comments = target.get("comments") or {}
-		commented = {
-			c.get("blockId")
-			for c in comments.values()
-			if isinstance(c, dict) and c.get("blockId") is not None
-		}
-		for proc, infos in by_proc.items():
-			if len(infos) < 2:
-				continue
+		max_passes = max(1, len(target.get("blocks") or {}) // 2 + 1)
+		procedure_aliases = {}
+		for _pass in range(max_passes):
+			by_proc, graph = _procedure_infos(target)
+			if not by_proc:
+				break
+			procedure_aliases.update({proc: procedure_aliases.get(proc, proc) for proc in by_proc})
+			comments = target.get("comments") or {}
+			commented = {
+				c.get("blockId")
+				for c in comments.values()
+				if isinstance(c, dict) and c.get("blockId") is not None
+			}
 			buckets = {}
-			for info in infos:
-				closure = info["closure"]
-				if closure & commented:
-					continue
-				# No member of a duplicate procedure may be externally owned.
-				if any(
-					any(parent not in closure for parent in graph.parents.get(bid, set()))
-					for bid in closure
-				):
-					continue
-				signature = _canonicalize_procedure(target, info, graph)
-				buckets.setdefault(signature, []).append(info)
-
-			for duplicates in buckets.values():
-				if len(duplicates) < 2:
-					continue
-				duplicates = sorted(
-					duplicates, key=lambda info: info["definition_id"]
-				)
-				canonical = duplicates[0]
-				canonical_def = canonical["definition_id"]
-				for duplicate in duplicates[1:]:
-					closure = set(duplicate["closure"])
-					# Never delete a block that the canonical procedure needs.
-					if closure & canonical["closure"]:
+			for proc, infos in by_proc.items():
+				for info in infos:
+					if not _procedure_merge_safe(target, info, graph, commented):
 						continue
+					signature = _canonicalize_procedure(target, info, graph, procedure_aliases)
+					buckets.setdefault(signature, []).append((proc, info))
+
+			merged_this_pass = 0
+			for entries in buckets.values():
+				if len(entries) < 2:
+					continue
+				group_by_proc = {}
+				for proc, info in entries:
+					group_by_proc.setdefault(proc, []).append(info)
+				if any(len(group_by_proc[proc]) != len(by_proc.get(proc, ())) for proc in group_by_proc):
+					continue
+				if len(group_by_proc) == 1 and len(entries) <= 1:
+					continue
+
+				call_counts = Counter()
+				for block in (target.get("blocks") or {}).values():
+					if isinstance(block, dict) and block.get("opcode") == "procedures_call":
+						call_counts[_procedure_key(block)] += 1
+				def key(item):
+					proc, info = item
+					return (len(proc or "") * call_counts.get(proc, 0) + len(proc or ""), len(proc or ""), proc or "", info["definition_id"])
+				canonical_proc, canonical = min(entries, key=key)
+				canonical_ids = list(canonical["argument_ids"])
+				if any(len(info["argument_ids"]) != len(canonical_ids) for _, info in entries):
+					continue
+
+				valid = True
+				for source_proc, info in entries:
+					if source_proc == canonical_proc:
+						continue
+					for call in (target.get("blocks") or {}).values():
+						if isinstance(call, dict) and call.get("opcode") == "procedures_call" and _procedure_key(call) == source_proc:
+							old_ids = _parse_argumentids(call.get("mutation"))
+							if old_ids is None or len(old_ids) != len(canonical_ids):
+								valid = False
+								break
+					if not valid:
+						break
+				if not valid:
+					continue
+
+				for source_proc, info in entries:
+					if info is canonical:
+						continue
+					if source_proc != canonical_proc:
+						for call in list((target.get("blocks") or {}).values()):
+							if isinstance(call, dict) and call.get("opcode") == "procedures_call" and _procedure_key(call) == source_proc:
+								_rewrite_procedure_call_to_canonical(call, canonical_proc, canonical_ids)
+						procedure_aliases[source_proc] = canonical_proc
+
+					closure = set(info["closure"])
+					blocks = target.get("blocks") or {}
 					for bid in closure:
 						blocks.pop(bid, None)
 					opts.merged_procedure_removed_blocks[ti].update(closure)
 					total_blocks += len(closure)
 					total_procedures += 1
+					merged_this_pass += 1
+
+			if not merged_this_pass:
+				break
 
 	stats["duplicate_procedures_merged"] += total_procedures
 	stats["duplicate_procedure_blocks_removed"] += total_blocks
@@ -6178,7 +7404,7 @@ def remove_constant_variable_setters(project, setters, stats, opts):
 
 
 def _to_scratch_number(val):
-	"""Scratch Cast.toNumber implementation"""
+	
 	if isinstance(val, bool):
 		return 1.0 if val else 0.0
 	if isinstance(val, (int, float)):
@@ -6219,7 +7445,7 @@ def _to_scratch_number(val):
 
 
 def _to_scratch_bool(val):
-	"""Scratch Cast.toBoolean implementation; whitespace is not stripped first."""
+	
 	if isinstance(val, bool):
 		return val
 	if isinstance(val, str):
@@ -6232,7 +7458,7 @@ def _to_scratch_bool(val):
 
 
 def _scratch_string(val):
-	"""Scratch Cast.toString implementation"""
+	
 	if isinstance(val, bool):
 		return "true" if val else "false"
 	if isinstance(val, str):
@@ -6601,7 +7827,6 @@ def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
 		return set()
 
 	if graph is None:
-		# Keep the legacy API usable for callers outside hot paths.
 		graph = _ScratchGraphIndex({"blocks": blocks})
 
 	candidate = set()
@@ -6630,6 +7855,7 @@ def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
 				return None
 
 	return candidate
+
 
 def _reparent_serialized_input(value, blocks, parent_id):
 	for bid in _direct_input_block_refs(value, blocks):
@@ -6791,7 +8017,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				for bid in removed:
 					blocks.pop(bid, None)
 				opts.simplified_block_removed_blocks[ti].update(removed)
-				graph.rebuild()
+				graph.refresh_after_mutation(changed={set_id}, removed=removed)
 
 				total += 1
 				add_count += 1
@@ -6822,7 +8048,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				for bid in removed:
 					blocks.pop(bid, None)
 				opts.simplified_block_removed_blocks[ti].update(removed)
-				graph.rebuild()
+				graph.refresh_after_mutation(changed={set_id}, removed=removed)
 
 				total += 1
 				subtract_count += 1
@@ -6843,7 +8069,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				for bid in removed:
 					blocks.pop(bid, None)
 				opts.simplified_block_removed_blocks[ti].update(removed)
-			graph.rebuild()
+			graph.refresh_after_mutation(changed={set_id, rhs_id}, removed=removed)
 
 			total += 1
 			subtract_count += 1
@@ -7190,7 +8416,6 @@ _NUMERIC_REPORTER_OPCODES = {
 	"looks_costumenumbername", "looks_backdropnumbername",
 	"sound_volume", "sensing_timer", "sensing_dayssince2000",
 }
-
 _BOOLEAN_REPORTER_OPCODES = {
 	"operator_not", "operator_and", "operator_or", "operator_gt",
 	"operator_lt", "operator_equals", "operator_contains",
@@ -7263,7 +8488,7 @@ def _simplify_double_boolean_negation(value, blocks, owner_id, input_name, incom
 
 
 def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
-	"""Apply safe numeric identities to definitely-numeric reporter expressions."""
+	
 	if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
 		return None
 	block_id = value[1]
@@ -7330,9 +8555,10 @@ def _replace_owner_block_ref(parent_block, old_id, new_id):
 
 
 def _control_substack(value, blocks):
-	if not isinstance(value, list) or not value or value[0] not in (1, 2, 3):
+	if not isinstance(value, list) or not value:
 		return None
-	if len(value) <= 1:
+	tag = _input_tag(value[0])
+	if tag not in (1, 2, 3) or len(value) <= 1:
 		return None
 	ref = value[1]
 	return ref if isinstance(ref, str) and ref in blocks else None
@@ -7366,7 +8592,7 @@ def _substack_tail(blocks, closure):
 
 
 def _control_owner_edge(blocks, control_id):
-	"""Return (owner_id, edge_kind, edge_name) for a unique direct owner."""
+	
 	control = blocks.get(control_id)
 	if not isinstance(control, dict):
 		return None
@@ -7390,7 +8616,7 @@ def _control_owner_edge(blocks, control_id):
 
 
 def _control_input_replacement(owner, edge_kind, edge_name, old_id, new_id):
-	"""Return a copied owner reference with one direct control edge replaced."""
+	
 	if not isinstance(owner, dict):
 		return None
 	if edge_kind == "next":
@@ -7558,8 +8784,6 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 	if selected_tail is not None and blocks[selected_tail].get("next") is not None:
 		return None
 
-	# Every removed block must belong to this control. No outside edge may
-	# enter the removed closure.
 	for bid in removed:
 		if bid == control_id:
 			continue
@@ -7569,8 +8793,6 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 
 	replacement = selected_closure and _control_substack(selected_raw, blocks) or continuation
 
-	# For a surviving branch, the branch root and continuation get new parents.
-	# For a deletion-only transformation, continuation takes the control's old owner.
 	parent_updates = []
 	next_updates = []
 	if selected_closure:
@@ -7600,7 +8822,7 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 
 
 def simplify_boolean_controls(project, stats, opts, only_repeat_one=False):
-	"""Structurally eliminate constant control-flow constructs."""
+	
 	targets = project.get("targets", [])
 	removed_sets = getattr(opts, "constant_control_removed_blocks", None)
 	if removed_sets is None or len(removed_sets) != len(targets):
@@ -7687,7 +8909,6 @@ def simplify_boolean_controls(project, stats, opts, only_repeat_one=False):
 				for bid, next_id in plan["next_updates"]:
 					blocks[bid]["next"] = next_id
 
-				# Record the exact structural differences expected by the verifier.
 				if plan["owner_edge_kind"] == "next":
 					link_edits[(ti, owner_id, "next")] = plan["replacement"]
 				else:
@@ -7703,7 +8924,10 @@ def simplify_boolean_controls(project, stats, opts, only_repeat_one=False):
 				for bid in removed:
 					blocks.pop(bid, None)
 
-				graph.rebuild()
+				graph.refresh_after_mutation(
+					changed={bid} | {x for x, _ in plan["parent_updates"]} | {x for x, _ in plan["next_updates"]},
+					removed=removed,
+				)
 				total += 1
 				changed = True
 				stats["boolean_control_simplifications"] += 1
@@ -7736,7 +8960,6 @@ def _script_input_root(value, blocks):
 
 
 def _script_condition_is_pure(value, blocks, graph):
-	"""Conservatively prove that a condition has no observable side effects."""
 	seen = set()
 	stack = list(_input_block_ids(value, blocks))
 	while stack:
@@ -7797,12 +9020,13 @@ def _script_record_new(opts, ti, created):
 
 
 def _script_literal_from_input(value):
-	if not (isinstance(value, list) and len(value) == 2 and value[0] == 1):
+	if not (isinstance(value, list) and len(value) == 2 and _scratch_numeric_tag(value[0]) == 1):
 		return None
 	literal = value[1]
 	if not (isinstance(literal, list) and len(literal) == 2):
 		return None
 	tag, raw = literal
+	tag = _scratch_numeric_tag(tag)
 	if tag in _NUMERIC_TAGS and not isinstance(raw, bool) and isinstance(raw, (str, int, float)):
 		if isinstance(raw, float) and not math.isfinite(raw):
 			return None
@@ -7947,17 +9171,464 @@ def _script_plan_nested_if(blocks, outer_id, incoming_refs, graph, commented):
 		"new_block": new_block, "body_raw": copy.deepcopy(body_raw), "body_root": body_root}
 
 
+def _branch_factor_sequence(blocks, root, closure):
+	
+	if not isinstance(root, str) or root not in closure:
+		return None
+	sequence = []
+	current = root
+	seen = set()
+	while isinstance(current, str) and current in closure and current not in seen:
+		block = blocks.get(current)
+		if not isinstance(block, dict):
+			return None
+		seen.add(current)
+		sequence.append(current)
+		nxt = block.get("next")
+		if nxt is None:
+			return sequence
+		if not isinstance(nxt, str) or nxt not in closure:
+			return None
+		current = nxt
+	return None
+
+
+def _branch_factor_segment_closure(blocks, sequence, graph):
+	
+	closure = set(sequence)
+	stack = []
+	for bid in sequence:
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		for value in (block.get("inputs") or {}).values():
+			stack.extend(_direct_input_block_refs(value, blocks))
+	while stack:
+		bid = stack.pop()
+		if bid in closure or bid not in blocks:
+			continue
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		closure.add(bid)
+		stack.extend(graph.edges.get(bid, ()))
+	return closure
+
+
+def _branch_factor_value_equal(left, right, blocks, left_closure, right_closure, memo, active):
+	if left is right:
+		return True
+	if isinstance(left, str) or isinstance(right, str):
+		if not isinstance(left, str) or not isinstance(right, str):
+			return False
+		left_local = left in left_closure
+		right_local = right in right_closure
+		if left_local or right_local:
+			if not (left_local and right_local):
+				return False
+			return _branch_factor_block_equal(
+				left, right, blocks, left_closure, right_closure, memo, active, True
+			)
+		return left == right
+	if isinstance(left, list) or isinstance(right, list):
+		if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+			return False
+		return all(
+			_branch_factor_value_equal(a, b, blocks, left_closure, right_closure, memo, active)
+			for a, b in zip(left, right)
+		)
+	if isinstance(left, dict) or isinstance(right, dict):
+		if not isinstance(left, dict) or not isinstance(right, dict) or left.keys() != right.keys():
+			return False
+		return all(
+			_branch_factor_value_equal(left[k], right[k], blocks, left_closure, right_closure, memo, active)
+			for k in left
+		)
+	return left == right
+
+
+def _branch_factor_block_equal(
+	a_id, b_id, blocks, left_closure, right_closure, memo, active, include_next=False
+):
+	pair = (a_id, b_id, include_next)
+	if pair in memo:
+		return memo[pair]
+	if pair in active:
+		return True
+	if a_id not in left_closure or b_id not in right_closure:
+		result = a_id == b_id
+		memo[pair] = result
+		return result
+	active.add(pair)
+	a = blocks.get(a_id)
+	b = blocks.get(b_id)
+	if not isinstance(a, dict) or not isinstance(b, dict):
+		active.discard(pair)
+		memo[pair] = False
+		return False
+
+	ignored = {"next", "parent", "topLevel", "x", "y"}
+	if a.get("opcode") != b.get("opcode"):
+		active.discard(pair); memo[pair] = False; return False
+	if {k: v for k, v in a.items() if k not in ignored} != {k: v for k, v in b.items() if k not in ignored}:
+		# The remaining values may contain branch-local references, so compare the
+		# individual structural fields rather than relying on raw dictionary equality.
+		for key in set(a) | set(b):
+			if key in ignored:
+				continue
+			if key not in a or key not in b:
+				active.discard(pair); memo[pair] = False; return False
+			if key in ("inputs",):
+				continue
+			if a[key] != b[key]:
+				active.discard(pair); memo[pair] = False; return False
+
+	ain = a.get("inputs") or {}
+	bin_ = b.get("inputs") or {}
+	if ain.keys() != bin_.keys():
+		active.discard(pair); memo[pair] = False; return False
+	for name in ain:
+		if not _branch_factor_value_equal(
+			ain[name], bin_[name], blocks, left_closure, right_closure, memo, active
+		):
+			active.discard(pair); memo[pair] = False; return False
+
+	if include_next:
+		an = a.get("next")
+		bn = b.get("next")
+		if an is None or bn is None:
+			if an is not None or bn is not None:
+				active.discard(pair); memo[pair] = False; return False
+		else:
+			if not _branch_factor_value_equal(
+				an, bn, blocks, left_closure, right_closure, memo, active
+			):
+				active.discard(pair); memo[pair] = False; return False
+
+	active.discard(pair)
+	memo[pair] = True
+	return True
+
+
+def _branch_factor_common_prefix(left, right, blocks, left_closure, right_closure):
+	limit = min(len(left), len(right))
+	memo = {}
+	count = 0
+	for i in range(limit):
+		if not _branch_factor_block_equal(
+			left[i], right[i], blocks, left_closure, right_closure, memo, set(), False
+		):
+			break
+		count += 1
+	return count
+
+
+def _branch_factor_common_suffix(left, right, blocks, left_closure, right_closure):
+	limit = min(len(left), len(right))
+	memo = {}
+	count = 0
+	for offset in range(1, limit + 1):
+		if not _branch_factor_block_equal(
+			left[-offset], right[-offset], blocks, left_closure, right_closure, memo, set(), False
+		):
+			break
+		count += 1
+	return count
+
+
+def _branch_factor_set_substack(inputs, name, root):
+	value = inputs.get(name)
+	if not isinstance(value, list) or len(value) < 2 or value[0] not in (1, 2, 3):
+		return None
+	new = copy.deepcopy(value)
+	new[1] = root
+	return new
+
+
+def _branch_factor_record_removed_input(opts, ti, block_id, name):
+	if getattr(opts, "script_rewrite_removed_inputs", None) is None:
+		opts.script_rewrite_removed_inputs = {}
+	opts.script_rewrite_removed_inputs.setdefault((ti, block_id), set()).add(name)
+
+
+def _branch_factor_owner_replace(blocks, control_id, new_id):
+	owner = _control_owner_edge(blocks, control_id)
+	if owner is None:
+		return None
+	owner_id, edge_kind, edge_name = owner
+	owner_block = blocks.get(owner_id)
+	if not isinstance(owner_block, dict):
+		return None
+	preview = copy.deepcopy(owner_block)
+	if _control_input_replacement(preview, edge_kind, edge_name, control_id, new_id) is None:
+		return None
+	return owner_id, edge_kind, edge_name, owner_block, preview
+
+
+def _branch_factor_plan(target, control_id, graph, commented):
+	blocks = target.get("blocks") or {}
+	control = blocks.get(control_id)
+	if not isinstance(control, dict) or control.get("opcode") != "control_if_else":
+		return None
+	inputs = control.get("inputs") or {}
+	then_value = inputs.get("SUBSTACK")
+	else_value = inputs.get("SUBSTACK2")
+	then_root = _control_substack(then_value, blocks)
+	else_root = _control_substack(else_value, blocks)
+	if then_root is None or else_root is None:
+		return None
+	incoming = graph.incoming
+	then_closure, then_tail = _substack_closure(then_value, blocks, control_id, incoming, graph)
+	else_closure, else_tail = _substack_closure(else_value, blocks, control_id, incoming, graph)
+	if then_closure is None or else_closure is None or then_closure & else_closure:
+		return None
+	then_sequence = _branch_factor_sequence(blocks, then_root, then_closure)
+	else_sequence = _branch_factor_sequence(blocks, else_root, else_closure)
+	if not then_sequence or not else_sequence:
+		return None
+
+	allow_prefix = control.get("topLevel") is not True and _control_owner_edge(blocks, control_id) is not None
+	prefix_len = _branch_factor_common_prefix(
+		then_sequence, else_sequence, blocks, then_closure, else_closure
+	) if allow_prefix else 0
+	suffix_len = _branch_factor_common_suffix(
+		then_sequence, else_sequence, blocks, then_closure, else_closure
+	)
+
+	if prefix_len == len(then_sequence) == len(else_sequence):
+		keep_closure = _branch_factor_segment_closure(blocks, then_sequence, graph)
+		remove_closure = _branch_factor_segment_closure(blocks, else_sequence, graph)
+		condition_closure = _exclusive_input_block_subtree_fast(
+			inputs.get("CONDITION"), blocks, control_id, incoming, graph=graph
+		)
+		if condition_closure is None:
+			return None
+		removed = {control_id} | remove_closure | condition_closure
+		owner = _branch_factor_owner_replace(blocks, control_id, then_sequence[0])
+		if owner is not None and not (removed & commented):
+			return {
+				"kind": "eliminate",
+				"control_id": control_id,
+				"keep_root": then_sequence[0],
+				"keep_tail": then_sequence[-1],
+				"remove": removed,
+				"owner": owner,
+			}
+		return None
+
+	if prefix_len > 0:
+		remove_segment = else_sequence[:prefix_len]
+		remove = _branch_factor_segment_closure(blocks, remove_segment, graph)
+		if remove & commented:
+			return None
+		return {
+			"kind": "prefix", "control_id": control_id,
+			"keep_segment": then_sequence[:prefix_len], "remove": remove,
+			"then_sequence": then_sequence, "else_sequence": else_sequence,
+			"prefix_len": prefix_len,
+			"owner": _branch_factor_owner_replace(blocks, control_id, then_sequence[0]),
+		}
+
+	if suffix_len > 0 and not (suffix_len == len(then_sequence) == len(else_sequence)):
+		remove_segment = else_sequence[-suffix_len:]
+		remove = _branch_factor_segment_closure(blocks, remove_segment, graph)
+		if remove & commented:
+			return None
+		return {
+			"kind": "suffix", "control_id": control_id,
+			"keep_segment": then_sequence[-suffix_len:], "remove": remove,
+			"then_sequence": then_sequence, "else_sequence": else_sequence,
+			"suffix_len": suffix_len,
+		}
+	return None
+
+
+def _branch_factor_apply(target, plan, opts, stats, ti):
+	blocks = target.get("blocks") or {}
+	control_id = plan["control_id"]
+	control = blocks.get(control_id)
+	if not isinstance(control, dict):
+		return False
+
+	if plan["kind"] == "eliminate":
+		owner_id, edge_kind, edge_name, _owner_block, preview = plan["owner"]
+		keep_root = plan["keep_root"]
+		keep_tail = plan["keep_tail"]
+		old_next = control.get("next")
+		if edge_kind == "next":
+			preview["next"] = keep_root
+			opts.script_rewrite_link_edits[(ti, owner_id, "next")] = keep_root
+		else:
+			opts.script_rewrite_input_edits[(ti, owner_id, edge_name)] = copy.deepcopy(
+				preview.get("inputs", {}).get(edge_name)
+			)
+		blocks[owner_id] = preview
+		blocks[keep_root]["parent"] = owner_id
+		opts.script_rewrite_link_edits[(ti, keep_root, "parent")] = owner_id
+		blocks[keep_tail]["next"] = old_next
+		opts.script_rewrite_link_edits[(ti, keep_tail, "next")] = old_next
+		if isinstance(old_next, str) and old_next in blocks:
+			blocks[old_next]["parent"] = keep_tail
+			opts.script_rewrite_link_edits[(ti, old_next, "parent")] = keep_tail
+		_script_record_removed(opts, ti, plan["remove"])
+		for bid in plan["remove"]:
+			blocks.pop(bid, None)
+		stats["branch_controls_factored"] += 1
+		stats["branch_factor_blocks_removed"] += len(plan["remove"])
+		return True
+
+	inputs = control.setdefault("inputs", {})
+	if plan["kind"] == "prefix":
+		owner = plan["owner"]
+		if owner is None:
+			return False
+		owner_id, edge_kind, edge_name, _owner_block, preview = owner
+		prefix_root = plan["keep_segment"][0]
+		prefix_tail = plan["keep_segment"][-1]
+		if edge_kind == "next":
+			preview["next"] = prefix_root
+			opts.script_rewrite_link_edits[(ti, owner_id, "next")] = prefix_root
+		else:
+			new_value = preview.get("inputs", {}).get(edge_name)
+			opts.script_rewrite_input_edits[(ti, owner_id, edge_name)] = copy.deepcopy(new_value)
+		blocks[owner_id] = preview
+		blocks[prefix_root]["parent"] = owner_id
+		opts.script_rewrite_link_edits[(ti, prefix_root, "parent")] = owner_id
+		blocks[prefix_tail]["next"] = control_id
+		opts.script_rewrite_link_edits[(ti, prefix_tail, "next")] = control_id
+		control["parent"] = prefix_tail
+		opts.script_rewrite_link_edits[(ti, control_id, "parent")] = prefix_tail
+		for name, sequence in (("SUBSTACK", plan["then_sequence"]), ("SUBSTACK2", plan["else_sequence"])):
+			remaining = sequence[plan["prefix_len"]:]
+			if remaining:
+				new_value = _branch_factor_set_substack(inputs, name, remaining[0])
+				if new_value is None:
+					return False
+				inputs[name] = new_value
+				blocks[remaining[0]]["parent"] = control_id
+				opts.script_rewrite_input_edits[(ti, control_id, name)] = copy.deepcopy(new_value)
+				opts.script_rewrite_link_edits[(ti, remaining[0], "parent")] = control_id
+			else:
+				inputs.pop(name, None)
+				_branch_factor_record_removed_input(opts, ti, control_id, name)
+		_script_record_removed(opts, ti, plan["remove"])
+		for bid in plan["remove"]:
+			blocks.pop(bid, None)
+		stats["branch_prefixes_factored"] += 1
+		stats["branch_factor_blocks_removed"] += len(plan["remove"])
+		return True
+
+	# Common suffix.
+	suffix = plan["keep_segment"]
+	suffix_root = suffix[0]
+	suffix_tail = suffix[-1]
+	then_seq = plan["then_sequence"]
+	else_seq = plan["else_sequence"]
+	split_then = len(then_seq) - plan["suffix_len"]
+	split_else = len(else_seq) - plan["suffix_len"]
+	if split_then:
+		prev = blocks[then_seq[split_then - 1]]
+		prev["next"] = None
+		opts.script_rewrite_link_edits[(ti, then_seq[split_then - 1], "next")] = None
+	else:
+		inputs.pop("SUBSTACK", None)
+		_branch_factor_record_removed_input(opts, ti, control_id, "SUBSTACK")
+	if split_else:
+		prev = blocks[else_seq[split_else - 1]]
+		prev["next"] = None
+		opts.script_rewrite_link_edits[(ti, else_seq[split_else - 1], "next")] = None
+	else:
+		inputs.pop("SUBSTACK2", None)
+		_branch_factor_record_removed_input(opts, ti, control_id, "SUBSTACK2")
+
+	old_next = control.get("next")
+	control["next"] = suffix_root
+	opts.script_rewrite_link_edits[(ti, control_id, "next")] = suffix_root
+	blocks[suffix_root]["parent"] = control_id
+	opts.script_rewrite_link_edits[(ti, suffix_root, "parent")] = control_id
+	blocks[suffix_tail]["next"] = old_next
+	opts.script_rewrite_link_edits[(ti, suffix_tail, "next")] = old_next
+	if isinstance(old_next, str) and old_next in blocks:
+		blocks[old_next]["parent"] = suffix_tail
+		opts.script_rewrite_link_edits[(ti, old_next, "parent")] = suffix_tail
+	for name, sequence, split in (("SUBSTACK", then_seq, split_then), ("SUBSTACK2", else_seq, split_else)):
+		if split:
+			value = _branch_factor_set_substack(inputs, name, sequence[0])
+			if value is None:
+				return False
+			inputs[name] = value
+			blocks[sequence[0]]["parent"] = control_id
+			opts.script_rewrite_input_edits[(ti, control_id, name)] = copy.deepcopy(value)
+			opts.script_rewrite_link_edits[(ti, sequence[0], "parent")] = control_id
+	_script_record_removed(opts, ti, plan["remove"])
+	for bid in plan["remove"]:
+		blocks.pop(bid, None)
+	stats["branch_suffixes_factored"] += 1
+	stats["branch_factor_blocks_removed"] += len(plan["remove"])
+	return True
+
+
+def factor_branches(project, stats, opts):
+	
+	total = 0
+	for ti, target in enumerate(project.get("targets", [])):
+		while True:
+			graph = _ScratchGraphIndex(target)
+			commented = _script_comment_ids(target)
+			candidates = [
+				bid for bid, block in list((target.get("blocks") or {}).items())
+				if isinstance(block, dict) and block.get("opcode") == "control_if_else"
+			]
+			changed = False
+			for control_id in candidates:
+				if control_id not in (target.get("blocks") or {}):
+					continue
+				plan = _branch_factor_plan(target, control_id, graph, commented)
+				if plan is None:
+					continue
+				before = _json_len(target)
+				candidate_target = copy.deepcopy(target)
+				trial = Options()
+				try:
+					_branch_factor_apply(candidate_target, copy.deepcopy(plan), trial, Counter(), ti)
+				except Exception:
+					continue
+				after = _json_len(candidate_target)
+				if after >= before:
+					stats["branch_factor_rejected_size"] += 1
+					continue
+				local = Counter()
+				if not _branch_factor_apply(target, plan, opts, local, ti):
+					continue
+				stats["branch_factor_bytes_saved"] += before - after
+				for key, value in local.items():
+					stats[key] += value
+				total += 1
+				changed = True
+				break
+			if not changed:
+				break
+	return total
+
+
 def simplify_script_structures(project, stats, opts):
-	"""Apply local control rewrites with explicit verifier bookkeeping."""
 	targets = project.get("targets", [])
 	_script_prepare_maps(opts, targets)
 	for ti, target in enumerate(targets):
 		blocks = target.get("blocks") or {}
 		graph = _ScratchGraphIndex(target)
 		commented = _script_comment_ids(target)
+		candidate_ids = [
+			bid for bid, block in blocks.items()
+			if isinstance(block, dict) and block.get("opcode") in (
+				"control_if", "control_if_else", "control_repeat_until",
+				"control_repeat",
+			)
+		]
 		while True:
 			changed = False
-			for bid, block in list(blocks.items()):
+			for bid in candidate_ids:
+				block = blocks.get(bid)
 				if not isinstance(block, dict) or bid not in blocks:
 					continue
 				incoming = graph.incoming
@@ -7978,7 +9649,7 @@ def simplify_script_structures(project, stats, opts):
 							opts.script_rewrite_input_edits[(ti, bid, n)] = copy.deepcopy(inputs[n])
 						_script_record_removed(opts, ti, plan["removed"])
 						for dead in plan["removed"]: blocks.pop(dead, None)
-						graph.rebuild(); stats["branch_swaps"] += 1; changed = True; break
+						graph.refresh_blocks((bid, *plan["removed"])); stats["branch_swaps"] += 1; changed = True; break
 
 				if opts.branch_swapping:
 					plan = _script_plan_empty_then(blocks, bid, incoming, graph, commented)
@@ -8009,7 +9680,7 @@ def simplify_script_structures(project, stats, opts):
 							_script_record_new(opts, ti, {plan["new_id"]})
 						_script_record_removed(opts, ti, plan["removed"])
 						for dead in plan["removed"]: blocks.pop(dead, None)
-						graph.rebuild(); stats["empty_then_rewrites"] += 1; changed = True; break
+						graph.refresh_blocks((bid, plan.get("new_id"), *plan["removed"])); stats["empty_then_rewrites"] += 1; changed = True; break
 
 				if opts.trivial_loops:
 					plan = _script_plan_repeat_until_not(blocks, bid, incoming, graph, commented)
@@ -8025,7 +9696,7 @@ def simplify_script_structures(project, stats, opts):
 								opts.script_rewrite_link_edits[(ti, moved, "parent")] = bid
 						_script_record_removed(opts, ti, plan["removed"])
 						for dead in plan["removed"]: blocks.pop(dead, None)
-						graph.rebuild(); stats["repeat_until_not_rewrites"] += 1; changed = True; break
+						graph.refresh_blocks((bid, *plan["removed"])); stats["repeat_until_not_rewrites"] += 1; changed = True; break
 
 				if opts.nested_conditionals:
 					plan = _script_plan_nested_if(blocks, bid, incoming, graph, commented)
@@ -8048,9 +9719,11 @@ def simplify_script_structures(project, stats, opts):
 						_script_record_new(opts, ti, {new_id})
 						_script_record_removed(opts, ti, {plan["inner_id"]})
 						blocks.pop(plan["inner_id"], None)
-						graph.rebuild(); stats["nested_if_merges"] += 1; changed = True; break
+						graph.refresh_blocks((bid, new_id, plan["inner_id"])); stats["nested_if_merges"] += 1; changed = True; break
 			if not changed: break
-	return sum(stats.get(k,0) for k in ("branch_swaps","empty_then_rewrites","repeat_until_not_rewrites","nested_if_merges"))
+	if opts.branch_factoring:
+		factor_branches(project, stats, opts)
+	return sum(stats.get(k,0) for k in ("branch_swaps","empty_then_rewrites","repeat_until_not_rewrites","nested_if_merges")) + stats.get("branch_prefixes_factored", 0) + stats.get("branch_suffixes_factored", 0) + stats.get("branch_controls_factored", 0)
 
 
 def _script_associative_plan(blocks, outer_id, graph, commented):
@@ -8124,7 +9797,11 @@ def merge_associative_constants(project, stats, opts):
 				for remove_id in plan["removed"]:
 					blocks.pop(remove_id, None)
 				_script_record_removed(opts, ti, plan["removed"])
-				graph.rebuild(); stats["associative_constant_merges"] += 1; count += 1; changed = True; break
+				graph.refresh_after_mutation(
+					changed={bid} | set(_direct_input_block_refs(plan["base"], blocks)),
+					removed=set(plan["removed"]),
+				)
+				stats["associative_constant_merges"] += 1; count += 1; changed = True; break
 			if not changed: break
 	return count
 
@@ -8137,12 +9814,12 @@ def _script_var_id(block):
 def _script_replace_known_reads(value, env, blocks, owner_id, ti, opts, graph, allow_literal=True):
 	if not isinstance(value, list) or not value:
 		return value, False, set()
-	if len(value) >= 3 and value[0] == 12 and isinstance(value[2], str) and value[2] in env:
+	if len(value) >= 3 and _scratch_numeric_tag(value[0]) == 12 and isinstance(value[2], str) and value[2] in env:
 		if not allow_literal:
 			return value, False, set()
 		entry = env[value[2]]
 		return [1, copy.deepcopy(entry)], True, set()
-	if value[0] in (1,2,3) and len(value) > 1 and isinstance(value[1], str):
+	if _scratch_numeric_tag(value[0]) in (1, 2, 3) and len(value) > 1 and isinstance(value[1], str):
 		ref = value[1]
 		child = blocks.get(ref)
 		if isinstance(child, dict) and child.get("opcode") == "data_variable":
@@ -8152,7 +9829,7 @@ def _script_replace_known_reads(value, env, blocks, owner_id, ti, opts, graph, a
 				if owned == {ref}:
 					return [1, copy.deepcopy(env[vid])], True, {ref}
 		return value, False, set()
-	if value[0] == 3:
+	if _scratch_numeric_tag(value[0]) == 3:
 		changed = False; removed = set()
 		for i in (1,2):
 			if i >= len(value) or not isinstance(value[i], list): continue
@@ -8178,43 +9855,358 @@ def _script_literal_payload(value):
 	return literal
 
 
+def _cfg_statement_roots(blocks):
+	roots = []
+	for bid, block in blocks.items():
+		if not isinstance(block, dict):
+			continue
+		if block.get("topLevel") is True:
+			roots.append(bid)
+		elif block.get("parent") is None and _is_hat(block):
+			roots.append(bid)
+	return roots
+
+
+def _cfg_linear_tail(blocks, root):
+	if not isinstance(root, str) or root not in blocks:
+		return None
+	current = root
+	seen = set()
+	while current in blocks and current not in seen:
+		seen.add(current)
+		block = blocks.get(current)
+		if not isinstance(block, dict):
+			return None
+		nxt = block.get("next")
+		if not isinstance(nxt, str) or nxt not in blocks:
+			return current
+		current = nxt
+	return None
+
+
+def _cfg_may_fall_through(blocks, block_id, memo=None, active=None):
+	if memo is None:
+		memo = {}
+	if active is None:
+		active = set()
+	if block_id in memo:
+		return memo[block_id]
+	if block_id in active:
+		return True
+	block = blocks.get(block_id)
+	if not isinstance(block, dict):
+		memo[block_id] = False
+		return False
+	op = block.get("opcode", "")
+	if op == "control_stop":
+		field = (block.get("fields") or {}).get("STOP_OPTION")
+		option = field[0] if isinstance(field, list) and field and isinstance(field[0], str) else None
+		result = option == "other scripts in sprite"
+		memo[block_id] = result
+		return result
+	if op in {
+		"control_forever",
+		"control_stop_all",
+		"control_stop_other_scripts",
+		"control_delete_this_clone",
+	}:
+		memo[block_id] = False
+		return False
+
+	active.add(block_id)
+	try:
+		if op == "control_if":
+			inputs = block.get("inputs") or {}
+			root = _control_substack(inputs.get("SUBSTACK"), blocks)
+			result = True if root is None else _cfg_substack_may_fall_through(blocks, root, memo, active)
+		elif op == "control_if_else":
+			inputs = block.get("inputs") or {}
+			then_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+			else_root = _control_substack(inputs.get("SUBSTACK2"), blocks)
+			then_fall = True if then_root is None else _cfg_substack_may_fall_through(blocks, then_root, memo, active)
+			else_fall = True if else_root is None else _cfg_substack_may_fall_through(blocks, else_root, memo, active)
+			result = then_fall or else_fall
+		elif op in {"control_repeat", "control_repeat_until", "control_while"}:
+			# These loops have a lexical exit unless they are a syntactic `forever`.
+			result = True
+		elif op == "control_wait_until":
+			result = True
+		else:
+			result = True
+	finally:
+		active.discard(block_id)
+	memo[block_id] = result
+	return result
+
+
+def _cfg_substack_may_fall_through(blocks, root, memo=None, active=None):
+	if root is None:
+		return True
+	tail = _cfg_linear_tail(blocks, root)
+	if tail is None:
+		return True
+	return _cfg_may_fall_through(blocks, tail, memo, active)
+
+
+def _build_script_cfg(target):
+	blocks = target.get("blocks") or {}
+	roots = _cfg_statement_roots(blocks)
+	successors = {bid: set() for bid in roots}
+	predecessors = {bid: set() for bid in roots}
+	seen_by_root = {root: set() for root in roots}
+
+	def add_node(root, bid):
+		if not isinstance(bid, str) or bid not in blocks or not isinstance(blocks.get(bid), dict):
+			return False
+		seen_by_root[root].add(bid)
+		successors.setdefault(bid, set())
+		predecessors.setdefault(bid, set())
+		return True
+
+	def add_edge(a, b, root):
+		if not add_node(root, a):
+			return
+		if not isinstance(b, str) or b not in blocks or not isinstance(blocks.get(b), dict):
+			return
+		add_node(root, b)
+		successors[a].add(b)
+		predecessors[b].add(a)
+
+	def process_chain(first, fallthrough, root, active=None):
+		if active is None:
+			active = set()
+		current = first
+		local_seen = set()
+		while isinstance(current, str) and current in blocks and current not in local_seen:
+			local_seen.add(current)
+			if current in active:
+				return
+			active.add(current)
+			block = blocks.get(current)
+			if not isinstance(block, dict):
+				active.discard(current)
+				return
+			add_node(root, current)
+			op = block.get("opcode", "")
+			inputs = block.get("inputs") or {}
+			nxt = block.get("next")
+			continuation = nxt if isinstance(nxt, str) and nxt in blocks else fallthrough
+
+			if op == "control_if":
+				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+				if body_root is not None:
+					add_edge(current, body_root, root)
+					process_chain(body_root, continuation, root, active)
+
+				if continuation is not None:
+					add_edge(current, continuation, root)
+
+			elif op == "control_if_else":
+				then_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+				else_root = _control_substack(inputs.get("SUBSTACK2"), blocks)
+				if then_root is not None:
+					add_edge(current, then_root, root)
+					process_chain(then_root, continuation, root, active)
+				elif continuation is not None:
+					add_edge(current, continuation, root)
+				if else_root is not None:
+					add_edge(current, else_root, root)
+					process_chain(else_root, continuation, root, active)
+				elif continuation is not None:
+					add_edge(current, continuation, root)
+
+			elif op in {"control_repeat", "control_repeat_until", "control_while"}:
+				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+
+				if continuation is not None:
+					add_edge(current, continuation, root)
+				if body_root is not None:
+					add_edge(current, body_root, root)
+					process_chain(body_root, current, root, active)
+
+			elif op == "control_forever":
+				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+				if body_root is not None:
+					add_edge(current, body_root, root)
+					process_chain(body_root, current, root, active)
+
+			elif op in {"control_stop", "control_stop_all", "control_stop_other_scripts", "control_delete_this_clone"}:
+				if op == "control_stop":
+					field = (block.get("fields") or {}).get("STOP_OPTION")
+					option = field[0] if isinstance(field, list) and field and isinstance(field[0], str) else None
+					if option == "other scripts in sprite" and continuation is not None:
+						add_edge(current, continuation, root)
+
+			else:
+				if continuation is not None:
+					add_edge(current, continuation, root)
+
+			active.discard(current)
+			if not isinstance(nxt, str) or nxt not in blocks:
+				return
+			current = nxt
+
+	for root in roots:
+		if not add_node(root, root):
+			continue
+		process_chain(root, None, root)
+
+	for root, nodes in seen_by_root.items():
+		for bid in nodes:
+			successors.setdefault(bid, set()).intersection_update(nodes)
+			predecessors.setdefault(bid, set()).intersection_update(nodes)
+
+	return roots, seen_by_root, successors, predecessors
+
+
+def _cfg_meet_constant_envs(envs):
+	if not envs:
+		return {}
+	common = dict(envs[0])
+	for env in envs[1:]:
+		for vid in list(common):
+			if vid not in env or env[vid] != common[vid]:
+				del common[vid]
+	return common
+
+
+def _cfg_is_hard_constant_barrier(block):
+	if not isinstance(block, dict):
+		return True
+	op = block.get("opcode", "")
+	return (
+		op == "procedures_call"
+		or op in {
+			"control_wait_until",
+			"sensing_askandwait",
+			"sound_playuntildone",
+			"event_broadcastandwait",
+			"control_create_clone_of",
+			"control_delete_this_clone",
+		}
+	)
+
+
+def _cfg_transfer_constants(block, env):
+	
+	out = dict(env)
+	if not isinstance(block, dict):
+		return out
+	op = block.get("opcode", "")
+	if op == "data_setvariableto":
+		vid = _script_var_id(block)
+		lit = _script_literal_payload((block.get("inputs") or {}).get("VALUE"))
+		if vid and lit is not None:
+			out[vid] = lit
+		elif vid:
+			out.pop(vid, None)
+	elif op == "data_changevariableby":
+		vid = _script_var_id(block)
+		if vid:
+			out.pop(vid, None)
+	if _cfg_is_hard_constant_barrier(block):
+		out.clear()
+	return out
+
+
+def _cfg_propagate_root_constants(
+	blocks, root, nodes, successors, predecessors, ti, opts, graph
+):
+	
+	in_env = {bid: {} for bid in nodes}
+	out_env = {bid: None for bid in nodes}
+	worklist = [root]
+	queued = {root}
+	changes = 0
+
+	while worklist:
+		bid = worklist.pop()
+		queued.discard(bid)
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+
+		if bid == root:
+			new_in = {}
+		else:
+			pred_envs = [
+				out_env[p]
+				for p in predecessors.get(bid, ())
+				if out_env.get(p) is not None
+			]
+			new_in = _cfg_meet_constant_envs(pred_envs)
+
+		node_changed = new_in != in_env.get(bid, {})
+		if node_changed:
+			in_env[bid] = new_in
+			changes += 1
+
+		new_out = _cfg_transfer_constants(block, new_in)
+		if new_out != out_env.get(bid):
+			out_env[bid] = new_out
+			node_changed = True
+			changes += 1
+
+		if node_changed:
+			for succ in successors.get(bid, set()):
+				if succ not in queued:
+					worklist.append(succ)
+					queued.add(succ)
+
+	propagated = 0
+	for bid in nodes:
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		env = in_env.get(bid, {})
+		for input_name, raw in list((block.get("inputs") or {}).items()):
+			new, changed, dead = _script_replace_known_reads(
+				raw,
+				env,
+				blocks,
+				bid,
+				ti,
+				opts,
+				graph,
+				allow_literal=not _is_boolean_slot(block, input_name),
+			)
+			if not changed:
+				continue
+			block.setdefault("inputs", {})[input_name] = new
+			opts.script_rewrite_input_edits[(ti, bid, input_name)] = copy.deepcopy(new)
+			for dead_id in dead:
+				blocks.pop(dead_id, None)
+			_script_record_removed(opts, ti, dead)
+			graph.refresh_after_mutation(changed={bid}, removed=set(dead))
+			propagated += 1
+
+	return propagated, changes
+
+
 def propagate_script_constants(project, stats, opts):
 	_script_prepare_maps(opts, project.get("targets", []))
-	count = 0
+	total = 0
+	analysis_changes = 0
+
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks") or {}
+		if not blocks:
+			continue
+		roots, nodes_by_root, successors, predecessors = _build_script_cfg(target)
 		graph = _ScratchGraphIndex(target)
-		roots = [
-			bid for bid, block in blocks.items()
-			if isinstance(block, dict) and (block.get("topLevel") is True or (block.get("parent") is None and _is_hat(block)))
-		]
 		for root in roots:
-			env = {}; seen = set(); current = root
-			while isinstance(current, str) and current in blocks and current not in seen:
-				seen.add(current)
-				block = blocks[current]
-				if not isinstance(block, dict): break
-				for input_name, raw in list((block.get("inputs") or {}).items()):
-					new, changed, dead = _script_replace_known_reads(raw, env, blocks, current, ti, opts, graph, allow_literal=not _is_boolean_slot(block, input_name))
-					if changed:
-						block.setdefault("inputs", {})[input_name] = new
-						opts.script_rewrite_input_edits[(ti, current, input_name)] = copy.deepcopy(new)
-						for dead_id in dead: blocks.pop(dead_id, None)
-						_script_record_removed(opts, ti, dead)
-						graph.rebuild(); count += 1
-				op = block.get("opcode")
-				if op == "data_setvariableto":
-					vid = _script_var_id(block)
-					lit = _script_literal_payload((block.get("inputs") or {}).get("VALUE"))
-					if vid and lit is not None: env[vid] = lit
-					else: env.pop(vid, None)
-				elif op == "data_changevariableby":
-					env.pop(_script_var_id(block), None)
-				if op.startswith(("event_", "control_", "procedures_")) or op in {"sensing_askandwait", "sound_playuntildone", "event_broadcastandwait"}:
-					env.clear()
-				current = block.get("next") if isinstance(block.get("next"), str) else None
-	stats["script_constants_propagated"] += count
-	return count
+			nodes = nodes_by_root.get(root, set())
+			if not nodes:
+				continue
+			count, iterations = _cfg_propagate_root_constants(
+				blocks, root, nodes, successors, predecessors, ti, opts, graph
+			)
+			total += count
+			analysis_changes += iterations
+
+	stats["script_constants_propagated"] += total
+	stats["script_constant_cfg_changes"] += analysis_changes
+	return total
 
 
 def _numeric_data_literal(value):
@@ -8258,6 +10250,7 @@ def strip_reference_names(project, stats):
 			count += 1
 	stats["reference_names_stripped"] += count
 	return count
+
 
 _EXTENSION_PREFIXES = {
 	"pen":"pen_", "music":"music_", "videoSensing":"videoSensing_", "text2speech":"text2speech_",
@@ -8306,6 +10299,15 @@ def fold_constant_expressions(project, stats, opts):
 		blocks = target.get("blocks") or {}
 		graph = _ScratchGraphIndex(target)
 		incoming_refs = graph.incoming
+		candidate_inputs = [
+			(block_id, input_name)
+			for block_id, block in blocks.items()
+			if isinstance(block, dict)
+			for input_name, input_val in (block.get("inputs") or {}).items()
+			if (isinstance(input_val, list) and len(input_val) > 1 and input_val[0] in (2, 3)
+				and isinstance(input_val[1], str) and isinstance(blocks.get(input_val[1]), dict)
+				and str(blocks[input_val[1]].get("opcode", "")).startswith("operator_"))
+		]
 		commented_ids = {
 			c.get("blockId")
 			for c in (target.get("comments") or {}).values()
@@ -8314,11 +10316,22 @@ def fold_constant_expressions(project, stats, opts):
 
 		while True:
 			changed = False
-			for block_id, block in list(blocks.items()):
-				if not isinstance(block, dict) or block_id not in blocks:
+			for block_id, input_name in candidate_inputs:
+				block = blocks.get(block_id)
+				if not isinstance(block, dict):
 					continue
+				inputs_now = block.get("inputs") or {}
+				input_val = inputs_now.get(input_name)
+				if input_val is None:
+					continue
+				if not (isinstance(input_val, list) and len(input_val) > 1 and input_val[0] in (1, 2, 3)):
+					continue
+				if input_val[0] in (2, 3):
+					root_id = input_val[1]
+					root = blocks.get(root_id) if isinstance(root_id, str) else None
+					if not isinstance(root, dict) or not str(root.get("opcode", "")).startswith("operator_"):
+						continue
 
-				for input_name, input_val in list((block.get("inputs") or {}).items()):
 					boolean_negation = _simplify_double_boolean_negation(
 						input_val, blocks, block_id, input_name, incoming_refs, graph
 					)
@@ -8338,7 +10351,7 @@ def fold_constant_expressions(project, stats, opts):
 							opts.folded_constant_expression_blocks[ti].update(removed_ids)
 							for remove_id in removed_ids:
 								blocks.pop(remove_id, None)
-							graph.rebuild()
+							graph.refresh_blocks((block_id, *removed_ids))
 							incoming_refs = graph.incoming
 							stats["boolean_constants_propagated"] += 1
 							folded += 1
@@ -8370,7 +10383,7 @@ def fold_constant_expressions(project, stats, opts):
 								opts.folded_constant_expression_blocks[ti].update(removed_ids)
 								for remove_id in removed_ids:
 									blocks.pop(remove_id, None)
-								graph.rebuild()
+								graph.refresh_blocks((block_id, *removed_ids))
 								incoming_refs = graph.incoming
 								stats["algebraic_simplifications"] += 1
 								folded += 1
@@ -8447,7 +10460,7 @@ def fold_constant_expressions(project, stats, opts):
 						)] = copy.deepcopy(demorgan["new_outer_input"])
 						opts.folded_constant_expression_blocks[ti].add(right_not_id)
 						blocks.pop(right_not_id, None)
-						graph.rebuild()
+						graph.refresh_blocks((block_id, logic_id, left_not_id, right_not_id))
 						incoming_refs = graph.incoming
 						changed = True
 						stats["demorgan_rewrites"] += 1
@@ -8504,7 +10517,7 @@ def fold_constant_expressions(project, stats, opts):
 						opts.folded_constant_expression_new_blocks[ti].update(new_ids)
 						for remove_id in folded_ids:
 							blocks.pop(remove_id, None)
-						graph.rebuild()
+						graph.refresh_blocks((block_id, *owned_ids))
 						incoming_refs = graph.incoming
 						folded += 1
 						changed = True
@@ -8548,7 +10561,7 @@ def fold_constant_expressions(project, stats, opts):
 					opts.folded_constant_expression_new_blocks[ti].update(new_ids)
 					for remove_id in owned_ids:
 						blocks.pop(remove_id, None)
-					graph.rebuild()
+					graph.refresh_blocks((block_id, *owned_ids))
 					incoming_refs = graph.incoming
 					folded += 1
 					changed = True
@@ -8931,9 +10944,17 @@ class Options:
 		simplify_boolean_control=False,
 		simplify_blocks=False,
 		deduplicate_assets=False,
+		compact_procedure_prototypes=False,
+		clear_procedure_definition_shadows=False,
 		optimize_procedure_arguments=False,
 		merge_duplicate_procedures=False,
+		inline_single_use_procedures=False,
+		procedure_inline_passes=8,
+		specialize_procedures=False,
+		procedure_specialization_passes=4,
+		procedure_specialization_min_calls=2,
 		branch_swapping=False,
+		branch_factoring=False,
 		trivial_loops=False,
 		nested_conditionals=False,
 		associative_constant_merging=False,
@@ -9006,8 +11027,9 @@ class Options:
 					or name in ("normalize_numbers", "convert_wav_to_mp3", "sort_keys",
 						"compact_numeric_inputs", "compact_field_ids", "compact_mutation_hasnext",
 						"compact_mutation_metadata", "deduplicate_assets", "group_similar_sequences",
-						"optimize_procedure_arguments", "merge_duplicate_procedures",
-						"branch_swapping", "trivial_loops", "nested_conditionals",
+						"optimize_procedure_arguments", "merge_duplicate_procedures", "inline_single_use_procedures", "specialize_procedures",
+						"compact_procedure_prototypes", "clear_procedure_definition_shadows",
+						"branch_swapping", "branch_factoring", "trivial_loops", "nested_conditionals",
 						"associative_constant_merging", "script_constant_propagation",
 						"compact_data_literals", "remove_unused_extensions",
 						"frequency_block_ids", "frequency_data_ids")
@@ -9072,9 +11094,23 @@ class Options:
 		self.simplify_boolean_control = simplify_boolean_control
 		self.simplify_blocks = simplify_blocks
 		self.deduplicate_assets = deduplicate_assets
+		self.compact_procedure_prototypes = compact_procedure_prototypes
+		self.clear_procedure_definition_shadows = clear_procedure_definition_shadows
 		self.optimize_procedure_arguments = optimize_procedure_arguments
 		self.merge_duplicate_procedures = merge_duplicate_procedures
+		self.inline_single_use_procedures = inline_single_use_procedures
+		self.procedure_inline_passes = int(procedure_inline_passes)
+		if self.procedure_inline_passes < 1:
+			raise ValueError("procedure_inline_passes must be positive")
+		self.specialize_procedures = specialize_procedures
+		self.procedure_specialization_passes = int(procedure_specialization_passes)
+		self.procedure_specialization_min_calls = int(procedure_specialization_min_calls)
+		if self.procedure_specialization_passes < 1:
+			raise ValueError("procedure_specialization_passes must be positive")
+		if self.procedure_specialization_min_calls < 2:
+			raise ValueError("procedure_specialization_min_calls must be at least 2")
 		self.branch_swapping = branch_swapping
+		self.branch_factoring = branch_factoring
 		self.trivial_loops = trivial_loops
 		self.nested_conditionals = nested_conditionals
 		self.associative_constant_merging = associative_constant_merging
@@ -9121,11 +11157,20 @@ class Options:
 		self.folded_constant_expression_new_blocks = []
 		self.constant_control_removed_blocks = []
 
+		self.procedure_prototype_compaction_removed_blocks = []
+		self.procedure_prototype_compaction_input_edits = {}
+		self.procedure_prototype_compaction_shadow_edits = {}
 		self.procedure_argument_mutation_edits = {}
 		self.procedure_argument_removed_inputs = {}
 		self.procedure_argument_input_edits = {}
 		self.procedure_argument_removed_blocks = []
 		self.merged_procedure_removed_blocks = []
+		self.inlined_procedure_removed_blocks = []
+		self.inlined_procedure_link_edits = {}
+		self.inlined_procedure_input_edits = {}
+		self.specialized_procedure_new_blocks = []
+		self.specialized_procedure_call_proccodes = {}
+		self.specialized_procedure_block_origins = {}
 
 		self.script_rewrite_removed_blocks = []
 		self.script_rewrite_new_blocks = []
@@ -9135,6 +11180,10 @@ class Options:
 		self.script_rewrite_removed_inputs = {}
 		self.removed_extensions = set()
 
+		self.unreachable_removed_blocks_first = []
+		self.unreachable_removed_blocks_second = []
+		self.unused_procedure_removed_blocks = []
+
 		self.grouped_sequence_removed_blocks = []
 		self.grouped_sequence_new_blocks = []
 		self.grouped_sequence_link_edits = {}
@@ -9142,68 +11191,137 @@ class Options:
 		self.grouped_sequence_rejected_size = 0
 
 
-def apply_transforms(project, opts: Options, assets=None):
+def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.lossless:
 		return Counter()
 	inherited_dangling = [_dangling_block_ids(target) for target in project.get("targets", [])]
+	progress = progress or ProgressBar(_progress_stage_count(opts))
+	stage = progress.next
+	stage("Normalize block defaults")
 	stats = minify_blocks(project)
 	if opts.convert_wav_to_mp3 and assets is not None:
+		stage('Convert WAV sounds to MP3')
 		opts.wav_conversions = convert_wav_sounds_to_mp3(project, assets, stats)
 	if opts.deduplicate_assets and assets is not None:
+		stage('Deduplicate assets')
 		opts.asset_deduplications = deduplicate_assets(project, assets, stats)
 	if opts.comments:
+		stage('Strip sprite comments')
 		strip_sprite_comments(project, stats)
 	if opts.positions:
+		stage('Round positions')
 		round_positions(project, stats)
 	if opts.covered:
+		stage('Reset covered shadow values')
 		clear_covered_values(project, stats)
 	if opts.monitors:
+		stage('Clean monitors')
 		clean_monitors(project, stats)
 	if opts.cleared_lists:
+		stage('Clear selected large lists')
 		clear_large_lists(project, opts.cleared_lists, stats)
 	if opts.remove_unreachable:
+		stage('Remove unreachable blocks')
+		before = [set((target.get("blocks") or {})) for target in project.get("targets", [])]
 		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_first")
+		opts.unreachable_removed_blocks_first = [
+			before[ti] - set((target.get("blocks") or {}))
+			for ti, target in enumerate(project.get("targets", []))
+		]
 	if opts.remove_unused_procedures:
+		stage('Remove unused procedures')
+		before = [set((target.get("blocks") or {})) for target in project.get("targets", [])]
 		remove_unused_procedures(project, stats)
+		opts.unused_procedure_removed_blocks = [
+			before[ti] - set((target.get("blocks") or {}))
+			for ti, target in enumerate(project.get("targets", []))
+		]
 	if opts.remove_unreachable or opts.remove_unused_procedures:
+		stage('Re-scan unreachable blocks')
+		before = [set((target.get("blocks") or {})) for target in project.get("targets", [])]
 		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_second")
+		opts.unreachable_removed_blocks_second = [
+			before[ti] - set((target.get("blocks") or {}))
+			for ti, target in enumerate(project.get("targets", []))
+		]
 	if opts.folded_constant_variables:
+		stage('Fold constant variables')
 		fold_constant_variables(project, opts.folded_constant_variables, stats)
 		remove_constant_variable_setters(
 			project, opts.folded_constant_variable_setters, stats, opts
 		)
 	if opts.script_constant_propagation:
+		stage('Propagate script constants')
 		propagate_script_constants(project, stats, opts)
-	if opts.branch_swapping or opts.trivial_loops or opts.nested_conditionals:
+	if opts.branch_swapping or opts.branch_factoring or opts.trivial_loops or opts.nested_conditionals:
+		stage('Rewrite script control structures')
 		simplify_script_structures(project, stats, opts)
 	if opts.associative_constant_merging:
+		stage('Merge associative constants')
 		merge_associative_constants(project, stats, opts)
+	if opts.specialize_procedures:
+		stage('Specialize custom procedures')
+		specialize_procedures(project, stats, opts)
 	if opts.fold_constant_expressions:
+		stage('Fold constant expressions')
 		fold_constant_expressions(project, stats, opts)
 	if opts.simplify_boolean_control:
+		stage('Simplify boolean control flow')
 		simplify_boolean_controls(project, stats, opts)
 	elif opts.trivial_loops:
+		stage('Simplify trivial boolean loops')
 		simplify_boolean_controls(project, stats, opts, only_repeat_one=True)
 	if opts.simplify_blocks:
+		stage('Simplify setter RHS blocks')
 		_simplify_setter_rhs_blocks(project, stats, opts)
 	if opts.group_similar_sequences:
+		stage('Group similar sequences')
 		group_similar_sequences(project, stats, opts.sequence_threshold, opts)
 	if opts.optimize_procedure_arguments:
+		stage('Optimize procedure arguments')
 		optimize_procedure_arguments(project, stats, opts)
+	if opts.clear_procedure_definition_shadows:
+		stage('Clear procedure definition shadows')
+		clear_procedure_definition_shadows(project, stats, opts)
+	if opts.compact_procedure_prototypes:
+		stage('Compact procedure prototypes')
+		compact_procedure_prototypes(project, stats, opts)
 	if opts.merge_duplicate_procedures:
+		stage('Merge duplicate procedures')
 		merge_duplicate_procedures(project, stats, opts)
+	if opts.inline_single_use_procedures:
+		stage('Inline safe single-use procedures')
+		inline_single_use_procedures(project, stats, opts)
 	if opts.remove_unused_procedures and (
-		opts.optimize_procedure_arguments or opts.merge_duplicate_procedures
+		opts.optimize_procedure_arguments
+		or opts.merge_duplicate_procedures
+		or opts.inline_single_use_procedures
+		or opts.specialize_procedures
 	):
+		stage("Remove procedures made unused")
+		before = [set((target.get("blocks") or {})) for target in project.get("targets", [])]
 		remove_unused_procedures(project, stats)
+		final_removed = [
+			before[ti] - set((target.get("blocks") or {}))
+			for ti, target in enumerate(project.get("targets", []))
+		]
+		if not hasattr(opts, "unused_procedure_removed_blocks"):
+			opts.unused_procedure_removed_blocks = [set() for _ in project.get("targets", [])]
+		for ti, removed_ids in enumerate(final_removed):
+			if ti >= len(opts.unused_procedure_removed_blocks):
+				opts.unused_procedure_removed_blocks.append(set())
+			opts.unused_procedure_removed_blocks[ti].update(removed_ids)
 	if opts.remove_unused_variables or opts.remove_unused_lists:
+		stage('Remove unused variables/lists')
 		remove_unused_data(
 			project, stats, opts.remove_unused_variables, opts.remove_unused_lists
 		)
+	stage("Repair dangling broadcast references")
 	opts.repaired_broadcast_ids, opts.broadcast_repair_conflicts = (
 		_repair_dangling_broadcast_refs(project, stats)
 	)
 	if opts.remove_unused_broadcasts:
+		stage('Remove unused broadcasts')
 		remove_unused_broadcasts(project, stats)
 	if (
 		opts.rename_identifiers
@@ -9213,6 +11331,7 @@ def apply_transforms(project, opts: Options, assets=None):
 		or opts.rename_argument_names
 		or opts.rename_procedure_names
 	):
+		stage('Rename identifiers')
 		opts.renamed_identifiers = rename_identifiers(
 			project,
 			stats,
@@ -9224,6 +11343,7 @@ def apply_transforms(project, opts: Options, assets=None):
 		)
 	used_data_ids = set()
 	if opts.rename_variable_ids or opts.rename_list_ids:
+		stage('Rename variable/list IDs')
 		opts.renamed_variable_ids, opts.renamed_list_ids = rename_variable_list_ids(
 			project,
 			stats,
@@ -9234,6 +11354,7 @@ def apply_transforms(project, opts: Options, assets=None):
 		used_data_ids.update(opts.renamed_variable_ids.values())
 		used_data_ids.update(opts.renamed_list_ids.values())
 	if opts.rename_broadcast_ids:
+		stage('Rename broadcast IDs')
 		opts.renamed_broadcast_ids = rename_broadcast_ids(
 			project,
 			stats,
@@ -9241,41 +11362,59 @@ def apply_transforms(project, opts: Options, assets=None):
 			frequency_order=opts.frequency_data_ids,
 		)
 	if opts.rename_argument_ids:
+		stage('Rename argument IDs')
 		opts.renamed_argument_ids = rename_argument_ids(project, stats)
 	if opts.rename_block_ids:
+		stage('Rename block IDs')
 		opts.renamed_block_ids = rename_block_ids(
 			project, stats, frequency_order=opts.frequency_block_ids
 		)
 	if opts.compact_numeric_inputs:
+		stage('Compact numeric inputs')
 		compact_numeric_inputs(project, stats)
 	if opts.compact_field_ids:
+		stage('Compact redundant field IDs')
 		compact_redundant_field_ids(project, stats)
 	if opts.compact_mutation_hasnext:
+		stage('Compact mutation hasnext')
 		compact_mutation_hasnext(project, stats)
 	if opts.compact_mutation_metadata:
+		stage('Compact mutation metadata')
 		compact_mutation_metadata(project, stats)
 	if opts.normalize_numbers:
+		stage('Normalize numbers')
 		normalize_numbers(project, stats, opts.normalize_epsilon)
 	if not opts.keep_sound_metadata:
+		stage('Remove sound metadata')
 		remove_sound_metadata(project, stats)
 	if opts.remove_empty_fields:
+		stage('Remove empty fields')
 		remove_empty_fields(project, stats)
 	if opts.remove_empty_inputs:
+		stage('Remove empty inputs')
 		remove_empty_inputs(project, stats)
 	if opts.remove_costume_metadata:
+		stage('Remove costume metadata')
 		remove_costume_metadata(project, stats, assets)
 	if opts.remove_default_target_properties:
+		stage('Remove default target properties')
 		remove_default_target_properties(project, stats)
 	if opts.remove_empty_target_containers:
+		stage('Remove empty target containers')
 		remove_empty_target_containers(project, stats)
 	if opts.remove_project_meta:
+		stage('Remove project metadata')
 		remove_project_meta(project, stats)
 	if opts.compact_data_literals:
+		stage('Compact data literals')
 		compact_data_literals(project, stats)
 	if opts.strip_reference_names:
+		stage('Strip reference names')
 		strip_reference_names(project, stats)
 	if opts.remove_unused_extensions:
+		stage('Remove unused extensions')
 		remove_unused_extensions(project, stats, opts)
+	stage("Repair dangling block links")
 	for ti, target in enumerate(project.get("targets", [])):
 		stats["dangling_block_refs_fixed"] += _repair_dangling_block_refs(target, preserve_comments=not opts.comments, preserve_refs=inherited_dangling[ti])
 	return stats
@@ -9457,6 +11596,130 @@ def _restore_argument_ids(project, mapping):
 			block["inputs"] = {local_rev.get(k, k): v for k, v in inputs.items()}
 
 
+def _restore_block_data_broadcast_ids(project, opts):
+	
+	targets = project.get("targets", [])
+	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
+
+	block_rev = {
+		ti: {new: old for old, new in (getattr(opts, "renamed_block_ids", {}) or {}).get(ti, {}).items()}
+		for ti in range(len(targets))
+	}
+	var_rev, list_rev = {}, {}
+	for (ti, old), new in (getattr(opts, "renamed_variable_ids", {}) or {}).items():
+		var_rev.setdefault(ti, {})[new] = old
+	for (ti, old), new in (getattr(opts, "renamed_list_ids", {}) or {}).items():
+		list_rev.setdefault(ti, {})[new] = old
+	broadcast_rev = {
+		new: old for old, new in (getattr(opts, "renamed_broadcast_ids", {}) or {}).items()
+	}
+
+	current_var_ids = [set((t.get("variables") or {}).keys()) for t in targets]
+	current_list_ids = [set((t.get("lists") or {}).keys()) for t in targets]
+
+	def restore_var(ti, value):
+		if not isinstance(value, str):
+			return value
+		if value in current_var_ids[ti]:
+			return var_rev.get(ti, {}).get(value, value)
+		if stage_index is not None and value in current_var_ids[stage_index]:
+			return var_rev.get(stage_index, {}).get(value, value)
+		return value
+
+	def restore_list(ti, value):
+		if not isinstance(value, str):
+			return value
+		if value in current_list_ids[ti]:
+			return list_rev.get(ti, {}).get(value, value)
+		if stage_index is not None and value in current_list_ids[stage_index]:
+			return list_rev.get(stage_index, {}).get(value, value)
+		return value
+
+	def restore_nested(ti, value):
+		if isinstance(value, list):
+			if len(value) > 2 and value[0] == 12 and isinstance(value[2], str):
+				value[2] = restore_var(ti, value[2])
+				return
+			if len(value) > 2 and value[0] == 13 and isinstance(value[2], str):
+				value[2] = restore_list(ti, value[2])
+				return
+			if len(value) > 2 and value[0] == 11 and isinstance(value[2], str):
+				value[2] = broadcast_rev.get(value[2], value[2])
+				return
+			if value and value[0] in (1, 2, 3):
+				positions = (1, 2) if value[0] == 3 else (1,)
+				for index in positions:
+					if index >= len(value):
+						continue
+					item = value[index]
+					if isinstance(item, str):
+						value[index] = block_rev.get(ti, {}).get(item, item)
+					elif isinstance(item, (list, dict)):
+						restore_nested(ti, item)
+				return
+			for child in value:
+				if isinstance(child, (list, dict)):
+					restore_nested(ti, child)
+		elif isinstance(value, dict):
+			for child in value.values():
+				if isinstance(child, (list, dict)):
+					restore_nested(ti, child)
+
+	for ti, target in enumerate(targets):
+		vmap = var_rev.get(ti, {})
+		lmap = list_rev.get(ti, {})
+		if vmap:
+			target["variables"] = {vmap.get(k, k): v for k, v in (target.get("variables") or {}).items()}
+		if lmap:
+			target["lists"] = {lmap.get(k, k): v for k, v in (target.get("lists") or {}).items()}
+		if broadcast_rev and target.get("broadcasts"):
+			target["broadcasts"] = {broadcast_rev.get(k, k): v for k, v in target["broadcasts"].items()}
+
+		bmap = block_rev.get(ti, {})
+		blocks = target.get("blocks") or {}
+		if bmap:
+			blocks = {bmap.get(current_id, current_id): block for current_id, block in blocks.items()}
+			target["blocks"] = blocks
+		for block in blocks.values():
+			if isinstance(block, list):
+				if len(block) > 2 and block[0] == 12 and isinstance(block[2], str):
+					block[2] = restore_var(ti, block[2])
+				elif len(block) > 2 and block[0] == 13 and isinstance(block[2], str):
+					block[2] = restore_list(ti, block[2])
+				continue
+			if not isinstance(block, dict):
+				continue
+			for key in ("next", "parent"):
+				if isinstance(block.get(key), str):
+					block[key] = bmap.get(block[key], block[key])
+			fields = block.get("fields") or {}
+			f = fields.get("VARIABLE")
+			if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str):
+				f[1] = restore_var(ti, f[1])
+			f = fields.get("LIST")
+			if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str):
+				f[1] = restore_list(ti, f[1])
+			for field_name in ("BROADCAST_OPTION", "BROADCAST_INPUT"):
+				f = fields.get(field_name)
+				if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str):
+					f[1] = broadcast_rev.get(f[1], f[1])
+			for value in (block.get("inputs") or {}).values():
+				restore_nested(ti, value)
+
+	name_to_index = {t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")}
+	for monitor in project.get("monitors", []):
+		if not isinstance(monitor, dict):
+			continue
+		sprite = monitor.get("spriteName")
+		ti = name_to_index.get(sprite, stage_index) if sprite else stage_index
+		if ti is None:
+			continue
+		if monitor.get("opcode") == "data_variable":
+			monitor["id"] = restore_var(ti, monitor.get("id"))
+		elif monitor.get("opcode") == "data_listcontents":
+			monitor["id"] = restore_list(ti, monitor.get("id"))
+
+
 def _num_eq(a, b, epsilon=0):
 	"""Compare JSON numbers by decimal value, optionally allowing normalization epsilon.
 
@@ -9493,7 +11756,6 @@ def _num_eq(a, b, epsilon=0):
 
 
 def _position_num_eq(original, minified):
-	"""Match the exact numeric transformation performed by ``round_positions``."""
 	if _num_eq(original, minified):
 		return True
 	if (
@@ -9600,7 +11862,7 @@ def _check_block_references_resolve(project, original=None):
 	return None
 
 
-def _check_argument_id_consistency(target, where):
+def _check_argument_id_consistency(target, where, opts=None):
 	for bid, b in target.get("blocks", {}).items():
 		if not isinstance(b, dict) or b.get("opcode") not in (
 			"procedures_prototype",
@@ -9609,6 +11871,12 @@ def _check_argument_id_consistency(target, where):
 			continue
 		vals = _parse_argumentids(b.get("mutation"))
 		if vals is None:
+			continue
+		if (
+			b.get("opcode") == "procedures_prototype"
+			and getattr(opts, "compact_procedure_prototypes", False)
+			and not (b.get("inputs") or {})
+		):
 			continue
 		if set(vals) != set((b.get("inputs") or {}).keys()):
 			return (
@@ -9634,10 +11902,6 @@ def _input_val_eq(vo, vm, opts):
 	if opts.normalize_numbers and (_num_eq(vo, vm, opts.normalize_epsilon) or vo == vm):
 		return True
 
-	# The JSON layout optimizer can spell an integral number using exponent
-	# notation (for example 10000 -> 1e4), which changes only the Python
-	# int/float type returned by json.loads. Accept that exact numeric
-	# re-encoding when JSON optimization is enabled.
 	if getattr(opts, "optimize_json", False):
 		if (
 			isinstance(vo, (int, float))
@@ -9655,7 +11919,6 @@ def _input_val_eq(vo, vm, opts):
 
 	if opts.compact_numeric_inputs:
 		if isinstance(vo, str) and isinstance(vm, (int, float)) and not isinstance(vm, bool):
-			# Mirror the integer branch of compact_numeric_inputs exactly.
 			try:
 				iv = int(vo)
 			except (ValueError, OverflowError):
@@ -9665,7 +11928,6 @@ def _input_val_eq(vo, vm, opts):
 					return False
 				return Decimal(str(iv)) == Decimal(str(vm))
 
-			# Mirror the float branch of compact_numeric_inputs exactly.
 			try:
 				fv = float(vo)
 			except (ValueError, OverflowError):
@@ -9859,7 +12121,12 @@ def _check_fields_match(original_fields, minified_fields, opts):
 	return True
 
 
-def _check_mutation_match(original_mutation, minified_mutation, opts):
+@lru_cache(maxsize=4096)
+def _cached_json_loads(value):
+	return json.loads(value)
+
+
+def _check_mutation_match(original_mutation, minified_mutation, opts, target_index=None, block_id=None):
 	if original_mutation == minified_mutation:
 		return True
 	if not (
@@ -9890,6 +12157,11 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 				continue
 			return False
 		mv = minified_mutation[key]
+		if key == "proccode" and target_index is not None and block_id is not None:
+			specialized_calls = getattr(opts, "specialized_procedure_call_proccodes", {}) or {}
+			expected_specialized = specialized_calls.get((target_index, block_id))
+			if expected_specialized is not None and mv == expected_specialized:
+				continue
 		if ov == mv:
 			continue
 		if (
@@ -9902,7 +12174,7 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 			and isinstance(mv, str)
 		):
 			try:
-				if json.loads(ov) == json.loads(mv):
+				if _cached_json_loads(ov) == _cached_json_loads(mv):
 					continue
 			except (TypeError, ValueError):
 				pass
@@ -9920,6 +12192,8 @@ def _check_blocks(
 	target_index=None,
 	block_id=None,
 ):
+	if o == m:
+		return None
 	remaining_blocks = (
 		remaining_blocks if remaining_blocks is not None else set(original_blocks or ())
 	)
@@ -9928,7 +12202,11 @@ def _check_blocks(
 		extra = set(m) - set(o)
 		if extra or not (opts.comments and gone <= {"comment"}):
 			return f"{where} (opcode: {o.get('opcode')}): block keys changed. Missing keys: {sorted(gone)}, unexpected extra keys: {sorted(extra)}"
-	allow_repairs = opts.remove_unreachable or opts.remove_unused_procedures
+	allow_repairs = (
+		opts.remove_unreachable
+		or opts.remove_unused_procedures
+		or getattr(opts, "inline_single_use_procedures", False)
+	)
 	for k in o:
 		if k not in m:
 			continue
@@ -9950,6 +12228,12 @@ def _check_blocks(
 		elif k == "fields":
 			if not _check_fields_match(o[k], m[k], opts):
 				return f"{where} (opcode: {o.get('opcode')}): fields changed from original {o[k]!r} to minified {m[k]!r}"
+		elif k == "shadow":
+			prototype_shadows = getattr(opts, "procedure_prototype_compaction_shadow_edits", {}) or {}
+			if (target_index, block_id) in prototype_shadows and m[k] is False:
+				continue
+			if o[k] != m[k]:
+				return f"{where} (opcode: {o.get('opcode')}): property {k!r} changed from original {o[k]!r} to minified {m[k]!r}"
 		elif k == "mutation":
 			procedure_mutations = getattr(opts, "procedure_argument_mutation_edits", {}) or {}
 			procedure_mutation = procedure_mutations.get((target_index, block_id))
@@ -9960,9 +12244,9 @@ def _check_blocks(
 						expected_mutation["warp"] = "true"
 					elif expected_mutation.get("warp") is False:
 						expected_mutation["warp"] = "false"
-				if _check_mutation_match(expected_mutation, m[k], opts):
+				if _check_mutation_match(expected_mutation, m[k], opts, target_index, block_id):
 					continue
-			if not _check_mutation_match(o[k], m[k], opts):
+			if not _check_mutation_match(o[k], m[k], opts, target_index, block_id):
 				return f"{where} (opcode: {o.get('opcode')}): mutation changed from original {o[k]!r} to minified {m[k]!r}"
 		elif k in ("x", "y") and opts.positions:
 			if not _position_num_eq(o[k], m[k]) and o[k] != m[k]:
@@ -9981,42 +12265,50 @@ def _check_blocks(
 			procedure_removed = getattr(opts, "procedure_argument_removed_inputs", {}) or {}
 			allowed_procedure_removed = procedure_removed.get((target_index, block_id), set())
 			allowed_gone.update(gone_inputs & set(allowed_procedure_removed))
+			prototype_inputs = getattr(opts, "procedure_prototype_compaction_input_edits", {}) or {}
+			prototype_edit = prototype_inputs.get((target_index, block_id))
+			if prototype_edit is not None:
+				if o.get("opcode") == "procedures_prototype" and m.get("inputs") == {}:
+					allowed_gone.update(gone_inputs)
+				elif isinstance(prototype_edit, dict):
+					for name, expected in prototype_edit.items():
+						if name in o.get("inputs", {}) and m.get("inputs", {}).get(name) == expected:
+							continue
+						return f"{where} (opcode: {o.get('opcode')}): input {name!r} changed unexpectedly during procedure prototype compaction"
 			script_removed_inputs = getattr(opts, "script_rewrite_removed_inputs", {}) or {}
 			allowed_gone.update(gone_inputs & set(script_removed_inputs.get((target_index, block_id), set())))
 
-			# Schema-changing script rewrites may rename an input slot along with the opcode.
-			# In particular, control_if_else -> control_if moves the surviving else branch
-			# from SUBSTACK2 to SUBSTACK. A later pass may legitimately update that same
-			# surviving input, so accept either the final value as directly equivalent to the
-			# original value, or the optimizer's recorded input edit as the provenance.
 			script_opcodes = getattr(opts, "script_rewrite_opcode_edits", {}) or {}
 			expected_script_opcode = script_opcodes.get((target_index, block_id))
 			script_input_edits = getattr(opts, "script_rewrite_input_edits", {}) or {}
 			recorded_substack = script_input_edits.get((target_index, block_id, "SUBSTACK"))
 			script_removed = getattr(opts, "script_rewrite_removed_inputs", {}) or {}
 			recorded_removed = set(script_removed.get((target_index, block_id), set()))
+			schema_match = False
 			if (
 				o.get("opcode") == "control_if_else"
 				and expected_script_opcode == "control_if"
 				and gone_inputs == {"SUBSTACK2"}
 				and extra_inputs == {"SUBSTACK"}
 				and "SUBSTACK2" in recorded_removed
-				and (
-					_check_inputs_match(
-						o["inputs"]["SUBSTACK2"],
-						m["inputs"]["SUBSTACK"],
-						opts, original_blocks, remaining_blocks, target_index
-					)
-					or (
-						recorded_substack is not None
-						and _check_inputs_match(
-							recorded_substack,
-						m["inputs"]["SUBSTACK"],
-						opts, original_blocks, remaining_blocks, target_index
-						)
-					)
-				)
 			):
+				schema_match = _check_inputs_match(
+					o["inputs"]["SUBSTACK2"],
+					m["inputs"]["SUBSTACK"],
+					opts, original_blocks, remaining_blocks, target_index
+				)
+				if not schema_match and recorded_substack is not None:
+					schema_match = _check_inputs_match(
+					recorded_substack,
+					m["inputs"]["SUBSTACK"],
+					opts, original_blocks, remaining_blocks, target_index
+				)
+				if not schema_match:
+					inlined_substack = (
+						getattr(opts, "inlined_procedure_input_edits", {}) or {}
+					).get((target_index, block_id, "SUBSTACK"))
+					schema_match = inlined_substack is not None and inlined_substack == m["inputs"]["SUBSTACK"]
+			if schema_match:
 				gone_inputs.clear()
 				extra_inputs.clear()
 
@@ -10050,6 +12342,20 @@ def _check_blocks(
 						remaining_blocks,
 						target_index,
 					)
+				):
+					continue
+				inlined_inputs = getattr(opts, "inlined_procedure_input_edits", {}) or {}
+				inlined_input = inlined_inputs.get((target_index, block_id, name))
+				if inlined_input is not None and (
+					inlined_input == mi
+					or _check_inputs_match(
+						inlined_input,
+					mi,
+					opts,
+					original_blocks,
+					remaining_blocks,
+					target_index,
+				)
 				):
 					continue
 				folded_inputs = getattr(opts, "folded_constant_expression_inputs", {})
@@ -10110,17 +12416,31 @@ def _check_blocks(
 			simplified_link_edits = getattr(opts, "simplified_block_link_edits", None) or {}
 			if k in ("next", "parent"):
 				link_key = (target_index, block_id, k)
-				expected_link = link_edits.get(link_key)
-				if expected_link is None:
-					expected_link = fold_link_edits.get(link_key)
-				if expected_link is None:
-					expected_link = group_link_edits.get(link_key)
-				if expected_link is None:
-					expected_link = simplified_link_edits.get(link_key)
-				if expected_link is None:
-					expected_link = script_link_edits.get(link_key)
-				if expected_link is not None and m[k] == expected_link:
+				found_link = False
+				expected_link = None
+				for mapping in (
+					link_edits,
+					fold_link_edits,
+					getattr(opts, "inlined_procedure_link_edits", {}) or {},
+					group_link_edits,
+					simplified_link_edits,
+					script_link_edits,
+				):
+					if link_key in mapping:
+						expected_link = mapping[link_key]
+						found_link = True
+						break
+				if found_link and m[k] == expected_link:
 					continue
+			if (
+				k == "parent"
+				and m[k] is None
+				and isinstance(o[k], str)
+				and _is_known_orphan_argument_reporter(o, original_blocks or {})
+				and o[k] not in (original_blocks or {})
+			):
+				continue
+			
 			if (
 				allow_repairs
 				and k in ("next", "parent")
@@ -10180,7 +12500,7 @@ def _asset_filename(entry, kind):
 	return None
 
 
-def _validate_asset_entries(project, zf, label):
+def _validate_asset_entries(project, zf, label, payload_cache=None):
 	try:
 		names, err = _zip_entry_names(zf)
 	except Exception as exc:
@@ -10223,7 +12543,12 @@ def _validate_asset_entries(project, zf, label):
 
 				if filename not in names:
 					return f"{where}: referenced asset {filename!r} is missing from archive"
-				payload = zf.read(filename)
+				if payload_cache is not None and filename in payload_cache:
+					payload = payload_cache[filename]
+				else:
+					payload = zf.read(filename)
+					if payload_cache is not None:
+						payload_cache[filename] = payload
 				actual_id = hashlib.md5(payload).hexdigest()
 				if actual_id.lower() != entry["assetId"].lower():
 					return (
@@ -10538,10 +12863,19 @@ def _expected_removed_blocks(project, opts):
 	allowed = []
 	for ti, target in enumerate(project.get("targets", [])):
 		ids = set()
-		if opts.remove_unreachable:
+		first_removed = getattr(opts, "unreachable_removed_blocks_first", None) or []
+		second_removed = getattr(opts, "unreachable_removed_blocks_second", None) or []
+		procedure_removed = getattr(opts, "unused_procedure_removed_blocks", None) or []
+		if opts.remove_unreachable and ti < len(first_removed):
+			ids.update(first_removed[ti])
+		elif opts.remove_unreachable:
 			ids.update(set(target.get("blocks", {})) - _reachable_block_ids(target))
-		if opts.remove_unused_procedures:
+		if opts.remove_unused_procedures and ti < len(procedure_removed):
+			ids.update(procedure_removed[ti])
+		elif opts.remove_unused_procedures:
 			ids.update(_dead_procedure_block_ids(target))
+		if (opts.remove_unreachable or opts.remove_unused_procedures) and ti < len(second_removed):
+			ids.update(second_removed[ti])
 		folded_blocks = getattr(opts, "folded_constant_expression_blocks", ())
 		if ti < len(folded_blocks):
 			ids.update(folded_blocks[ti])
@@ -10560,9 +12894,15 @@ def _expected_removed_blocks(project, opts):
 		procedure_arg_removed = getattr(opts, "procedure_argument_removed_blocks", ())
 		if ti < len(procedure_arg_removed):
 			ids.update(procedure_arg_removed[ti])
+		prototype_removed = getattr(opts, "procedure_prototype_compaction_removed_blocks", ())
+		if ti < len(prototype_removed):
+			ids.update(prototype_removed[ti])
 		merged_removed = getattr(opts, "merged_procedure_removed_blocks", ())
 		if ti < len(merged_removed):
 			ids.update(merged_removed[ti])
+		inlined_removed = getattr(opts, "inlined_procedure_removed_blocks", ())
+		if ti < len(inlined_removed):
+			ids.update(inlined_removed[ti])
 		script_removed = getattr(opts, "script_rewrite_removed_blocks", ())
 		if ti < len(script_removed):
 			ids.update(script_removed[ti])
@@ -10593,7 +12933,6 @@ def _target_default_properties(target):
 	}
 
 
-
 def _reference_primitive_head_equal(original, minified, opts):
 	if not (isinstance(original, list) and isinstance(minified, list)):
 		return False
@@ -10609,14 +12948,190 @@ def _reference_primitive_head_equal(original, minified, opts):
 		and original[2] == minified[2]
 	)
 
+
+VERIFY_PARALLEL_MIN_BLOCKS = 3000
+VERIFY_PARALLEL_MAX_WORKERS = 4
+_VERIFY_WORKER_STATE = None
+_VERIFY_WORKER_STATE_PATH = None
+
+
+_VERIFY_BLOCK_OPT_ATTRS = (
+	"comments", "positions", "covered", "remove_unreachable",
+	"remove_unused_procedures", "compact_field_ids",
+	"compact_mutation_hasnext", "compact_mutation_metadata",
+	"rename_argument_ids", "strip_reference_names", "normalize_epsilon",
+	"normalize_numbers", "optimize_json", "minimum_json", "compact_numeric_inputs",
+	"inline_single_use_procedures", "specialize_procedures",
+)
+_VERIFY_BLOCK_MAP_ATTRS = (
+	"variable_setter_input_edits", "variable_setter_link_edits",
+	"procedure_prototype_compaction_input_edits", "procedure_prototype_compaction_shadow_edits",
+	"procedure_argument_input_edits", "procedure_argument_mutation_edits",
+	"procedure_argument_removed_inputs",
+	"folded_constant_expression_inputs", "folded_constant_expression_link_edits",
+	"folded_constant_expression_opcode_edits",
+	"grouped_sequence_input_edits", "grouped_sequence_link_edits",
+	"inlined_procedure_input_edits", "inlined_procedure_link_edits",
+	"specialized_procedure_call_proccodes",
+	"script_rewrite_input_edits", "script_rewrite_link_edits",
+	"script_rewrite_opcode_edits", "script_rewrite_removed_inputs",
+	"simplified_block_input_edits", "simplified_block_link_edits",
+	"simplified_block_opcode_edits", "folded_constant_variables",
+	"folded_constant_variable_literals",
+)
+
+def _filter_verify_map(mapping, target_index):
+	if not isinstance(mapping, dict):
+		return {}
+	return {
+		key: value
+		for key, value in mapping.items()
+		if isinstance(key, tuple) and key and key[0] == target_index
+	}
+
+
+def _make_verify_worker_state(to, tm, opts, target_index, changed):
+	attrs = {}
+	for name in _VERIFY_BLOCK_OPT_ATTRS:
+		attrs[name] = getattr(opts, name, False)
+	for name in _VERIFY_BLOCK_MAP_ATTRS:
+		value = getattr(opts, name, None)
+		if name in ("folded_constant_variables", "folded_constant_variable_literals"):
+			attrs[name] = dict(value) if isinstance(value, dict) else {}
+		else:
+			attrs[name] = _filter_verify_map(value, target_index)
+
+	verify_project = getattr(opts, "_verify_project", None) or {}
+	owner_targets = [
+		{
+			"variables": target.get("variables", {}),
+			"isStage": bool(target.get("isStage", False)),
+		}
+		for target in verify_project.get("targets", [])
+		if isinstance(target, dict)
+	]
+	attrs["_verify_project"] = {"targets": owner_targets}
+
+	return {
+		"checks": changed,
+		"remaining_blocks": set(tm.get("blocks", {})),
+		"target_index": target_index,
+		"target_name": to.get("name", f"target_{target_index}"),
+		"opts": SimpleNamespace(**attrs),
+	}
+
+
+def _init_verify_worker(state_path):
+	global _VERIFY_WORKER_STATE, _VERIFY_WORKER_STATE_PATH
+	if _VERIFY_WORKER_STATE_PATH != state_path:
+		with open(state_path, "rb") as handle:
+			_VERIFY_WORKER_STATE = pickle.load(handle)
+		_VERIFY_WORKER_STATE_PATH = state_path
+
+
+def _verify_one_changed_block(item, state):
+	position, bid, bo, bm = item
+	opts = state["opts"]
+	target_index = state["target_index"]
+	target_name = state["target_name"]
+	remaining_blocks = state["remaining_blocks"]
+	where = f"Target {target_index} ({target_name!r})"
+
+	if isinstance(bo, list) or isinstance(bm, list):
+		ok = (
+			isinstance(bo, list)
+			and isinstance(bm, list)
+			and len(bo) == len(bm)
+			and _reference_primitive_head_equal(bo, bm, opts)
+			and all(_num_eq(x, y, opts.normalize_epsilon) or x == y for x, y in zip(bo[3:], bm[3:]))
+		)
+		if not (ok and (opts.positions or bo == bm)):
+			return position, f"{where}, primitive block {bid!r} changed from {bo!r} to {bm!r}"
+		return None
+
+	err = _check_blocks(
+		bo, bm, opts, f"{where}, block {bid!r}",
+		None, remaining_blocks, target_index, bid
+	)
+	if err:
+		return position, err
+	if not isinstance(bm.get("inputs"), dict) or not isinstance(bm.get("fields"), dict):
+		return position, f"{where}, block {bid!r} ({bm.get('opcode')}): inputs or fields is not a dict (violates Scratch VM format)"
+	if "next" not in bm or "parent" not in bm:
+		return position, f"{where}, block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute"
+	mu = bm.get("mutation")
+	if mu is not None:
+		if not isinstance(mu, dict):
+			return position, f"{where}, block {bid!r} ({bm.get('opcode')}): mutation is not an object"
+		if not getattr(opts, "compact_mutation_metadata", False) and ("tagName" not in mu or "children" not in mu):
+			return position, f"{where}, block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children"
+	return None
+
+
+def _verify_block_chunk(bounds):
+	state = _VERIFY_WORKER_STATE
+	start, stop = bounds
+	checks = state["checks"]
+	for index in range(start, stop):
+		result = _verify_one_changed_block(checks[index], state)
+		if result is not None:
+			return result
+	return None
+
+
+def _verify_target_blocks_parallel(to, tm, opts, target_index):
+	original_blocks = to.get("blocks", {})
+	minified_blocks = tm.get("blocks", {})
+	changed = []
+
+	for position, bid in enumerate(original_blocks):
+		if bid not in minified_blocks:
+			continue
+		bo = original_blocks[bid]
+		bm = minified_blocks[bid]
+		if bo != bm:
+			changed.append((position, bid, bo, bm))
+
+	if not changed:
+		return None
+
+	if len(changed) < 1200:
+		state = _make_verify_worker_state(to, tm, opts, target_index, changed)
+		for item in changed:
+			result = _verify_one_changed_block(item, state)
+			if result is not None:
+				return result[1]
+		return None
+
+	workers = min(VERIFY_PARALLEL_MAX_WORKERS, max(2, (os.cpu_count() or 2) - 1))
+	chunk_count = min(len(changed), workers * 2)
+	chunk_size = (len(changed) + chunk_count - 1) // chunk_count
+	state = _make_verify_worker_state(to, tm, opts, target_index, changed)
+
+	with tempfile.TemporaryDirectory(prefix=".minify-verify-") as temp_dir:
+		state_path = os.path.join(temp_dir, "state.pkl")
+		with open(state_path, "wb") as handle:
+			pickle.dump(state, handle, protocol=pickle.HIGHEST_PROTOCOL)
+		bounds = [
+			(start, min(start + chunk_size, len(changed)))
+			for start in range(0, len(changed), chunk_size)
+		]
+		results = []
+		with ProcessPoolExecutor(max_workers=workers, initializer=_init_verify_worker, initargs=(state_path,)) as pool:
+			for result in pool.map(_verify_block_chunk, bounds):
+				if result is not None:
+					results.append(result)
+		if results:
+			return min(results, key=lambda item: item[0])[1]
+	return None
+
+
 def verify(original_path, minified_path, opts):
 	if opts.lossless:
 		return _verify_lossless(original_path, minified_path, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids, opts.strip_reference_names, opts.prune_orphan_arguments, opts.compact_procedure_symbols, opts.compact_reporter_defaults, opts.strip_covered_shadows, opts.strip_editor_comments, opts.strip_script_positions, opts.prune_unused_data, opts.rebuild_procedure_displays, opts.compact_terminal_links)
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
-		if a.testzip() is not None:
-			return False, f"input zip '{original_path}' failed CRC test"
-		if b.testzip() is not None:
-			return False, f"output zip '{minified_path}' failed CRC test"
+		# All project and asset members are read later; zipfile.read() validates their
+		# CRCs, so a separate testzip() pass would decompress the same data again.
 		for zf, zpath in ((a, original_path), (b, minified_path)):
 			names, err = _zip_entry_names(zf)
 			if err:
@@ -10625,6 +13140,8 @@ def verify(original_path, minified_path, opts):
 				return False, f"archive '{zpath}' has no project.json"
 		orig_assets = {name for name in a.namelist() if name != "project.json"}
 		mini_assets = {name for name in b.namelist() if name != "project.json"}
+		original_asset_cache = {}
+		minified_asset_cache = {}
 		conversions = getattr(opts, "wav_conversions", {}) or {}
 		expected_assets = {
 			_final_asset_name(conversions.get(name, name), opts)
@@ -10640,7 +13157,10 @@ def verify(original_path, minified_path, opts):
 		for name in orig_assets:
 			if name in conversions:
 				new_name = _final_asset_name(conversions[name], opts)
-				new_bytes = b.read(new_name)
+				new_bytes = minified_asset_cache.get(new_name)
+				if new_bytes is None:
+					new_bytes = b.read(new_name)
+					minified_asset_cache[new_name] = new_bytes
 				if hashlib.md5(new_bytes).hexdigest() != new_name.rsplit(".", 1)[0]:
 					return (
 						False,
@@ -10648,13 +13168,21 @@ def verify(original_path, minified_path, opts):
 					)
 			else:
 				final_name = _final_asset_name(name, opts)
+				original_bytes = original_asset_cache.get(name)
+				if original_bytes is None:
+					original_bytes = a.read(name)
+					original_asset_cache[name] = original_bytes
+				minified_bytes = minified_asset_cache.get(final_name)
+				if minified_bytes is None:
+					minified_bytes = b.read(final_name)
+					minified_asset_cache[final_name] = minified_bytes
 				if final_name != name:
-					if a.read(name) != b.read(final_name):
+					if original_bytes != minified_bytes:
 						return (False, f"deduplicated asset byte mismatch: {name!r} -> {final_name!r}")
-				elif a.read(name) != b.read(name):
+				elif original_bytes != minified_bytes:
 					return (
 						False,
-						f"asset byte-for-byte mismatch: {name!r} ({len(a.read(name))} bytes vs {len(b.read(name))} bytes)",
+						f"asset byte-for-byte mismatch: {name!r} ({len(original_bytes)} bytes vs {len(minified_bytes)} bytes)",
 					)
 
 		try:
@@ -10672,7 +13200,7 @@ def verify(original_path, minified_path, opts):
 		mini = _reinflate(mini_raw_project)
 		opts._verify_project = orig
 
-		err = _validate_asset_entries(mini, b, "minified project")
+		err = _validate_asset_entries(mini, b, "minified project", minified_asset_cache)
 		if err:
 			return False, err
 		err = _validate_asset_entries(orig, a, "original project")
@@ -10997,6 +13525,9 @@ def verify(original_path, minified_path, opts):
 			if ti < len(group_new_block_sets):
 				allowed_new_blocks = set(allowed_new_blocks) | set(group_new_block_sets[ti])
 			script_new_block_sets = getattr(opts, "script_rewrite_new_blocks", None) or []
+		specialized_new_block_sets = getattr(opts, "specialized_procedure_new_blocks", None) or []
+		if ti < len(specialized_new_block_sets):
+			allowed_new_blocks = set(allowed_new_blocks) | set(specialized_new_block_sets[ti])
 			if ti < len(script_new_block_sets):
 				allowed_new_blocks = set(allowed_new_blocks) | set(script_new_block_sets[ti])
 			unexpected_blocks = (
@@ -11015,62 +13546,9 @@ def verify(original_path, minified_path, opts):
 					f"Target {ti} ({name!r}): block(s) were removed even though the original "
 					f"project proves they were reachable/live: {sorted(illegal_missing)[:10]}"
 				)
-			for bid, bo in to["blocks"].items():
-				if bid not in tm["blocks"]:
-					continue
-				bm = tm["blocks"][bid]
-				if isinstance(bo, list) or isinstance(bm, list):
-					ok = (
-						isinstance(bo, list)
-						and isinstance(bm, list)
-						and len(bo) == len(bm)
-						and _reference_primitive_head_equal(bo, bm, opts)
-						and all(_num_eq(x, y, opts.normalize_epsilon) or x == y for x, y in zip(bo[3:], bm[3:]))
-					)
-					if not (ok and (opts.positions or bo == bm)):
-						return (
-							False,
-							f"Target {ti} ({name!r}), primitive block {bid!r} changed from {bo!r} to {bm!r}",
-						)
-					continue
-				err = _check_blocks(
-					bo,
-					bm,
-					opts,
-					f"Target {ti} ({name!r}), block {bid!r}",
-					to["blocks"],
-					set(tm["blocks"]),
-					ti,
-					bid,
-				)
-				if err:
-					return False, err
-				if not isinstance(bm.get("inputs"), dict) or not isinstance(
-					bm.get("fields"), dict
-				):
-					return (
-						False,
-						f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): inputs or fields is not a dict (violates Scratch VM format)",
-					)
-				if "next" not in bm or "parent" not in bm:
-					return (
-						False,
-						f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute",
-					)
-				mu = bm.get("mutation")
-				if mu is not None:
-					if not isinstance(mu, dict):
-						return (
-							False,
-							f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): mutation is not an object",
-						)
-					if not opts.compact_mutation_metadata and (
-						"tagName" not in mu or "children" not in mu
-					):
-						return (
-							False,
-							f"Target {ti} ({name!r}), block {bid!r} ({bm.get('opcode')}): lost required mutation tagName or children",
-						)
+			err = _verify_target_blocks_parallel(to, tm, opts, ti)
+			if err:
+				return False, err
 
 			co, cm = to.get("comments", {}), tm.get("comments", {})
 			if not isinstance(cm, dict):
@@ -11142,8 +13620,8 @@ def verify(original_path, minified_path, opts):
 			if err:
 				return False, err
 
-			if _check_argument_id_consistency(to, name) is None:
-				err = _check_argument_id_consistency(tm, name)
+			if _check_argument_id_consistency(to, name, opts) is None:
+				err = _check_argument_id_consistency(tm, name, opts)
 				if err:
 					return False, err
 
@@ -11204,15 +13682,16 @@ def _check_monitors(orig, mini, opts):
 		return (m.get("id"), m.get("spriteName"), m.get("opcode"))
 
 	by_key = {key(m): m for m in mo}
-	order = [key(m) for m in mo]
+	order_index = {key(m): i for i, m in enumerate(mo)}
 	prev = -1
 	for m in mm:
 		k = key(m)
 		if k not in by_key:
 			return f"Monitor {k} appeared in minified project but was not present in original"
-		if order.index(k) < prev:
+		position = order_index[k]
+		if position < prev:
 			return f"Monitor {k} order changed in project monitors list"
-		prev = order.index(k)
+		prev = position
 		o = by_key[k]
 		for f in set(o) | set(m):
 			if o.get(f) == m.get(f):
@@ -11466,8 +13945,40 @@ def _print_transform_stats(stats, opts):
 					("control_branch_blocks_removed", "branch/condition blocks removed"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.branch_factoring:
+				print(Ansi.subheading("  12d. Factor common branch sequences"))
+				for key, label in (
+					("branch_prefixes_factored", "common prefixes factored"),
+					("branch_suffixes_factored", "common suffixes factored"),
+					("branch_controls_factored", "identical conditionals eliminated"),
+					("branch_factor_blocks_removed", "duplicate branch blocks removed"),
+					("branch_factor_bytes_saved", "branch factoring JSON bytes saved"),
+					("branch_factor_rejected_size", "candidates rejected for size"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.specialize_procedures:
+				print(Ansi.subheading("  12d. Specialize custom procedures"))
+				for key, label in (
+					("procedure_specialized", "procedure variants specialized"),
+					("procedure_specialization_calls", "calls rewritten to specialized variants"),
+					("procedure_specialization_blocks_added", "specialized blocks added"),
+					("procedure_specialization_blocks_removed", "generic procedure blocks replaced"),
+					("procedure_specialization_argument_reporters_removed", "constant argument reporters removed"),
+					("procedure_specialization_passes", "specialization passes completed"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.clear_procedure_definition_shadows:
+				print(Ansi.subheading("  12e. Clear procedure definition shadows"))
+				print(Ansi.muted(f"    {'procedure definition shadows cleared':40} {stats['procedure_definition_shadows_cleared']:>8,}"))
+			if opts.compact_procedure_prototypes:
+				print(Ansi.subheading("  12f. Compact procedure prototypes"))
+				for key, label in (
+					("procedure_prototypes_compacted", "procedure prototypes compacted"),
+					("procedure_prototype_argument_reporters_removed", "prototype argument reporters removed"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.optimize_procedure_arguments:
-				print(Ansi.subheading("  12d. Optimize custom procedure arguments"))
+				print(Ansi.subheading("  12g. Optimize custom procedure arguments"))
 				for key, label in (
 					("procedure_arguments_removed", "procedure arguments removed"),
 					("procedure_constant_arguments_folded", "constant procedure arguments folded"),
@@ -11475,13 +13986,21 @@ def _print_transform_stats(stats, opts):
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.merge_duplicate_procedures:
-				print(Ansi.subheading("  12e. Merge duplicate custom procedures"))
+				print(Ansi.subheading("  12g. Merge duplicate custom procedures"))
 				for key, label in (
 					("duplicate_procedures_merged", "duplicate procedures merged"),
 					("duplicate_procedure_blocks_removed", "duplicate procedure blocks removed"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
-
+			if opts.inline_single_use_procedures:
+				print(Ansi.subheading("  12h. Inline safe single-use procedures"))
+				for key, label in (
+					("procedure_inlined", "single-use procedures inlined"),
+					("procedure_inline_blocks_removed", "procedure scaffolding blocks removed"),
+					("procedure_inline_argument_reporters_removed", "argument reporters removed during inlining"),
+					("procedure_inline_passes", "inlining passes completed"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 
 
 def format_size_report(before_json, after_json, before_archive, after_archive):
@@ -11533,30 +14052,6 @@ def _verify_lossless(original_path, minified_path, compact_defaults=False, compa
 		return True, "every JSON value, collection order, ZIP metadata and asset byte preserved"
 	except (ValueError, OSError, KeyError, zipfile.BadZipFile, zlib.error) as error:
 		return False, str(error)
-
-
-def _lossless_asset_entries(source, opts, zopfli):
-	"""Compress a bounded queue in parallel; read and write ZIP entries in order."""
-	workers = min(4, os.cpu_count() or 1)
-	pending, queued_bytes = deque(), 0
-	with ThreadPoolExecutor(max_workers=workers) as pool:
-		for info in source.infolist():
-			job, size = None, 0
-			if info.filename != "project.json":
-				data = source.read(info)
-				previous = read_compressed_entry(source, info)
-				size = len(data) + len(previous)
-				if opts.optimize_assets and info.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
-					job = pool.submit(optimize_asset, data, opts.compression_level,
-						(info.compress_type, previous), zopfli if opts.zopfli_assets else False, opts.zopfli_iterations)
-				else:
-					job = (info.compress_type, previous)
-			pending.append((info, job, size)); queued_bytes += size
-			while pending and (len(pending) >= workers * 2 or queued_bytes >= 32 * 1024 * 1024):
-				entry, result, size = pending.popleft(); queued_bytes -= size
-				yield entry, result.result() if hasattr(result, "result") else result
-		for entry, result, _ in pending:
-			yield entry, result.result() if hasattr(result, "result") else result
 
 
 def _minify_lossless_sb3(src, dst, opts):
@@ -11684,6 +14179,7 @@ def minify_sb3(src, dst, opts=None):
 	except ValueError as error:
 		print(Ansi.error(f"Error: {error}"))
 		return 1
+	
 	with zipfile.ZipFile(src) as zin:
 		if "project.json" not in zin.namelist():
 			print(Ansi.error("Error: no project.json in archive"))
@@ -11722,8 +14218,11 @@ def minify_sb3(src, dst, opts=None):
 			if item.filename != "project.json"
 		}
 
-		stats = apply_transforms(project, opts, assets)
+		print("\n" + Ansi.prompt("--- BEGIN ---") + "\n")
+		progress = ProgressBar(_progress_stage_count(opts))
+		stats = apply_transforms(project, opts, assets, progress)
 		if opts.relabel_block_ids:
+			progress.next("Minimize block IDs")
 			project, label_maps, label_cost = relabel_blocks(project)
 			previous_maps = getattr(opts, "renamed_block_ids", {})
 			opts.renamed_block_ids = {
@@ -11735,12 +14234,15 @@ def minify_sb3(src, dst, opts=None):
 		out_json = dumps_compact(project, opts.sort_keys).encode("utf-8")
 		compressed_json = None
 		if opts.optimize_json:
+			progress.next("Optimize project.json")
 			out_json, compressed_json, encoding_stats = optimize_project_json(
 				loads_exact(out_json), opts.compression_level, opts.zopfli,
 				opts.zopfli_iterations, opts.zopfli_required, opts.compact_block_defaults,
 				opts.compact_costume_references, opts.compact_block_flags, opts.minimum_json, opts.json_search_rounds
 			)
 			stats.update({key: value for key, value in encoding_stats.items() if isinstance(value, int)})
+
+		progress.next("Process assets and write archive" if opts.optimize_assets else "Write archive")
 		with zipfile.ZipFile(
 			dst, "w", zipfile.ZIP_DEFLATED, compresslevel=opts.compression_level
 		) as zout:
@@ -11752,15 +14254,33 @@ def minify_sb3(src, dst, opts=None):
 				json_info.file_size = len(out_json)
 				json_info.CRC = zlib.crc32(out_json)
 				write_compressed_entry(zout, json_info, compressed_json)
-			for name, data in assets.items():
+			asset_count = len(assets)
+			last_progress_render = time.monotonic()
+			for asset_index, (name, data) in enumerate(assets.items(), 1):
+				if opts.optimize_assets and time.monotonic() - last_progress_render >= 0.15:
+					progress.detail(f"{asset_index:,}/{asset_count:,} assets")
+					last_progress_render = time.monotonic()
 				if opts.optimize_assets:
+					# PNG/JPEG/GIF/WebP/MP3/OGG containers are already internally compressed.
+					# Preserve their existing ZIP stream instead of spending CPU on DEFLATE/Zopfli.
+					_ext = os.path.splitext(name)[1].lower()
+					if _ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp3", ".ogg", ".m4a", ".aac") and name in asset_infos:
+						info = copy.copy(asset_infos[name])
+						previous = read_compressed_entry(zin, info)
+						write_compressed_entry(zout, info, previous)
+						continue
 					info = copy.copy(asset_infos[name]) if name in asset_infos else zipfile.ZipInfo(name)
 					original = None
 					if name in asset_infos and zin.read(name) == data:
 						original = (info.compress_type, read_compressed_entry(zin, info))
+					asset_zopfli = (
+						zopfli
+						if opts.zopfli_assets and (not opts.auto_zopfli or opts.zopfli_required)
+						else False
+					)
 					method, compressed = optimize_asset(
 						data, opts.compression_level, original,
-						zopfli if opts.zopfli_assets else False, opts.zopfli_iterations
+						asset_zopfli, opts.zopfli_iterations
 					)
 					info.compress_type = method
 					info.file_size = len(data)
@@ -11810,30 +14330,107 @@ def minify_sb3(src, dst, opts=None):
 						compresslevel=opts.compression_level,
 					)
 
-	print(f'Input : "{src}"\nOutput: "{dst}"\n')
-	_print_transform_stats(stats, opts)
-	b, a = len(raw), len(out_json)
-	print("")
-	for line in format_size_report(b, a, os.path.getsize(src), os.path.getsize(dst)):
-		print(line)
-
-	print(Ansi.heading("\nVerifying (independent original-vs-result check)..."))
+	progress.next("Verify output")
 	ok, msg = verify(src, dst, opts)
 	if not ok:
+		progress.detail(f"failed: {msg}")
+		progress.close()
 		print(Ansi.error(f"Verification failed: {msg}"))
 		os.remove(dst)
 		print(Ansi.muted("Output deleted."))
 		return 2
+	progress.finish("Complete")
 	print(Ansi.success("Verified successfully."))
+
+	print(f'Input : "{src}"\nOutput: "{dst}"\n')
+	_print_transform_stats(stats, opts)
+
+	b, a = len(raw), len(out_json)
+	print("")
+	for line in format_size_report(b, a, os.path.getsize(src), os.path.getsize(dst)):
+		print(line)
 	return 0
 
 
-if __name__ == "__main__":
-	from minify_flags import toggles, valued
+def _render_layout(parts, order=None, shapes=None):
+	if shapes is None: shapes = {}
+	return b"".join(part if isinstance(part, bytes) else part.render(order, shapes) for part in parts)
 
-	flags = [a for a in sys.argv[1:] if a.startswith("--")]
+
+def _dangling_block_ids(target):
+	blocks = target.get("blocks", {})
+	ids = set(blocks)
+	dangling = set()
+	for block in blocks.values():
+		if not isinstance(block, dict):
+			continue
+		for key in ("next", "parent"):
+			v = block.get(key)
+			if isinstance(v, str) and v not in ids:
+				dangling.add(v)
+		for value in (block.get("inputs") or {}).values():
+			_collect_dangling_in_input(value, ids, dangling)
+	for comment in (target.get("comments") or {}).values():
+		if isinstance(comment, dict):
+			bid = comment.get("blockId")
+			if isinstance(bid, str) and bid not in ids:
+				dangling.add(bid)
+	return dangling
+
+
+def _lossless_asset_entries(source, opts, zopfli):
+	"""Compress a bounded queue in parallel; read and write ZIP entries in order."""
+	workers = min(4, os.cpu_count() or 1)
+	pending, queued_bytes = deque(), 0
+	with ThreadPoolExecutor(max_workers=workers) as pool:
+		for info in source.infolist():
+			job, size = None, 0
+			if info.filename != "project.json":
+				data = source.read(info)
+				previous = read_compressed_entry(source, info)
+				size = len(data) + len(previous)
+				if opts.optimize_assets and info.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+					job = pool.submit(optimize_asset, data, opts.compression_level,
+						(info.compress_type, previous), zopfli if opts.zopfli_assets else False, opts.zopfli_iterations)
+				else:
+					job = (info.compress_type, previous)
+			pending.append((info, job, size)); queued_bytes += size
+			while pending and (len(pending) >= workers * 2 or queued_bytes >= 32 * 1024 * 1024):
+				entry, result, size = pending.popleft(); queued_bytes -= size
+				yield entry, result.result() if hasattr(result, "result") else result
+		for entry, result, _ in pending:
+			yield entry, result.result() if hasattr(result, "result") else result
+
+
+
+if __name__ == "__main__":
+	from minify_flags import groups, toggles, valued
+
+	raw_flags = [a for a in sys.argv[1:] if a.startswith("--")]
 	args = [a for a in sys.argv[1:] if not a.startswith("--")]
 	values, bad = {}, []
+
+	# expand named groups recursively while preserving first-seen order
+	expanded_flags = []
+	seen_flags = set()
+	def expand_group(flag, stack=()):
+		if flag in stack:
+			raise ValueError(f"cyclic flag group: {' -> '.join((*stack, flag))}")
+		for member in groups.get(flag, (flag,)):
+			if member in groups:
+				expand_group(member, (*stack, flag))
+			elif member not in seen_flags:
+				seen_flags.add(member)
+				expanded_flags.append(member)
+
+	try:
+		for f in raw_flags:
+			expand_group(f) if f.split("=", 1)[0] in groups and "=" not in f else expanded_flags.append(f)
+	except ValueError as error:
+		print(Ansi.error(f"Invalid flag group: {error}"))
+		sys.exit(1)
+
+	flags = expanded_flags
 
 	for f in flags:
 		key, eq, val = f.partition("=")
@@ -12019,6 +14616,37 @@ if __name__ == "__main__":
 		list_items=values.get("--list-items", DEFAULT_LIST_ITEMS),
 		normalize_epsilon=values.get("--normalize-epsilon", DEFAULT_EPSILON),
 		keep_sound_metadata=("--keep-sound-metadata" in flags),
+		compact_procedure_prototypes=any(
+			f in flags
+			for f in (
+				"--procedure-prototype-compaction",
+				"--compact-procedure-prototypes",
+				"--compact-custom-procedure-prototypes",
+			)
+		),
+		clear_procedure_definition_shadows=any(
+			f in flags
+			for f in (
+				"--clear-procedure-definition-shadows",
+				"--compact-procedure-definition-shadows",
+				"--remove-procedure-definition-shadows",
+			)
+		),
+		inline_single_use_procedures=any(
+			f in flags
+			for f in (
+				"--inline-single-use-procedures",
+				"--inline-single-use-custom-procedures",
+				"--procedure-inlining",
+			)
+		),
+		procedure_inline_passes=values.get("--procedure-inline-passes", 8),
+		specialize_procedures=any(
+			f in flags for f in ("--specialize-procedures", "--specialize-custom-procedures", "--procedure-specialization")
+		),
+		procedure_specialization_passes=values.get("--procedure-specialization-passes", 4),
+		procedure_specialization_min_calls=values.get("--procedure-specialization-min-calls", 2),
+		branch_factoring="--branch-factoring" in flags,
 	)
 	dst = args[1] if len(args) > 1 else os.path.splitext(args[0])[0] + "_minified.sb3"
 	if os.path.abspath(args[0]) == os.path.abspath(dst):

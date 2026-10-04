@@ -1,663 +1,891 @@
 # minify_sb3
 
+`minify_sb3.py` shrinks Scratch 3 project archives (`.sb3`) by removing redundant metadata and dead data, rewriting project structures, shortening identifiers, optimizing custom procedures, and optimizing ZIP/`project.json` encoding. It verifies the generated archive before reporting success.
 
-`minify_sb3.py` shrinks Scratch 3 project archives (`.sb3`) by removing redundant metadata and dead data while preserving project behavior, editor compatibility, and asset integrity. It targets the Scratch VM, the Scratch block editor, and TurboWarp-style editors, and it checks its own output before leaving it on disk.
+The script is designed around Scratch 3's serialized project format and preserves editor/runtime compatibility for transformations that it explicitly models. Some optional transforms are intentionally aggressive or lossy; review the resulting project when using them.
+
+## Contents
 
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
-- [CLI reference](#command-line-reference)
-- [How the pipeline works](#how-the-pipeline-works)
-- [Always-on behavior](#always-on-behavior)
-- [Default transforms](#default-transforms)
+- [CLI syntax](#cli-syntax)
+- [Flag groups and modes](#flag-groups-and-modes)
+- [Default behavior](#default-behavior)
+- [CLI reference](#cli-reference)
 - [Interactive prompts](#interactive-prompts)
-- [Optional transforms](#optional-transforms)
-- [`--all-optimizations` in detail](#--all-optimizations-in-detail)
-- [Archive and asset handling](#archive-and-asset-handling)
-- [Invariants the script protects](#invariants-the-script-protects)
+- [Transformation pipeline](#transformation-pipeline)
+- [JSON and archive optimization](#json-and-archive-optimization)
+- [Lossless mode](#lossless-mode)
 - [Verification](#verification)
-- [Output report](#output-report)
+- [Output and progress reporting](#output-and-progress-reporting)
 - [Exit codes](#exit-codes)
-- [Which flags can change behavior?](#which-flags-can-change-behavior)
-- [Known caveats and limitations](#known-caveats-and-limitations)
+- [Behavior-changing and potentially lossy transforms](#behavior-changing-and-potentially-lossy-transforms)
+- [Known limitations](#known-limitations)
 - [Programmatic use](#programmatic-use)
-- [Example usage](#example-usage)
+- [Examples](#examples)
 
 ## Requirements
 
-- **Python 3.10 or newer.** The script uses only the standard library (`collections`, `copy`, `hashlib`, `json`, `math`, `os`, `subprocess`, `sys`, `uuid`, `zipfile`, `zlib`). It relies on `X | None` annotations, which need 3.10+.
-- **`ffmpeg` with `libmp3lame` (optional).** Only needed for `--convert-wav-to-mp3` (and `--all-optimizations`, which enables it).
-- Enough RAM to hold the whole archive: every asset is read into memory before the output is written.
+- **Python 3.10 or newer.**
+- **`minify_flags.py`** must be importable by the script. The CLI uses it for flag groups, toggles, and valued options.
+- **`ffmpeg` with `libmp3lame`** is needed for `--convert-wav-to-mp3` and for `--all-flags`, which enables that conversion.
+- **The Python `zopfli` package** is needed when Zopfli is explicitly requested (`--zopfli`, `--zopfli-assets`) or when using the all-lossless/safe group. Install it with:
+  ```bash
+  python -m pip install zopfli
+  ```
+- Enough RAM to hold the archive's assets in memory. The normal pipeline reads all non-`project.json` archive entries before writing the output.
 
 ## Quick start
 
 ```bash
-# Safe defaults; large lists are not scanned unless requested
+# Default minification
 python minify_sb3.py my_project.sb3
 
-# Scan large lists and prompt before clearing any
-python minify_sb3.py my_project.sb3 --clear-large-lists
+# Explicit output path
+python minify_sb3.py my_project.sb3 my_project_small.sb3
 
-# Explicit output path, enable the batch of non-interactive optimizations
+# All non-interactive aggressive optimizations
 python minify_sb3.py my_project.sb3 my_project_small.sb3 --all-optimizations
 
-# Keep comments and monitors, canonicalize key order
-python minify_sb3.py my_project.sb3 --keep-comments --keep-monitors --sort-keys
+# The stronger all-flags bundle, including block-ID relabeling,
+# minimum-JSON search, automatic Zopfli, and WAV -> MP3 conversion
+python minify_sb3.py my_project.sb3 my_project_small.sb3 --all-flags
+
+# Scan large lists and interactively choose which to clear
+python minify_sb3.py my_project.sb3 --clear-large-lists
+
+# Lossless compression/representation optimization
+python minify_sb3.py my_project.sb3 my_project_small.sb3 --lossless
+
+# Full lossless bundle
+python minify_sb3.py my_project.sb3 my_project_small.sb3 --all-lossless
 ```
 
-If no output path is given, the result is written next to the input as `<input name>_minified.sb3`. The output path must differ from the input path; the script refuses to overwrite its own source. Your original file is never modified.
+If no output path is supplied, the output is written beside the input as:
 
-## CLI reference
-
+```text
+<input name>_minified.sb3
 ```
+
+The script refuses to overwrite the input file.
+
+## CLI syntax
+
+```text
 python minify_sb3.py input.sb3 [output.sb3] [flags]
 ```
 
-Flags starting with `--` may appear anywhere. Anything not starting with `--` is a positional argument (the first is the input, the second is the output). Flags that take a value must be written as `--name=value` (no space). Any unrecognized or malformed flag prints the list of valid flags and exits with status 1 before touching any file.
+Flags may appear anywhere. Non-flag arguments are positional: the first is the input archive and the second is the output archive.
 
-### Opt-out flags (disable a default transform)
+Valued flags use `--name=value`; a space-separated form such as `--compression-level 9` is rejected.
+
+Unknown or malformed options are rejected before the input archive is modified.
+
+## Flag groups and modes
+
+`minify_flags.py` defines the CLI's flag vocabulary. Named groups are expanded
+**recursively**, in first-seen order, before the individual options are parsed.
+This means a group can contain another group, and duplicate flags are applied
+only once.
+
+### Optimization groups
+
+| Group | Expands to |
+| --- | --- |
+| `--recommended` | `--all-optimizations`, `--fold-constant-variables`, `--compact-mutation-metadata`, `--clear-large-lists`, all name-shortening flags, `--all-flags`, procedure-argument optimization, duplicate-procedure merging, associative constant merging, constant propagation, reference-name stripping, compact data literals, unused-extension removal, WAV→MP3 conversion, nested-conditionals |
+| `--maximum-size` | `--recommended`, `--inline-single-use-procedures`, `--specialize-procedures` |
+| `--procedures` | Procedure-argument optimization, duplicate-procedure merging, single-use procedure inlining, procedure specialization |
+| `--cleanup` | Unused variable/list/broadcast/procedure removal, unreachable-block removal, empty-field/input/container removal, costume-metadata removal, default-target-property removal, project-metadata removal, unused-extension removal, reference-name stripping |
+| `--names` | Variable/list/broadcast/argument/procedure name shortening, variable/list/broadcast/argument ID shortening, frequency-based data-ID ordering |
+| `--control-flow` | Branch swapping, trivial-loop simplification, nested-conditionals, associative constant merging, constant propagation, constant-expression folding, boolean-control simplification, block simplification |
+| `--data-optimization` | Constant-variable folding, procedure-argument optimization, compact data literals, compact numeric inputs, compact field IDs, compact `mutation.hasnext`, compact mutation metadata, number normalization |
+| `--compression` | `--optimize-json`, `--optimize-assets`, compact block defaults, compact costume references, frequency-based block/data IDs, asset deduplication, WAV→MP3 conversion |
+| `--all-groups` | `--procedures`, `--cleanup`, `--names`, `--control-flow`, `--data-optimization`, `--compression`, `--all-optimizations`, and `--all-flags` |
+
+Because `--all-flags` implies `--all-optimizations`, `--all-groups` is effectively
+the broadest predefined optimization group. Some groups, especially
+`--recommended`, also contain interactive operations such as
+`--clear-large-lists` and `--fold-constant-variables`.
+
+### `--all-optimizations`
+
+Enables the main aggressive optimization bundle directly in `minify_sb3.py`.
+It enables the transforms represented by the `all_optimizations` option set,
+including:
+
+- compact costume references and block defaults;
+- optimized `project.json` and asset compression;
+- frequency-based block and data ID assignment;
+- variable/list/broadcast/argument/block ID shortening;
+- unused variable/list/broadcast/procedure removal;
+- unreachable-block removal;
+- numeric/input/field/mutation compaction;
+- number normalization;
+- constant-expression folding;
+- boolean/control-flow and block simplification;
+- custom-procedure argument optimization;
+- duplicate-procedure merging;
+- single-use procedure inlining;
+- procedure specialization;
+- branch swapping;
+- trivial-loop simplification;
+- nested-conditional simplification;
+- associative constant merging;
+- script constant propagation;
+- asset deduplication;
+- removal of empty/default structural data where modeled.
+
+It does **not** by itself enable the separate interactive or extra-compression flags
+such as `--clear-large-lists`, `--fold-constant-variables`,
+`--compact-mutation-metadata`, `--sort-keys`, WAV→MP3 conversion,
+`--minimum-json`, block-ID relabeling, or automatic Zopfli.
+
+### `--all-flags`
+
+`--all-flags` implies `--all-optimizations` and additionally enables:
+
+- `--compact-block-flags`;
+- `--minimum-json`;
+- `--relabel-block-ids`;
+- automatic Zopfli compression;
+- WAV→MP3 conversion.
+
+WAV→MP3 is lossy. The minimum-JSON and block-ID relabeling features are
+representation/compression optimizations accounted for by the verifier.
+
+### `--lossless`
+
+Enters lossless mode. The CLI rejects semantic or lossy transforms such as
+dead-data removal, renaming, number normalization, control-flow rewrites,
+procedure transformations, and WAV→MP3 conversion.
+
+Lossless mode permits only the explicitly allowed representation/compression
+options, such as JSON/asset optimization, compact block defaults/flags,
+compact costume references, Zopfli, minimum-JSON search, and block-ID relabeling.
+The verifier checks the resulting archive against the lossless invariants.
+
+### `--all-lossless`, `--all-safe`, `--all-safe-flags`
+
+These three flags activate the same `all_safe` path in `minify_sb3.py`:
+lossless mode plus the complete lossless/safe option set.
+
+They are **not** optimization groups in `minify_flags.py`; they are special
+mode toggles recognized directly by `minify_sb3.py`.
+
+The lossless/safe path enables the lossless JSON and asset compression features,
+including Zopfli. It therefore requires the Python `zopfli` package when those
+features are actually used.
+
+### Group aliases
+
+Many individual transforms have multiple accepted spellings. They are all
+listed in the CLI reference below; the aliases are equivalent when passed
+individually.
+
+## Default behavior
+
+Without optional flags, the CLI performs these operations:
+
+1. Drops `topLevel: false` and `shadow: false`.
+2. Normalizes `mutation.warp` from `"true"`/`"false"` strings to JSON booleans.
+3. Strips sprite comments from non-Stage targets.
+4. Rounds supported coordinate values.
+5. Resets covered numeric/text shadow values.
+6. Cleans variable/list monitors.
+7. Removes sound `rate` and `sampleCount`.
+8. Repairs dangling broadcast references.
+9. Repairs dangling block links.
+10. Verifies the complete output archive.
+
+The Stage is deliberately excluded from sprite-comment stripping because Stage metadata can contain TurboWarp configuration.
+
+Large-list scanning is **off by default**.
+
+`--all-optimizations` does not scan or prompt about large lists.
+
+## CLI reference
+
+### Default-transform opt-outs
 
 | Flag | Effect |
 | --- | --- |
-| `--keep-comments` | Do not strip sprite comments or block comment links. |
-| `--keep-positions` | Do not round block, comment, or costume-rotation-center coordinates. |
+| `--keep-comments` | Keep sprite comments and block comment links. |
+| `--keep-positions` | Do not round supported block/comment/costume coordinates. |
 | `--keep-covered` | Do not reset covered shadow values. |
-| `--keep-monitors` | Do not clean monitors. |
-| `--keep-sound-metadata` | Keep `rate` and `sampleCount` on sounds. |
+| `--keep-monitors` | Do not clean variable/list monitors. |
+| `--keep-sound-metadata` | Keep sound `rate` and `sampleCount`. |
 
-### Interactive list prompt
-
-| Flag | Effect |
-| --- | --- |
-| `--clear-large-lists` | Scan for large lists and prompt for optional clearing. Off by default and skipped by `--all-optimizations`. |
-
-### Name shortening
+### Large-list handling
 
 | Flag | Effect |
 | --- | --- |
-| `--rename-identifiers` | Shorten variable, list, broadcast, and custom-block argument names; equivalent to enabling all four category flags below. IDs are unchanged. |
-| `--rename-variable-names` | Shorten variable names only. |
-| `--rename-list-names` | Shorten list names only. |
-| `--rename-broadcast-names` | Shorten broadcast message names only. |
-| `--rename-argument-names` | Shorten custom-block argument names only. |
+| `--clear-large-lists` | Find large lists and prompt before clearing selected lists. |
+| `--list-bytes=N` | Minimum serialized JSON size for a list to be considered large. Default: `4096`. |
+| `--list-items=N` | Minimum item count for a list to be considered large. Default: `1000`. |
 
-### ID renaming
+A list qualifies when it is non-empty and meets either threshold.
+
+### Valued options
+
+All valued options use the `--name=value` form. A space-separated form such as
+`--compression-level 9` is rejected.
+
+| Option | Accepted value | Default |
+| --- | --- | --- |
+| `--zopfli-iterations=N` | Positive integer | `5` |
+| `--json-search-rounds=N` | Positive integer | `0` normally; `1` with `--all-optimizations` |
+| `--list-bytes=N` | Positive integer | `4096` |
+| `--list-items=N` | Positive integer | `1000` |
+| `--compression-level=N` | Integer `0`–`9` | `9` |
+| `--normalize-epsilon=N` | Positive finite number | `1e-8` |
+| `--sequence-threshold=N` | Positive integer | `3` |
+| `--procedure-inline-passes=N` | Positive integer | `8` |
+| `--procedure-specialization-passes=N` | Positive integer | `4` |
+| `--procedure-specialization-min-calls=N` | Positive integer | `2` |
+
+The parser accepts only positive integers for the integer-valued options above,
+except `--compression-level`, which accepts `0` through `9`. `--normalize-epsilon`
+must be a finite positive number.
+
+### Identifier names
 
 | Flag | Effect |
 | --- | --- |
-| `--rename-block-ids` | Shorten block IDs (per sprite). |
+| `--rename-identifiers` | Shorten variable, list, broadcast, custom-block argument, and procedure names. |
+| `--rename-variable-names` | Shorten variable names. |
+| `--rename-list-names` | Shorten list names. |
+| `--rename-broadcast-names` | Shorten broadcast names. |
+| `--rename-argument-names` | Shorten custom-block argument names. |
+| `--rename-procedure-names` | Shorten procedure names. |
+
+These flags change names, not IDs.
+
+### ID shortening
+
+| Flag | Effect |
+| --- | --- |
+| `--rename-block-ids` | Shorten block IDs. |
 | `--rename-variable-ids` | Shorten variable IDs. |
 | `--rename-list-ids` | Shorten list IDs. |
-| `--rename-broadcast-ids` | Shorten broadcast IDs (names are preserved). |
+| `--rename-broadcast-ids` | Shorten broadcast IDs. |
 | `--rename-argument-ids` | Shorten custom-block argument IDs. |
-| `--frequency-block-ids` (alias `--order-block-ids-by-frequency`) | Implies `--rename-block-ids`; most-referenced blocks get the shortest IDs. |
-| `--frequency-data-ids` (alias `--order-data-ids-by-frequency`) | Implies `--rename-variable-ids`, `--rename-list-ids`, and `--rename-broadcast-ids`; most-referenced data gets the shortest IDs. |
+| `--frequency-block-ids` | Shorten block IDs and order new IDs by reference frequency. |
+| `--order-block-ids-by-frequency` | Alias for `--frequency-block-ids`. |
+| `--frequency-data-ids` | Shorten variable/list/broadcast IDs and order them by reference frequency. |
+| `--order-data-ids-by-frequency` | Alias for `--frequency-data-ids`. |
+| `--relabel-block-ids` | Use the minimum-cost block-ID assignment during JSON optimization. |
 
-### Dead-data removal
+`--relabel-block-ids` is a representation optimization used by the lossless/all-flags compression path; the verifier accounts for the approved ID relabeling.
 
-| Flag | Effect |
-| --- | --- |
-| `--remove-unused-variables` | Remove variables nothing references (cloud variables are always kept). |
-| `--remove-unused-lists` | Remove lists nothing references. |
-| `--remove-unused-broadcasts` | Remove broadcast definitions nothing references. |
-| `--remove-unreachable` | Remove blocks not reachable from a top-level script. |
-| `--remove-unused-procedures` | Remove custom-block definitions that are never called. |
-
-### Normalization and compaction
+### Dead-data and reachability removal
 
 | Flag | Effect |
 | --- | --- |
-| `--normalize-numbers` | Rewrite integral floats (`1.0`) as integers and snap near-integers within a tolerance. |
-| `--normalize-epsilon=N` | Tolerance for `--normalize-numbers`. Positive float, default `1e-8`. |
-| `--compact-numeric-inputs` | Convert canonical numeric input strings to JSON numbers. |
-| `--compact-field-ids` | Remove explicit `null` ID slots from block fields. |
-| `--compact-mutation-hasnext` | Remove `mutation.hasnext` when it is explicitly false. |
-| `--compact-mutation-metadata` | Canonicalize the JSON strings in custom-block mutations. Not included in `--all-optimizations`. |
-| `--fold-constant-expressions` | Fold supported arithmetic, comparison, boolean, text-length, and math-function reporters whose inputs are constant. Included in `--all-optimizations`. |
-| `--fold-constant-variables` | Interactively replace reporters of eligible write-once variables with their initial value. May also remove a matching setter block. Not included in `--all-optimizations`. |
+| `--remove-unused-variables` | Remove variables with no modeled references. Cloud variables are retained. |
+| `--remove-unused-lists` | Remove lists with no modeled references. |
+| `--remove-unused-broadcasts` | Remove unused broadcast definitions. |
+| `--remove-unreachable` | Remove blocks unreachable from modeled roots. |
+| `--remove-unused-procedures` | Remove custom procedures that are never reached through modeled procedure calls. |
 
-### Structural trimming
+### Numeric and structural compaction
 
 | Flag | Effect |
 | --- | --- |
-| `--remove-empty-fields` | Drop empty `fields` objects from blocks. |
-| `--remove-empty-inputs` | Drop empty `inputs` objects from blocks. |
-| `--remove-costume-metadata` | Drop provably redundant costume `md5ext` and SVG `bitmapResolution`. |
-| `--remove-default-target-properties` | Drop target properties that equal Scratch's defaults. |
-| `--remove-empty-containers` (alias `--remove-empty-target-containers`) | Drop empty `lists`, `broadcasts`, and `comments` containers. |
-| `--remove-project-meta` | Drop `meta.agent` and `meta.platform`. |
-| `--sort-keys` | Write JSON with object keys sorted. Not included in `--all-optimizations`. |
+| `--normalize-numbers` | Normalize integral/near-integral numeric values. |
+| `--normalize-epsilon=N` | Positive tolerance for near-integer snapping. Default: `1e-8`. |
+| `--compact-numeric-inputs` | Convert canonical numeric shadow strings to JSON numbers. |
+| `--compact-field-ids` | Remove explicit `null` field-ID slots. |
+| `--compact-mutation-hasnext` | Remove `mutation.hasnext` when false. |
+| `--compact-mutation-metadata` | Compact JSON encoded in custom-block mutation metadata. |
+| `--remove-empty-fields` | Remove empty `fields` objects. |
+| `--remove-empty-inputs` | Remove empty `inputs` objects. |
+| `--remove-costume-metadata` | Remove provably redundant costume metadata. |
+| `--remove-default-target-properties` | Remove properties equal to Scratch defaults. |
+| `--remove-empty-containers` | Remove empty `lists`, `broadcasts`, and `comments` containers. |
+| `--remove-empty-target-containers` | Alias for `--remove-empty-containers`. |
+| `--remove-project-meta` | Remove `meta.agent` and `meta.platform`. |
+| `--sort-keys` | Sort JSON object keys during final serialization. |
 
-### Archive and asset flags
-
-| Flag | Effect |
-| --- | --- |
-| `--convert-wav-to-mp3` | Convert WAV sounds to MP3 with `ffmpeg` (lossy). |
-| `--preserve-asset-compression` | Reuse an unchanged asset's original DEFLATE bytes when they are no larger than recompressing. |
-| `--compression-level=N` | ZIP DEFLATE level, integer `0` to `9`. Default `9`. |
-| `--compress-assets` | Accepted for compatibility; currently stored but does not run any transform. |
-
-### Large-list thresholds
+### Constant folding and script rewrites
 
 | Flag | Effect |
 | --- | --- |
-| `--list-bytes=N` | A list is "large" if its JSON size is at least `N` bytes. Positive integer, default `4096`. |
-| `--list-items=N` | A list is "large" if it has at least `N` items. Positive integer, default `1000`. |
+| `--fold-constant-variables` | Interactively replace eligible write-once variable reporters with their initial literals. |
+| `--fold-constant-expressions` | Fold supported constant Scratch reporter expressions. |
+| `--script-constant-propagation` | Propagate constants through modeled scripts. |
+| `--propagate-script-constants` | Alias for script constant propagation. |
+| `--constant-propagation` | Alias for script constant propagation. |
+| `--branch-swapping` | Rewrite eligible conditional branches to reduce serialized size. |
+| `--swap-branches` | Alias for branch swapping. |
+| `--branch-swap` | Alias for branch swapping. |
+| `--trivial-loops` | Simplify supported trivial boolean loops. |
+| `--simplify-trivial-loops` | Alias for trivial-loop simplification. |
+| `--nested-conditionals` | Simplify/merge supported nested conditionals. |
+| `--merge-nested-conditionals` | Alias for nested-conditional simplification. |
+| `--merge-nested-ifs` | Alias for nested-conditional simplification. |
+| `--associative-constants` | Merge/reassociate supported constant arithmetic expressions. |
+| `--merge-associative-constants` | Alias. |
+| `--reassociate-constants` | Alias. |
+| `--simplify-boolean-control` | Simplify constant boolean control flow. |
+| `--simplify-blocks` | Simplify supported setter RHS block patterns. |
 
-A list qualifies if it is non-empty and meets either threshold.
-
-### Batch flag
+### Custom-procedure optimization
 
 | Flag | Effect |
 | --- | --- |
-| `--all-optimizations` (alias `--all-flags`) | Enable the batch of non-interactive optional transforms. See [below](#--all-optimizations-in-detail). |
+| `--optimize-procedure-arguments` | Remove/fold unnecessary custom-procedure arguments. |
+| `--optimize-custom-procedure-arguments` | Alias. |
+| `--drop-procedure-arguments` | Alias. |
+| `--remove-unused-procedure-arguments` | Alias. |
+| `--remove-unused-custom-procedure-arguments` | Alias. |
+| `--fold-constant-procedure-arguments` | Alias. |
+| `--fold-constant-custom-procedure-arguments` | Alias. |
+| `--merge-duplicate-procedures` | Merge equivalent custom procedures. |
+| `--merge-duplicate-custom-procedures` | Alias. |
+| `--merge-duplicate-custom-blocks` | Alias. |
+| `--deduplicate-procedures` | Alias. |
+| `--inline-single-use-procedures` | Inline safe single-use procedures. |
+| `--inline-single-use-custom-procedures` | Alias. |
+| `--procedure-inlining` | Alias. |
+| `--procedure-inline-passes=N` | Maximum inlining passes. Default: `8`. |
+| `--specialize-procedures` | Specialize eligible custom procedures. |
+| `--specialize-custom-procedures` | Alias. |
+| `--procedure-specialization` | Alias. |
+| `--procedure-specialization-passes=N` | Specialization passes. Default: `4`. |
+| `--procedure-specialization-min-calls=N` | Minimum call count for specialization. Default: `2`. |
 
-### Validation rules for valued flags
+After procedure transformations, the script can perform another unused-procedure sweep when applicable.
 
-- `--list-bytes`, `--list-items`: digits only, greater than zero.
-- `--compression-level`: digits only, `0` through `9`.
-- `--normalize-epsilon`: any finite float greater than zero.
-- A valued flag given without `=value`, or a toggle given with `=value`, is rejected as malformed.
+### Sequence grouping
 
-## How the pipeline works
+| Flag | Effect |
+| --- | --- |
+| `--group-similar-sequences` | Replace sufficiently similar repeated block sequences with custom procedures. |
+| `--sequence-threshold=N` | Minimum sequence length. Default: `3`. |
 
-1. `project.json` is parsed (UTF-8 JSON) and every other archive entry is read into memory as an asset.
-2. If `--clear-large-lists` is given, the large-list prompt runs. If `--fold-constant-variables` is given, the constant-variable prompt runs. Both happen before anything is written. Aborting with Ctrl-C at either prompt exits with status 130 and writes nothing. Neither prompt runs by default or with `--all-optimizations` alone.
-3. Transforms are applied in this fixed order:
-   1. Drop `topLevel: false` and `shadow: false`; normalize `mutation.warp` to booleans.
-   2. WAV to MP3 conversion (if enabled).
-   3. Strip sprite comments (default).
-   4. Round positions (default).
-   5. Reset covered shadow values (default).
-   6. Clean monitors (default).
-   7. Clear any lists chosen at the prompt.
-   8. Remove unreachable blocks.
-   9. Remove unused procedures.
-   10. Remove unreachable blocks again (to sweep anything the procedure pass orphaned).
-   11. Fold selected constant variable reporters, then remove safe matching setter blocks.
-   12. Fold constant expressions.
-   13. Remove unused variables and lists.
-   14. Repair dangling broadcast references.
-   15. Remove unused broadcasts.
-   16. Rename variable and list IDs, then broadcast IDs, then argument IDs, then block IDs.
-   17. Compact numeric inputs, field IDs, and mutation `hasnext`/metadata.
-   18. Normalize numbers.
-   19. Remove sound `rate` and `sampleCount` (unless `--keep-sound-metadata`).
-   20. Remove empty fields, empty inputs, costume metadata, default target properties, empty containers, and project meta.
-   21. Repair any dangling block links ([always-on](#always-on-behavior)).
-4. `project.json` is serialized compactly (`separators=(",", ":")`, `ensure_ascii=False`), then written first into a new ZIP, followed by the assets.
-5. Per-transform counters and size totals are printed.
-6. The original and output archives are independently reloaded and compared. On any mismatch, the output file is deleted and the script exits with status 2.
+Sequence grouping is not automatically enabled by `--all-optimizations`.
 
-The order matters: unreachable-block and procedure removal run before unused-data removal, so variables referenced only by dead code are correctly detected as unused; ID renaming runs after removal so it never renames data that is about to be deleted.
+### Data/metadata cleanup
 
-## Always-on behavior
+| Flag | Effect |
+| --- | --- |
+| `--strip-reference-names` | Strip supported redundant reference names. |
+| `--drop-reference-names` | Alias. |
+| `--empty-reference-names` | Alias. |
+| `--compact-data-literals` | Compact numeric data literals. |
+| `--numeric-data-literals` | Alias. |
+| `--convert-numeric-data` | Alias. |
+| `--remove-unused-extensions` | Remove extensions that are no longer referenced. |
+| `--unused-extensions` | Alias. |
 
-A few things happen regardless of flags (except where noted):
+### Asset handling
 
-- `topLevel: false`, `shadow: false`, and `mutation.warp` always run. Scratch only tests whether `topLevel` and `shadow` are truthy, so the `false` values carry no information. `"true"`/`"false"` strings in `mutation.warp` become real booleans.
-- `rate` and `sampleCount` are removed from every sound unless `--keep-sound-metadata` is given.
-- After all other transforms, every sprite is scanned and repaired:
-  - `next` or `parent` pointing at a block that does not exist becomes `null`.
-  - Inputs that point at a missing block are removed. If a covering block vanished but a shadow value remains, the input falls back to the shadow value alone.
-  - A child whose `parent` is `null` (and which is not marked `topLevel`) gets its `parent` restored when exactly one owner (via `next` or exactly one input) unambiguously claims it. Existing valid parents are never overwritten.
-  - Comments that point at a missing block are deleted.
-- A broadcast ID used by a block but defined nowhere is added to the Stage's `broadcasts` table, named after the reference. If one ID is referenced under several different names, the script refuses to guess; verification then fails and nothing is written.
-- Verification always runs.
+| Flag | Effect |
+| --- | --- |
+| `--convert-wav-to-mp3` | Convert WAV sounds to MP3 using `ffmpeg`; lossy. |
+| `--deduplicate-assets` | Deduplicate identical assets and update references. |
+| `--compress-assets` | Enable asset-compression handling; accepted by the CLI and retained for compatibility. |
+| `--optimize-assets` | Optimize asset ZIP compression. |
+| `--preserve-asset-compression` | Reuse an unchanged asset's existing DEFLATE stream when it is no larger than recompression. |
+| `--zopfli-assets` | Use Zopfli for eligible asset compression. |
+| `--zopfli-iterations=N` | Zopfli effort. Default: `5`. |
+| `--compression-level=N` | Python zlib DEFLATE level, `0` through `9`. Default: `9`. |
 
-## Default transforms
+Already internally compressed formats such as PNG/JPEG/GIF/WebP/MP3/OGG/M4A/AAC are not needlessly recompressed by the optimized-asset path.
 
-### Metadata cleanup
+### `project.json` optimization
 
-Described under [Always-on behavior](#always-on-behavior). WAV sounds are left unchanged unless you ask for conversion.
+| Flag | Effect |
+| --- | --- |
+| `--optimize-json` | Search multiple valid JSON encodings/layouts and retain the best compressed result. |
+| `--compact-block-defaults` | Omit redundant block defaults during JSON optimization. |
+| `--compact-costume-references` | Omit provably redundant costume `md5ext` references. |
+| `--compact-block-flags` | Omit false `topLevel`/`shadow` block flags during the representation search. |
+| `--minimum-json` | Optimize against the shortest supported raw JSON representation rather than only compressed size. |
+| `--json-search-rounds=N` | Additional bounded layout-search rounds. Default: `0`, or `1` under `--all-optimizations`. |
+| `--zopfli` | Use Zopfli for `project.json`. |
+| `--zopfli-iterations=N` | Zopfli iterations; default `5`. |
+| `--relabel-block-ids` | Apply minimum-cost block-ID relabeling as part of JSON optimization. |
 
-### Sprite comments and block comment links
-
-- Every comment on every non-Stage target is removed, and the target's `comments` is set to `{}` (the loader expects an object).
-- Each block's `comment` link is deleted so nothing dangles.
-- The Stage is deliberately untouched, because TurboWarp stores its `_twconfig_` metadata there and some projects depend on it.
-
-Disable with `--keep-comments`.
-
-### Position rounding
-
-Floats become integers (`int(round(v))`, which uses Python's round-half-to-even) for:
-
-- block `x` and `y`;
-- variable/list primitive blocks stored in the block table (indices 3 and 4 of `[12|13, name, id, x, y]`);
-- comment `x`, `y`, `width`, and `height`;
-- costume `rotationCenterX` and `rotationCenterY`.
-
-`NaN`, infinities, booleans, and values that are already integers are left alone. Sprite `x`/`y` (the sprite's position on stage) are untouched.
-
-Disable with `--keep-positions`.
-
-### Covered shadow values
-
-When a reporter sits in an input, the shadow underneath is still stored so the editor can rebuild the workspace, but its value is never read at runtime. For inputs of the form `[3, <covering block>, [tag, value]]`:
-
-- numeric shadows (tags 4 to 8: number, positive number, whole number, integer, angle) are reset to `0`;
-- text shadows (tag 10) are reset to `""`;
-- everything else is left alone (colors, tag 9, and shadows that are block references or three-element broadcast/variable primitives).
-
-Disable with `--keep-covered`.
-
-### Monitor cleanup
-
-Only variable monitors (`data_variable`) and list monitors (`data_listcontents`) are touched; all other monitors (sensing, motion, and so on) are always preserved exactly.
-
-- Orphaned hidden monitors are dropped: hidden monitors whose variable or list is not defined on the owning sprite/Stage. An orphaned visible monitor is kept.
-- Unused hidden monitors are dropped when all of the following hold: it is hidden, no show/hide block (`data_showvariable`, `data_hidevariable`, `data_showlist`, `data_hidelist`) targets its ID, and it has the default layout (`x`/`y` equal to 5 and `width`/`height` equal to 0, using those defaults when the keys are missing).
-- List-monitor `params` are cleared to `{}`; the loader re-derives them from the monitor ID.
-- Monitor `value` is normalized to `[]` for lists and `0` for variables where a `value` key exists. This applies to surviving visible monitors too; the displayed value is recomputed at runtime.
-- Relative order of surviving monitors is preserved.
-
-Disable with `--keep-monitors`.
-
-### Large-list prompt
-
-See [Interactive prompts](#interactive-prompts). Enable it with `--clear-large-lists`; it is off by default and skipped by `--all-optimizations`.
+For very large projects, the JSON search deliberately uses cheaper/bounded search settings. The semantic transforms are unchanged.
 
 ## Interactive prompts
 
-The large-list prompt runs only with `--clear-large-lists`; the constant-variable prompt runs only with `--fold-constant-variables`. Both read from standard input. If stdin is closed or hits EOF, the safe answer ("keep everything") is assumed. Ctrl-C aborts the entire run with exit status 130 and nothing is written. Pressing Enter keeps everything. Output is colored only when stdout is a terminal.
+### Large lists
 
-### Large lists (`--clear-large-lists`)
+`--clear-large-lists` scans non-empty lists meeting either configured threshold and presents them largest-first.
 
-The scan finds non-empty lists meeting either threshold (`--list-bytes`, `--list-items`) and prints a table sorted largest first:
-
-```
-Large lists found: 3  (48,213 bytes = 31.4% of project.json)
-
-   #  scope         list        items   bytes  usage
- !  1  GLOBAL        Highscores  1,204  19,880  modified at runtime (2 add, 1 delete); read by 3 blocks
-    2  local:Player  Palette       412   9,102  not referenced by any block
-```
-
-- **scope** is `GLOBAL` for Stage lists or `local:<sprite name>`.
-- **usage** is derived from the project's blocks and monitors, classified as read (`itemoflist`, `lengthoflist`, `listcontainsitem`, `itemnumoflist`, the list reporter), add (`addtolist`, `insertatlist`), replace, delete (`deleteoflist`, `deletealloflist`), show/hide, or other. Variable-style list reporters in inputs count as reads. A visible monitor counts as "shown on stage". For Stage lists, sprites that define a local list with the same ID are excluded from the scan.
-- A `!` marks a list whose clearing could change behavior (anything referenced). A list that only uses `replace item` is annotated as "looks like a fixed-size array", since replacing items in an emptied list does nothing.
-
-Responses:
+The prompt supports:
 
 | Input | Action |
 | --- | --- |
-| Enter, `n`, `no`, `none`, `keep` | Keep every list. |
-| `a`, `all` | Select all listed lists. |
-| `u`, `unreferenced`, `safe` | Select only lists nothing references (no `!`). |
-| `1,3,5-7` | Select those numbers; commas or spaces separate, `a-b` is an inclusive range. |
-| `s N` | Print the first 8 items of list N (each truncated to 70 characters), then ask again. |
+| Enter / `n` / `no` / `none` / `keep` | Keep all lists. |
+| `a` / `all` | Select all candidates. |
+| `u` / `unreferenced` / `safe` | Select only lists with no modeled references. |
+| `1,3,5-7` | Select list numbers/ranges. |
+| `s N` | Show the first eight items of list `N`, then prompt again. |
 
-After a selection the script reports how many bytes it expects to save. If any selected list is marked `!`, it lists them and requires you to type `yes` to proceed; anything else returns you to the prompt.
+Clearing a list empties its contents but leaves the list definition in place.
 
-Clearing a list only empties its contents (`[]`). The list stays defined, so block references and monitors keep resolving.
+Lists marked as behavior-sensitive require an explicit `yes` confirmation before they are cleared.
 
-### Constant variables (`--fold-constant-variables`)
+### Constant variables
 
-Candidates are variables that satisfy all of these:
+`--fold-constant-variables` prompts for eligible variables.
 
-- exactly one `set variable to` block in the whole project, and its value input is a literal (numeric tags 4 to 8 or text tag 10);
-- at least one reporter use in an input;
-- no `change variable by` block;
-- not a cloud variable;
-- an initial value that is a finite number or a string (booleans are skipped).
+A candidate must have a modeled write-once pattern, a literal setter input, a reporter use, no `change variable by`, no cloud status, and a finite numeric/string initial value.
 
-Variable names are resolved with Scratch's local-then-Stage scope rule. Folding replaces each reporter use (`[12, name, id]`) with `[4, value]` for numbers or `[10, value]` for strings, using the variable's **initial value stored in `project.json`**, which can differ from the value the setter assigns at runtime. After folding, the setter block is removed only if it assigns the same value as the initial value and has no attached comment; otherwise it remains. The variable definition remains.
+The transform substitutes the **initial value stored in `project.json`**, not necessarily the value later assigned by the setter.
 
-The table shows scope, name, reporter-use count, and an estimated byte change per candidate. Candidates where folding would grow the file are marked `LOSS`; variables with `change variable by` blocks are excluded by the finder.
+Pressing Enter keeps everything. The prompt also supports selecting positive-saving candidates or individual candidates. Loss-making candidates require explicit confirmation.
 
-| Input | Action |
-| --- | --- |
-| Enter, `n`, `no`, `none`, `keep` | Keep every variable. |
-| `p`, `positive`, `safe`, `s` | Fold only candidates that reduce the file. |
-| `u`, `unchanged` | Fold only candidates that reduce the file and have no `change variable by`. |
-| `a`, `all` | Fold every candidate. |
-| `1,3,5-7` | Fold those numbers. |
+EOF or Ctrl-C is handled safely; Ctrl-C exits with status `130` and writes nothing.
 
-Selecting any `LOSS` candidate requires typing `yes` to confirm. `--all-optimizations` does not enable this transform.
+## Transformation pipeline
 
-## Optional transforms
+For the normal non-lossless pipeline, transforms run in this order, subject to their options:
 
-### ID renaming
+1. Normalize block defaults:
+   - drop `topLevel: false`;
+   - drop `shadow: false`;
+   - normalize `mutation.warp` to a boolean.
+2. Convert WAV sounds to MP3, if enabled.
+3. Deduplicate assets, if enabled.
+4. Strip sprite comments, unless `--keep-comments`.
+5. Round positions, unless `--keep-positions`.
+6. Reset covered shadow values, unless `--keep-covered`.
+7. Clean monitors, unless `--keep-monitors`.
+8. Clear lists selected by the interactive prompt.
+9. Remove unreachable blocks.
+10. Remove unused procedures.
+11. Re-scan and remove newly unreachable blocks.
+12. Fold selected constant variables.
+13. Propagate script constants.
+14. Rewrite script control structures.
+15. Merge associative constants.
+16. Specialize custom procedures.
+17. Fold constant expressions.
+18. Simplify boolean control flow.
+19. Simplify setter RHS blocks.
+20. Group similar sequences.
+21. Optimize custom-procedure arguments.
+22. Merge duplicate procedures.
+23. Inline safe single-use procedures.
+24. Remove procedures made unused by the preceding procedure passes.
+25. Remove unused variables/lists.
+26. Repair dangling broadcast references.
+27. Remove unused broadcasts.
+28. Rename names/identifiers.
+29. Rename variable/list IDs.
+30. Rename broadcast IDs.
+31. Rename argument IDs.
+32. Rename block IDs.
+33. Compact numeric inputs.
+34. Compact redundant field IDs.
+35. Compact `mutation.hasnext`.
+36. Compact mutation metadata.
+37. Normalize numbers.
+38. Remove sound metadata unless `--keep-sound-metadata`.
+39. Remove empty fields.
+40. Remove empty inputs.
+41. Remove redundant costume metadata.
+42. Remove default target properties.
+43. Remove empty target containers.
+44. Remove project metadata.
+45. Compact data literals.
+46. Strip reference names.
+47. Remove unused extensions.
+48. Repair dangling block links.
 
-All renaming uses the same 87-character alphabet (`!@#$%^*()+_-={}|[]:;?,./~`, `A-Z`, `a-z`, and `0-9`). The first 87 IDs are one character, the next 7569 are two characters, and so on. Every rewrite updates all references so the project stays functional.
+Then:
 
-- **`--rename-block-ids`**: block IDs are unique per sprite, so renaming is per sprite. Rewrites the block table keys plus every `next`, `parent`, input reference (including shadow slots), and comment `blockId`. IDs that are already dangling in the source are reserved so a new ID can never collide with them.
-- **`--rename-variable-ids`** / **`--rename-list-ids`**: Stage (global) data is renamed first, then each sprite's local data. All new IDs are unique across the whole project. Rewrites the `variables`/`lists` tables, `VARIABLE`/`LIST` fields, variable and list reporter primitives (including those nested in inputs and those stored in the block table), and monitor IDs, honoring local-over-global resolution.
-- **`--rename-broadcast-ids`**: renames broadcast IDs project-wide while preserving each broadcast's name. Rewrites broadcast tables, `BROADCAST_OPTION`/`BROADCAST_INPUT` fields, and broadcast primitives in inputs. New IDs avoid those assigned to variables and lists.
-- **`--rename-argument-ids`**: renames custom-block argument IDs inside `procedures_prototype` and `procedures_call` mutations (`argumentids`) and the matching input keys. For each procedure code within a sprite, renaming happens only if every prototype and call agrees on the same `argumentids` list; otherwise that procedure is skipped.
-- **`--frequency-block-ids`**: orders block IDs by how often each block is referenced (via `next`, `parent`, inputs, and comments), so the most-referenced blocks get one-character IDs.
-- **`--frequency-data-ids`**: the same idea for variables, lists, and broadcasts.
+49. Optionally relabel block IDs for the JSON minimum model.
+50. Serialize `project.json`.
+51. Optionally optimize its layout/compression.
+52. Write `project.json` and assets to a new ZIP.
+53. Verify the output.
+54. Delete the output if verification fails.
 
-Renamed projects are harder to compare by eye. The verifier reverses every mapping before comparing against the original.
+The actual stage progress bar reflects only enabled stages, so disabled transforms do not appear as completed work.
 
-### Identifier name shortening
+## Always-on repairs and invariants
 
-`--rename-identifiers` enables `--rename-variable-names`, `--rename-list-names`, `--rename-broadcast-names`, and `--rename-argument-names`. Each category flag can also be used independently. Renaming updates variable/list reporter labels, broadcast definitions and references, procedure mutation `argumentnames`, and `argument_reporter` labels together. These flags do not change variable, list, broadcast, block, or argument IDs; use the `--rename-*-ids` flags for IDs.
+Several operations happen independently of the optional transform flags:
 
-### Removing dead data
+- `topLevel: false`, `shadow: false`, and string-valued `mutation.warp` are normalized.
+- Sound `rate` and `sampleCount` are removed unless `--keep-sound-metadata` is set.
+- Dangling `next`/`parent` block links are repaired.
+- Inputs pointing to missing blocks are removed or reduced to their surviving shadow value.
+- Unambiguous missing parent links may be restored.
+- Comments pointing to missing blocks are deleted.
+- A referenced-but-undefined broadcast can be repaired into the appropriate broadcast table. Conflicting names for the same missing ID are rejected rather than guessed.
+- Verification always runs after a successful non-lossless write.
 
-- **`--remove-unused-variables`** / **`--remove-unused-lists`**: remove entries that no block or monitor references. A reference is a `VARIABLE`/`LIST` field, a reporter primitive anywhere in a block, or a monitor entry. A variable is also treated as referenced if a `sensing_of` block selects a property with that variable's name (for reading another sprite's variable). **Cloud variables are never removed.**
-- **`--remove-unused-broadcasts`**: removes broadcast definitions that no block references.
-- **`--remove-unreachable`**: removes any block that cannot be reached from a root. Roots are blocks marked `topLevel` and variable/list primitives in the block table. Reachability follows `next` and every block or shadow reference in inputs; it does not follow `parent` links. Loose, detached fragments are deleted.
-- **`--remove-unused-procedures`**: within each sprite, finds `procedures_definition` blocks and gathers each body by following `parent` links. Calls made from outside any definition are entry points; calls inside definitions keep their callees alive transitively. Definitions (and their bodies) of procedures never reached are deleted. Matching is by `proccode`. A procedure that is only called by itself (or only by other dead procedures) is considered dead.
+## JSON and archive optimization
 
-These can change behavior if a project relies on data or scripts that are only reachable through means the script does not model. Review the result before shipping.
+### Normal ZIP writing
 
-### Normalization and compaction
+The output contains `project.json` first, followed by assets.
 
-- **`--normalize-numbers`** walks every target and monitor and rewrites floats:
-  - integral floats (`1.0`, `-3.0`) become integers (negative zero `-0.0` is preserved);
-  - floats within `--normalize-epsilon` (default `1e-8`) of a non-zero integer snap to that integer (`2.000000001` becomes `2`);
-  - values near zero are not snapped to zero; `NaN`/infinity and strings are untouched.
+The normal archive writer uses DEFLATE with `--compression-level` (default `9`).
 
-  This applies everywhere numbers appear, including variable values, list items, and sprite properties, so the near-integer snapping is lossy by design.
-- **`--compact-numeric-inputs`**: for numeric-tag shadow values stored as strings (tags 4 to 8), converts the string to a JSON number only when the text is the canonical form of that number: `"15"` becomes `15`, `"1.5"` becomes `1.5`. Text such as `"007"`, `"+5"`, `" 5"`, `"1.50"`, `"-0"`, or anything with an exponent is left as is. Plain text values (tag 10) are never converted.
-- **`--compact-field-ids`**: field tuples serialized as `[value, null]` become `[value]`. Only an explicit `null` slot is removed; empty-string and non-null IDs are preserved.
-- **`--compact-mutation-hasnext`**: removes `mutation.hasnext` when it is `false` or `"false"`.
-- **`--compact-mutation-metadata`**: re-serializes the JSON-encoded `argumentids`, `argumentnames`, and `argumentdefaults` strings in mutations without whitespace, with decoded values unchanged. `tagName` and `children` are never removed.
-- **`--fold-constant-expressions`**:
-  - Folds nested `+`, `-`, `*`, `/`, `%`, `=`, `<`, `>`, `and`, `or`, `not`, `length`, and `mathop` reporters for `abs`, `floor`, `ceiling`, `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `ln`, `log`, `e ^`, and `10 ^` when their inputs are constant.
-  - Numeric strings may be decimal or prefixed with `0b`, `0o`, or `0x`; surrounding whitespace is ignored.
-  - Booleans are implicitly converted to `1` or `0` when used numerically.
-  - Expressions involving variables, unsupported math operations, division/modulo by zero, or non-finite results are left unchanged.
-  - Folded booleans are encoded according to their destination: false becomes the empty input `[2, null]`, true becomes a `not <>` reporter with an empty operand, and booleans in other sockets become text literals `"true"` or `"false"`.
-  - The transform avoids folding expressions with attached comments and verifies the exact input rewrites and any inserted reporter blocks.
-- **`--remove-empty-fields`** / **`--remove-empty-inputs`**: delete empty `fields`/`inputs` objects. The default keeps these containers.
-- **`--remove-costume-metadata`**: removes a costume's `md5ext` only when it equals `<assetId>.<dataFormat>` and that asset exists in the archive; removes `bitmapResolution` only from SVG costumes when it equals `1`. Bitmap costumes are never changed.
-- **`--remove-default-target-properties`**: removes properties exactly equal (value and type) to Scratch's defaults.
-  - Stage:
-    - `currentCostume`: 0
-    - `volume`: 100
-    - `tempo`: 60
-    - `videoTransparency`: 50
-    - `videoState`: `"on"`
-    - `textToSpeechLanguage`: `null`.
-  - Sprites:
-    - `currentCostume`: 0
-    - `volume`: 100
-    - `visible`: true
-    - `x`: 0
-    - `y`: 0
-    - `size`: 100
-    - `direction`: 90
-    - `draggable`: false
-    - `rotationStyle`: `"all around"`.
-- **`--remove-empty-containers`**: removes empty `lists`, `broadcasts`, and `comments` objects from targets.
-- **`--remove-project-meta`**: removes `meta.agent` and `meta.platform`. `meta.semver` and `meta.vm` are kept.
-- **`--sort-keys`**: writes every JSON object with keys in sorted order. This can help compression experiments and makes diffs stable.
+### `--optimize-json`
 
-## `--all-optimizations` in detail
+The JSON optimizer considers multiple valid representations, including:
 
-`--all-optimizations` (alias `--all-flags`) turns on the following:
+- original property order;
+- alternative block-property orders;
+- shorter exact numeric spellings;
+- compact block/default representations when enabled;
+- block-ID relabeling when enabled;
+- bounded layout/window searches;
+- Zopfli when requested.
 
-| Group | Enabled |
-| --- | --- |
-| Identifier renaming | Shortened variable, list, broadcast, and argument names, plus block, variable, list, broadcast, and argument IDs ordered by frequency |
-| Dead data | unused variables, lists, and broadcasts; unreachable blocks; unused procedures |
-| Compaction | `--compact-numeric-inputs`, `--compact-field-ids`, `--compact-mutation-hasnext`, `--fold-constant-expressions`, `--normalize-numbers` |
-| Trimming | `--remove-empty-fields`, `--remove-empty-inputs`, `--remove-costume-metadata`, `--remove-default-target-properties`, `--remove-empty-containers`, `--remove-project-meta` |
-| Archive | `--convert-wav-to-mp3`, `--preserve-asset-compression` (and the no-op `--compress-assets`) |
-| Prompts | neither interactive prompt runs; large lists are not scanned or cleared |
+The optimizer compares candidates using the requested objective and keeps the best candidate.
 
-It does not enable:
+For large `project.json` files, the search is deliberately reduced to prevent compression-search cost from dominating processing time. The large-project thresholds in the script are approximately 1.5 MB of raw JSON or 8,000 blocks.
 
-- `--clear-large-lists` (not part of the batch; lists are not scanned or cleared)
-- `--fold-constant-variables` (needs your selection)
-- `--compact-mutation-metadata`
-- `--sort-keys`
-- `--keep-sound-metadata` (sound `rate`/`sampleCount` are still removed)
+### Asset optimization
 
-`--keep-*` flags, `--compression-level=N`, and `--normalize-epsilon=N` still apply on top of it. The list thresholds are used only with `--clear-large-lists`. Because `--all-optimizations` includes lossy WAV conversion and aggressive removals, review the result for projects that use unusual patterns.
+When `--optimize-assets` is enabled:
 
-## Archive and asset handling
+- already internally compressed formats are preserved without redundant recompression;
+- unchanged assets can be compared against their original compressed streams;
+- Zopfli can be used when enabled;
+- asset data itself is unchanged unless an explicit transform such as WAV-to-MP3 or deduplication changes references.
 
-### Output archive
+`--preserve-asset-compression` is useful when an existing DEFLATE stream is already no larger than recompression.
 
-- Entries are written as `project.json` first, then assets in the order they appeared in the input. Converted MP3s are appended after the original assets.
-- All entries use DEFLATE at `--compression-level` (default 9).
-- Non-`project.json` assets are not modified, except for the explicit WAV conversion.
+## Lossless mode
 
-### `--preserve-asset-compression`
+Lossless mode is separate from the normal semantic-minification pipeline.
 
-For each unchanged asset that the original archive stored with DEFLATE, the script compares the original compressed size with what Python's zlib would produce at the chosen level. If the original is no larger, its raw compressed bytes are copied straight into the new archive (with the original CRC, size, and timestamp). Otherwise the asset is recompressed.
+```bash
+python minify_sb3.py project.sb3 --lossless
+```
 
-### `--convert-wav-to-mp3`
+It optimizes:
 
-- Requires `ffmpeg`. Each WAV sound is piped through `ffmpeg` with `libmp3lame` at 128 kbit/s, 44.1 kHz, stereo, with a 120-second timeout per file.
-- The sound's `assetId`, `dataFormat`, and `md5ext` are updated to the MP3's MD5, so asset IDs always match the data.
-- A WAV shared by several sounds is converted once and every sound is repointed; the original WAV is dropped only after all references are updated.
-- If `ffmpeg` is missing or an individual conversion fails, the WAV is kept. The report table does not print a message for this, so check the archive size if you expected savings.
-- Conversion is lossy and re-encodes to a fixed sample rate and channel layout. Because `rate` and `sampleCount` are removed (unless `--keep-sound-metadata`), no stale values are left behind.
+- `project.json` serialization/compression;
+- selected representation-only block defaults;
+- selected costume references;
+- asset DEFLATE streams.
 
-## Invariants the script protects
+The lossless verifier checks:
 
-Some fields cannot be removed without breaking the editor, loader, or VM. The script keeps them, and the verifier enforces them:
+- archive entry names and order;
+- ZIP metadata;
+- every non-`project.json` asset byte-for-byte;
+- exact JSON values;
+- collection order.
 
-- `next` and `parent` stay present on every block (as `null` or a valid block ID).
-- `mutation.tagName` and `mutation.children` are retained so the block-to-XML conversion works when the project is opened in the editor.
-- Sound and costume `md5ext`/`assetId` values stay consistent with the archive's asset names and actual MD5 hashes.
-- Variable, list, comment, costume, sound, monitor, and target entries are not removed wholesale unless a transform explicitly says so.
-- Numeric strings are preserved unless you request `--compact-numeric-inputs` or `--fold-constant-expressions`, which operate only on the specific shapes described above.
-- Variable definitions and values, broadcast names, and list contents are unchanged unless a transform explicitly changes them. Constant-variable folding can replace reporters and may remove a setter that exactly matches the initial value; constant-expression folding rewrites only the selected constant input trees.
-- Stage comments and `_twconfig_` metadata are untouched.
+The only permitted representation changes are the ones explicitly selected by the lossless options, such as approved block-flag/default compaction or block-ID relabeling.
+
+`--all-lossless`, `--all-safe`, and `--all-safe-flags` enable the strongest built-in lossless bundle and require Zopfli.
 
 ## Verification
 
-After the output is written, the script reloads both archives and checks the following. Any failure deletes the output file, prints the reason, and exits with status 2. The original archive is never modified.
+The normal verifier reloads the original and output archives and checks the archive, project structure, references, and approved transformations.
 
-**Archive level**
-- Both ZIPs pass their CRC test, contain `project.json`, and have no duplicate, absolute, or path-traversing entry names.
-- The output's asset set equals the input's, minus converted WAVs, plus their MP3 replacements.
-- Unchanged assets are byte-for-byte identical; converted assets' MD5s match their new names.
-- Every costume and sound has a valid 32-character hex `assetId`, supported `dataFormat`, a consistent `md5ext`, an existing archive entry whose MD5 matches, and valid numeric `bitmapResolution`/rotation-center/`rate`/`sampleCount` values where present.
+It validates, among other things:
 
-**Block graph**
-- Every block has an opcode, valid `next`/`parent` types, `inputs` and `fields` objects (after normalizing omitted empties), and well-formed mutations.
-- `next` links are reciprocated by the child's `parent`; parents reference their child through `next` or an input; input owners agree with the child's `parent`.
-- Top-level blocks have no parent and shadow blocks are not top-level.
-- No block, broadcast, or comment reference dangles.
+### Archive integrity
 
-**Original-vs-minified comparison** (after reversing any ID renames)
-- Top-level project keys are unchanged (except `meta.agent`/`meta.platform` when `--remove-project-meta` is on).
-- Target count and target properties match, apart from removals explicitly enabled by flags.
-- Variables, lists, and broadcasts match the original except for approved removals or clears; no unexpected new IDs appear; list contents change only for the lists you selected; variable values are unchanged.
-- Blocks match the original except for blocks that the enabled flags say should be gone, with each allowed difference verified (shadow resets, rounding, folded values, compacted fields and mutations, and so on).
-- Comments match, or are fully stripped when `--keep-comments` is off.
-- Sounds match except for removed `rate`/`sampleCount` and approved WAV to MP3 changes; costumes match except for removed metadata.
-- Monitors: nothing new appears, order is preserved, non-variable/list monitors are intact, and every removed monitor was either an orphan or an unused default-layout hidden monitor. No visible monitor is removed.
+- ZIP entry names are valid and non-duplicated.
+- `project.json` exists and can be parsed.
+- Asset references resolve to archive entries.
+- Asset MD5s and metadata are consistent.
+- WAV-to-MP3 conversions have updated asset IDs/references correctly.
+- Unchanged assets remain byte-identical when the transform requires it.
 
-## Output report
+### Block graph
 
-The script prints the input and output paths, then one line per transform with its count, for example:
+- Block opcodes and record structure are valid.
+- `next`/`parent` relationships are coherent.
+- Inputs and shadow references resolve correctly.
+- Top-level/shadow relationships are valid.
+- No unexpected dangling block references remain.
+
+### Data and procedure integrity
+
+- Variable/list/broadcast references are consistent.
+- Approved removed data is absent only where the corresponding transform allows it.
+- Renamed IDs are reversed before comparison.
+- Procedure rewrites, inlining, specialization, argument changes, and other approved graph edits are checked against the transform's recorded edits.
+
+### Monitors, comments, costumes, and sounds
+
+- Monitor order and non-variable/list monitors are preserved.
+- Removed monitors must satisfy the transform's orphan/default-layout rules.
+- Comments and comment links are checked against the selected comment policy.
+- Costume and sound metadata changes are restricted to approved transforms.
+
+If verification fails, the output archive is deleted and the process returns status `2`.
+
+## Output and progress reporting
+
+The normal pipeline prints a live progress bar with stages such as:
+
+```text
+Normalize block defaults
+...
+Optimize project.json
+Process assets and write archive
+Verify output
 ```
+
+Asset optimization also reports an asset counter while processing a large archive.
+
+At completion, the script prints:
+
+```text
 Input : "my_project.sb3"
 Output: "my_project_minified.sb3"
+
 Transforms applied:
-  topLevel:false dropped                       12,340
-  shadow:false dropped                          9,121
-  sprite comments removed                          14
-  position values rounded                       4,882
   ...
-project.json : 812.3000 KiB -> 301.7000 KiB  (-510.6000 KiB, 62.9%)
-archive      : 1.8400 MiB -> 1.2700 MiB
+project.json : ... MiB -> ... MiB  (...)
+archive      : ... MiB -> ... MiB
 ```
 
-Counters appear in this order:
-- `topLevel`,
-- `shadow`,
-- `warp`
-- comments
-- comment links
-- rounded positions
-- covered values
-- monitor changes,
-- large lists cleared and items removed
-- block IDs
-- dangling-reference repairs
-- broadcast repairs and conflicts
-- variable/list/broadcast/argument ID renames
-- removed variables/lists/broadcasts
-- removed blocks and procedures
-- normalized numbers
-- empty fields/inputs
-- costume metadata
-- default target properties
-- empty containers
-- project meta
-- numeric inputs
-- field IDs
-- `hasnext`
-- mutation JSON
-- constant variable reporters and bytes saved
-- constant-variable setters removed/kept
-- shortened identifier names
-- constant expressions folded
+The transform report includes counters for metadata normalization, comments, positions, shadows, monitors, list clearing, dead-code/procedure removal, script rewrites, identifier changes, compaction, asset work, JSON optimization, and verification-related repairs.
 
-Each prints even when it is zero. The sizes shown are for `project.json` and for the whole archive.
+Lossless mode additionally reports JSON encoding trials, the selected JSON lower bound, JSON DEFLATE savings, and asset DEFLATE savings.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Success; output written and verified. |
-| `1` | Bad usage: malformed or unknown flag, no input given, output path equal to input path, input file not found, or no `project.json` in the archive. |
-| `2` | Verification failed; the output file was deleted. |
-| `130` | Aborted (Ctrl-C) at an interactive prompt; nothing was written. |
+| `0` | Success; output was written and verified. |
+| `1` | Invalid usage, missing input, invalid archive, unavailable required compressor, or another pre-write/runtime error. |
+| `2` | Output verification failed; the output was deleted. |
+| `130` | Interactive prompt was aborted with Ctrl-C; nothing was written. |
 
-## Which flags can change behavior?
+## Behavior-changing and potentially lossy transforms
 
-| Risk | Flags |
-| --- | --- |
-| Cosmetic or label changes | default transforms; `--compact-field-ids`, `--compact-mutation-hasnext`, `--compact-mutation-metadata`, `--remove-empty-fields`, `--remove-empty-inputs`, `--remove-costume-metadata`, `--remove-empty-containers`, `--remove-project-meta`, `--sort-keys`, all ID-renaming flags, `--rename-identifiers` |
-| Low risk, depends on project contents | `--compact-numeric-inputs`, `--remove-default-target-properties`, `--fold-constant-expressions`, `--remove-unused-variables`, `--remove-unused-lists`, `--remove-unused-broadcasts` |
-| Can change behavior | clearing lists with `--clear-large-lists`, `--remove-unreachable`, `--remove-unused-procedures`, `--normalize-numbers` (near-integer snapping), `--fold-constant-variables`, `--fold-constant-expressions` (constant-evaluation semantics), `--convert-wav-to-mp3` (lossy audio) |
+These transforms deserve review before shipping the result:
 
-## Known caveats and limitations
+- `--clear-large-lists` can change runtime behavior when selected lists are referenced.
+- `--remove-unreachable` can remove scripts that the reachability model does not consider live.
+- `--remove-unused-procedures` relies on the procedure-call model implemented by the script.
+- `--fold-constant-variables` uses the stored initial value and can remove a setter in approved cases.
+- `--fold-constant-expressions` uses the script's modeled Scratch coercion/evaluation rules.
+- `--script-constant-propagation` and control-flow rewrites change the serialized program graph.
+- Procedure argument optimization, specialization, duplicate merging, and inlining change procedure structure.
+- `--group-similar-sequences` creates procedures and replaces repeated sequences.
+- `--normalize-numbers` can change near-integer floating-point values by design.
+- `--compact-numeric-inputs` changes JSON number/string representation and can matter to consumers that distinguish the two outside Scratch.
+- `--convert-wav-to-mp3` is lossy audio conversion.
+- `--deduplicate-assets` changes archive/reference structure while retaining the shared asset data.
+- `--strip-reference-names` and similar metadata compaction can affect tools that depend on serialized names rather than Scratch behavior.
+- `--remove-unused-extensions` assumes the script's reference analysis is sufficient for the target project.
 
-These come from reading the code; test the minified project when any of them might apply to you.
+Lossless mode is the appropriate choice when semantic and byte-level preservation are the priority.
 
-- `--compact-numeric-inputs` is textual and does not bound magnitude, so a very long integer string could become a JSON number that loses precision when parsed by a JS-based tool.
-- `--remove-unreachable` and `--remove-unused-procedures` only model `topLevel`, `next`, input references, and `parent` links; scripts that exist but never run (for example, hats nothing triggers) are kept, and unusual hand-edited projects may be pruned more than expected.
-- `--normalize-numbers` rounds floats in any location, including variable values and list items.
-- `--fold-constant-variables` uses the stored initial value, not necessarily the value the setter assigns. A setter is removed only when the script can prove it matches that initial value and has no comment.
-- `--fold-constant-expressions` implements only the listed Scratch operators and a conservative subset of their coercion behavior; review projects using unusual literal types or editor extensions.
-- Missing `ffmpeg` is silent in the transform table; the WAVs are simply retained.
-- `--compress-assets` is parsed but performs no transform.
-- Running with no arguments prints the script's module docstring, which is empty, so see this README for usage.
-- The full archive is held in memory during processing.
-- The Stage's comments and metadata are intentionally skipped by comment stripping.
+## Known limitations
+
+- The normal pipeline loads all assets into memory.
+- `--clear-large-lists` and `--fold-constant-variables` are interactive; they are not enabled by `--all-optimizations`.
+- `--all-optimizations` is intentionally aggressive and can substantially rewrite a project.
+- `--all-flags` adds lossy WAV-to-MP3 conversion.
+- Explicit Zopfli options require the `zopfli` package.
+- `ffmpeg` failures during WAV conversion leave the WAV in place rather than invalidating the whole project.
+- Some transformations intentionally model only the serialized constructs the script understands. Hand-edited or extension-specific project structures should be tested in the intended Scratch/TurboWarp environment.
+- JSON optimization can be CPU-intensive. Large projects use bounded search paths specifically to prevent the compression/layout search from exploding in cost.
+- The script's lossless lower bound is a bound under its selected fixed representation model; it is not a proof of the globally smallest possible Scratch JSON representation.
 
 ## Programmatic use
 
-The module exposes an `Options` class and `minify_sb3(src, dst, opts=None)`. The function prints progress to stdout, returns the same status codes as the CLI (`0`, `1`, `2`, or `130`), and writes the output archive on success.
+The module exposes:
 
 ```python
 from minify_sb3 import Options, minify_sb3
 
 opts = Options(
-    lists=False,  # do not scan/prompt for large lists
+    lists=False,
     rename_block_ids=True,
     remove_unreachable=True,
     normalize_numbers=True,
     compression_level=9,
 )
+
 status = minify_sb3("in.sb3", "out.sb3", opts)
 ```
 
-Notes:
+`minify_sb3()` returns the same status codes used by the CLI.
 
-- `Options` defaults differ from CLI list behavior: `comments`, `positions`, `covered`, `monitors`, and `lists` are `True` on a directly constructed `Options()` object, so programmatic use scans/prompts for large lists unless `lists=False`. The CLI enables this scan only with `--clear-large-lists`; its ordinary default and `--all-optimizations` do not scan lists.
-- Other defaults include:
-  - `compression_level=9`
-  - `list_bytes=4096`
-  - `list_items=1000`
-  - `normalize_epsilon=1e-8`
-- `fold_constant_variables=True` always prompts interactively.
-- Available keyword arguments:
-  - `comments`
-  - `positions`
-  - `covered`
-  - `monitors`
-  - `lists`
-  - `rename_identifiers`
-  - `rename_variable_names`
-  - `rename_list_names`
-  - `rename_broadcast_names`
-  - `rename_argument_names`
-  - `rename_block_ids`
-  - `rename_variable_ids`
-  - `rename_list_ids`
-  - `rename_broadcast_ids`
-  - `rename_argument_ids`
-  - `remove_unused_variables`
-  - `remove_unused_lists`
-  - `remove_unused_broadcasts`
-  - `remove_unreachable`
-  - `remove_unused_procedures`
-  - `normalize_numbers`
-  - `remove_empty_fields`
-  - `remove_empty_inputs`
-  - `remove_costume_metadata`
-  - `remove_default_target_properties`
-  - `remove_empty_containers` / `remove_empty_target_containers`
-  - `remove_project_meta`
-  - `convert_wav_to_mp3`
-  - `compress_assets`
-  - `sort_keys`
-  - `compression_level`
-  - `list_bytes`
-  - `list_items`
-  - `normalize_epsilon`
-  - `keep_sound_metadata`
-  - `preserve_asset_compression`
-  - `frequency_block_ids`
-  - `frequency_data_ids`
-  - `compact_numeric_inputs`
-  - `compact_field_ids`
-  - `compact_mutation_hasnext`
-  - `compact_mutation_metadata`
-  - `fold_constant_variables`
-  - `fold_constant_expressions`
-  - `group_similar_sequences`
-- Frequency ordering is selected by `frequency_block_ids`/`frequency_data_ids` together with the corresponding `rename_*` flag; on the CLI the `--frequency-*` flags set both for you.
-- An `Options` instance accumulates run state (rename maps, cleared lists, conversion maps) that the verifier reads, so create a fresh one for each call.
-- Lower-level helpers such as `find_large_lists`, `apply_transforms`, and `verify` are importable too, but they are internal and may change.
+### `Options` keyword arguments
 
-## Example usage
+The `Options` constructor currently accepts:
+
+```text
+comments
+positions
+covered
+monitors
+lists
+
+rename_block_ids
+rename_variable_ids
+rename_list_ids
+rename_broadcast_ids
+rename_argument_ids
+
+rename_identifiers
+rename_variable_names
+rename_list_names
+rename_broadcast_names
+rename_argument_names
+rename_procedure_names
+
+remove_unused_variables
+remove_unused_lists
+remove_unused_broadcasts
+remove_unreachable
+remove_unused_procedures
+
+normalize_numbers
+remove_empty_fields
+remove_empty_inputs
+remove_costume_metadata
+remove_default_target_properties
+remove_empty_containers
+remove_empty_target_containers
+remove_project_meta
+
+convert_wav_to_mp3
+compress_assets
+sort_keys
+compression_level
+list_bytes
+list_items
+normalize_epsilon
+keep_sound_metadata
+preserve_asset_compression
+
+frequency_block_ids
+frequency_data_ids
+
+compact_numeric_inputs
+compact_field_ids
+compact_mutation_hasnext
+compact_mutation_metadata
+
+fold_constant_variables
+fold_constant_expressions
+simplify_boolean_control
+simplify_blocks
+
+deduplicate_assets
+
+optimize_procedure_arguments
+merge_duplicate_procedures
+inline_single_use_procedures
+procedure_inline_passes
+
+specialize_procedures
+procedure_specialization_passes
+procedure_specialization_min_calls
+
+branch_swapping
+trivial_loops
+nested_conditionals
+associative_constant_merging
+script_constant_propagation
+
+strip_reference_names
+compact_data_literals
+remove_unused_extensions
+
+group_similar_sequences
+sequence_threshold
+
+lossless
+all_lossless
+
+optimize_json
+optimize_assets
+compact_block_defaults
+zopfli
+zopfli_assets
+zopfli_iterations
+compact_costume_references
+compact_block_flags
+minimum_json
+json_search_rounds
+relabel_block_ids
+auto_zopfli
+```
+
+Important programmatic defaults:
+
+- `compression_level=9`
+- `list_bytes=4096`
+- `list_items=1000`
+- `normalize_epsilon=1e-8`
+- `zopfli_iterations=5`
+- `procedure_inline_passes=8`
+- `procedure_specialization_passes=4`
+- `procedure_specialization_min_calls=2`
+- `sequence_threshold=3`
+
+Unlike the CLI, a directly constructed `Options()` has `lists=True`, so programmatic callers should set `lists=False` if they do not want an interactive large-list prompt.
+
+`Options` also accumulates internal state used by verification, including rename maps, cleared-list selections, asset conversions, and recorded graph edits. Use a fresh `Options` object for each independent run.
+
+## Examples
 
 ```bash
-# Defaults; large-list scan is off
-python minify_sb3.py my_project.sb3
+# Default minification
+python minify_sb3.py project.sb3
 
-# Opt in to scanning and prompting about large lists
-python minify_sb3.py my_project.sb3 --clear-large-lists
+# Keep comments and monitors
+python minify_sb3.py project.sb3 --keep-comments --keep-monitors
 
-# Every non-interactive optimization
-python minify_sb3.py my_project.sb3 my_project_minified.sb3 --all-optimizations
+# Remove dead data and dead scripts
+python minify_sb3.py project.sb3 \
+    --remove-unused-variables \
+    --remove-unused-lists \
+    --remove-unused-broadcasts \
+    --remove-unreachable \
+    --remove-unused-procedures
 
-# Keep editor data, canonical key order
-python minify_sb3.py my_project.sb3 --keep-comments --keep-monitors --sort-keys
+# Rename all supported user-facing identifiers
+python minify_sb3.py project.sb3 --rename-identifiers
 
-# Constant folding only
-python minify_sb3.py my_project.sb3 --fold-constant-expressions
+# Rename IDs by reference frequency
+python minify_sb3.py project.sb3 \
+    --frequency-block-ids \
+    --frequency-data-ids
 
-# Shrink audio only
-python minify_sb3.py my_project.sb3 --convert-wav-to-mp3
+# Fold constant expressions
+python minify_sb3.py project.sb3 --fold-constant-expressions
 
-# Aggressive, then fold write-once variables interactively
-python minify_sb3.py my_project.sb3 --all-optimizations --fold-constant-variables
+# Optimize custom procedures
+python minify_sb3.py project.sb3 \
+    --optimize-procedure-arguments \
+    --merge-duplicate-procedures \
+    --inline-single-use-procedures \
+    --specialize-procedures
 
-# Treat only large lists as candidates for clearing.
-python minify_sb3.py my_project.sb3 --clear-large-lists --list-bytes=65536 --list-items=5000
+# Group repeated sequences
+python minify_sb3.py project.sb3 \
+    --group-similar-sequences \
+    --sequence-threshold=4
 
-# Maximum minimization without touching IDs
-python minify_sb3.py my_project.sb3 --remove-unused-variables --remove-unused-lists \
-    --remove-unreachable --remove-unused-procedures --remove-empty-containers \
-    --remove-default-target-properties --remove-costume-metadata
+# Optimize JSON encoding without enabling all semantic transforms
+python minify_sb3.py project.sb3 \
+    --optimize-json \
+    --json-search-rounds=2
 
-# Shrink all identifiers
-python minify_sb3.py my_project.sb3 --rename-identifiers
+# Optimize assets while preserving unchanged asset streams when possible
+python minify_sb3.py project.sb3 \
+    --optimize-assets \
+    --preserve-asset-compression
 
-# Shrink all variable & list names only
-python minify_sb3.py my_project.sb3 --rename-variable-names --rename-list-names
+# Lossless optimization
+python minify_sb3.py project.sb3 project_lossless.sb3 --all-lossless
+
+# Maximum built-in optimization, including lossy WAV conversion
+python minify_sb3.py project.sb3 project_max.sb3 --all-flags
 ```
