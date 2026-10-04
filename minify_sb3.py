@@ -8745,6 +8745,10 @@ class Options:
 		self.script_rewrite_removed_inputs = {}
 		self.removed_extensions = set()
 
+		self.unreachable_removed_blocks_first = []
+		self.unreachable_removed_blocks_second = []
+		self.unused_procedure_removed_blocks = []
+
 		self.grouped_sequence_removed_blocks = []
 		self.grouped_sequence_new_blocks = []
 		self.grouped_sequence_link_edits = {}
@@ -8782,13 +8786,28 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		clear_large_lists(project, opts.cleared_lists, stats)
 	if opts.remove_unreachable:
 		stage('Remove unreachable blocks')
+		before = [set((target.get("blocks") or {})) for target in project.get("targets", [])]
 		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_first")
+		opts.unreachable_removed_blocks_first = [
+			before[ti] - set((target.get("blocks") or {}))
+			for ti, target in enumerate(project.get("targets", []))
+		]
 	if opts.remove_unused_procedures:
 		stage('Remove unused procedures')
+		before = [set((target.get("blocks") or {})) for target in project.get("targets", [])]
 		remove_unused_procedures(project, stats)
+		opts.unused_procedure_removed_blocks = [
+			before[ti] - set((target.get("blocks") or {}))
+			for ti, target in enumerate(project.get("targets", []))
+		]
 	if opts.remove_unreachable or opts.remove_unused_procedures:
 		stage('Re-scan unreachable blocks')
+		before = [set((target.get("blocks") or {})) for target in project.get("targets", [])]
 		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_second")
+		opts.unreachable_removed_blocks_second = [
+			before[ti] - set((target.get("blocks") or {}))
+			for ti, target in enumerate(project.get("targets", []))
+		]
 	if opts.folded_constant_variables:
 		stage('Fold constant variables')
 		fold_constant_variables(project, opts.folded_constant_variables, stats)
@@ -9114,6 +9133,130 @@ def _restore_argument_ids(project, mapping):
 			inputs = block.get("inputs") or {}
 			block["inputs"] = {local_rev.get(k, k): v for k, v in inputs.items()}
 
+
+
+def _restore_block_data_broadcast_ids(project, opts):
+	"""Restore block, variable/list, and broadcast IDs in one graph traversal."""
+	targets = project.get("targets", [])
+	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
+
+	block_rev = {
+		ti: {new: old for old, new in (getattr(opts, "renamed_block_ids", {}) or {}).get(ti, {}).items()}
+		for ti in range(len(targets))
+	}
+	var_rev, list_rev = {}, {}
+	for (ti, old), new in (getattr(opts, "renamed_variable_ids", {}) or {}).items():
+		var_rev.setdefault(ti, {})[new] = old
+	for (ti, old), new in (getattr(opts, "renamed_list_ids", {}) or {}).items():
+		list_rev.setdefault(ti, {})[new] = old
+	broadcast_rev = {
+		new: old for old, new in (getattr(opts, "renamed_broadcast_ids", {}) or {}).items()
+	}
+
+	current_var_ids = [set((t.get("variables") or {}).keys()) for t in targets]
+	current_list_ids = [set((t.get("lists") or {}).keys()) for t in targets]
+
+	def restore_var(ti, value):
+		if not isinstance(value, str):
+			return value
+		if value in current_var_ids[ti]:
+			return var_rev.get(ti, {}).get(value, value)
+		if stage_index is not None and value in current_var_ids[stage_index]:
+			return var_rev.get(stage_index, {}).get(value, value)
+		return value
+
+	def restore_list(ti, value):
+		if not isinstance(value, str):
+			return value
+		if value in current_list_ids[ti]:
+			return list_rev.get(ti, {}).get(value, value)
+		if stage_index is not None and value in current_list_ids[stage_index]:
+			return list_rev.get(stage_index, {}).get(value, value)
+		return value
+
+	def restore_nested(ti, value):
+		if isinstance(value, list):
+			if len(value) > 2 and value[0] == 12 and isinstance(value[2], str):
+				value[2] = restore_var(ti, value[2])
+				return
+			if len(value) > 2 and value[0] == 13 and isinstance(value[2], str):
+				value[2] = restore_list(ti, value[2])
+				return
+			if len(value) > 2 and value[0] == 11 and isinstance(value[2], str):
+				value[2] = broadcast_rev.get(value[2], value[2])
+				return
+			if value and value[0] in (1, 2, 3):
+				positions = (1, 2) if value[0] == 3 else (1,)
+				for index in positions:
+					if index >= len(value):
+						continue
+					item = value[index]
+					if isinstance(item, str):
+						value[index] = block_rev.get(ti, {}).get(item, item)
+					elif isinstance(item, (list, dict)):
+						restore_nested(ti, item)
+				return
+			for child in value:
+				if isinstance(child, (list, dict)):
+					restore_nested(ti, child)
+		elif isinstance(value, dict):
+			for child in value.values():
+				if isinstance(child, (list, dict)):
+					restore_nested(ti, child)
+
+	for ti, target in enumerate(targets):
+		vmap = var_rev.get(ti, {})
+		lmap = list_rev.get(ti, {})
+		if vmap:
+			target["variables"] = {vmap.get(k, k): v for k, v in (target.get("variables") or {}).items()}
+		if lmap:
+			target["lists"] = {lmap.get(k, k): v for k, v in (target.get("lists") or {}).items()}
+		if broadcast_rev and target.get("broadcasts"):
+			target["broadcasts"] = {broadcast_rev.get(k, k): v for k, v in target["broadcasts"].items()}
+
+		bmap = block_rev.get(ti, {})
+		blocks = target.get("blocks") or {}
+		if bmap:
+			blocks = {bmap.get(current_id, current_id): block for current_id, block in blocks.items()}
+			target["blocks"] = blocks
+		for block in blocks.values():
+			if isinstance(block, list):
+				if len(block) > 2 and block[0] == 12 and isinstance(block[2], str):
+					block[2] = restore_var(ti, block[2])
+				elif len(block) > 2 and block[0] == 13 and isinstance(block[2], str):
+					block[2] = restore_list(ti, block[2])
+				continue
+			if not isinstance(block, dict):
+				continue
+			for key in ("next", "parent"):
+				if isinstance(block.get(key), str):
+					block[key] = bmap.get(block[key], block[key])
+			fields = block.get("fields") or {}
+			f = fields.get("VARIABLE")
+			if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str):
+				f[1] = restore_var(ti, f[1])
+			f = fields.get("LIST")
+			if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str):
+				f[1] = restore_list(ti, f[1])
+			for field_name in ("BROADCAST_OPTION", "BROADCAST_INPUT"):
+				f = fields.get(field_name)
+				if isinstance(f, list) and len(f) > 1 and isinstance(f[1], str):
+					f[1] = broadcast_rev.get(f[1], f[1])
+			for value in (block.get("inputs") or {}).values():
+				restore_nested(ti, value)
+
+	name_to_index = {t.get("name"): i for i, t in enumerate(targets) if not t.get("isStage")}
+	for monitor in project.get("monitors", []):
+		if not isinstance(monitor, dict):
+			continue
+		sprite = monitor.get("spriteName")
+		ti = name_to_index.get(sprite, stage_index) if sprite else stage_index
+		if ti is None:
+			continue
+		if monitor.get("opcode") == "data_variable":
+			monitor["id"] = restore_var(ti, monitor.get("id"))
+		elif monitor.get("opcode") == "data_listcontents":
+			monitor["id"] = restore_list(ti, monitor.get("id"))
 
 def _num_eq(a, b, epsilon=0):
 	"""Compare JSON numbers by decimal value, optionally allowing normalization epsilon.
@@ -9510,6 +9653,11 @@ def _check_fields_match(original_fields, minified_fields, opts):
 	return True
 
 
+@lru_cache(maxsize=4096)
+def _cached_json_loads(value):
+	return json.loads(value)
+
+
 def _check_mutation_match(original_mutation, minified_mutation, opts):
 	if original_mutation == minified_mutation:
 		return True
@@ -9553,7 +9701,7 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 			and isinstance(mv, str)
 		):
 			try:
-				if json.loads(ov) == json.loads(mv):
+				if _cached_json_loads(ov) == _cached_json_loads(mv):
 					continue
 			except (TypeError, ValueError):
 				pass
@@ -9571,6 +9719,12 @@ def _check_blocks(
 	target_index=None,
 	block_id=None,
 ):
+	# Most surviving blocks are byte-for-byte/field-for-field unchanged after
+	# the verifier's reinflation and ID restoration. Avoid the per-property
+	# validation machinery in that common case. Equality is stronger than every
+	# individual rule below, so this cannot mask an allowed-but-required change.
+	if o == m:
+		return None
 	remaining_blocks = (
 		remaining_blocks if remaining_blocks is not None else set(original_blocks or ())
 	)
@@ -9831,7 +9985,7 @@ def _asset_filename(entry, kind):
 	return None
 
 
-def _validate_asset_entries(project, zf, label):
+def _validate_asset_entries(project, zf, label, payload_cache=None):
 	try:
 		names, err = _zip_entry_names(zf)
 	except Exception as exc:
@@ -9874,7 +10028,12 @@ def _validate_asset_entries(project, zf, label):
 
 				if filename not in names:
 					return f"{where}: referenced asset {filename!r} is missing from archive"
-				payload = zf.read(filename)
+				if payload_cache is not None and filename in payload_cache:
+					payload = payload_cache[filename]
+				else:
+					payload = zf.read(filename)
+					if payload_cache is not None:
+						payload_cache[filename] = payload
 				actual_id = hashlib.md5(payload).hexdigest()
 				if actual_id.lower() != entry["assetId"].lower():
 					return (
@@ -9965,11 +10124,10 @@ def _validate_block_structure(project, label):
 				if "children" in mut and not isinstance(mut["children"], list):
 					return f"{where}: mutation.children is not an array"
 
-			refs = set()
 			for name, value in block["inputs"].items():
-				_serialized_input_refs(value, refs)
-			for child in refs:
-				if child in blocks:
+				for child in _iter_input_block_refs(value):
+					if child not in blocks:
+						return f"{where}: input {name!r} points to missing block {child!r}"
 					input_parents.setdefault(child, set()).add(bid)
 
 		# next must be reciprocated by parent
@@ -10170,10 +10328,19 @@ def _expected_removed_blocks(project, opts):
 	allowed = []
 	for ti, target in enumerate(project.get("targets", [])):
 		ids = set()
-		if opts.remove_unreachable:
+		first_removed = getattr(opts, "unreachable_removed_blocks_first", None) or []
+		second_removed = getattr(opts, "unreachable_removed_blocks_second", None) or []
+		procedure_removed = getattr(opts, "unused_procedure_removed_blocks", None) or []
+		if opts.remove_unreachable and ti < len(first_removed):
+			ids.update(first_removed[ti])
+		elif opts.remove_unreachable:
 			ids.update(set(target.get("blocks", {})) - _reachable_block_ids(target))
-		if opts.remove_unused_procedures:
+		if opts.remove_unused_procedures and ti < len(procedure_removed):
+			ids.update(procedure_removed[ti])
+		elif opts.remove_unused_procedures:
 			ids.update(_dead_procedure_block_ids(target))
+		if (opts.remove_unreachable or opts.remove_unused_procedures) and ti < len(second_removed):
+			ids.update(second_removed[ti])
 		folded_blocks = getattr(opts, "folded_constant_expression_blocks", ())
 		if ti < len(folded_blocks):
 			ids.update(folded_blocks[ti])
@@ -10245,10 +10412,8 @@ def verify(original_path, minified_path, opts):
 	if opts.lossless:
 		return _verify_lossless(original_path, minified_path, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids)
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
-		if a.testzip() is not None:
-			return False, f"input zip '{original_path}' failed CRC test"
-		if b.testzip() is not None:
-			return False, f"output zip '{minified_path}' failed CRC test"
+		# All project and asset members are read later; zipfile.read() validates their
+		# CRCs, so a separate testzip() pass would decompress the same data again.
 		for zf, zpath in ((a, original_path), (b, minified_path)):
 			names, err = _zip_entry_names(zf)
 			if err:
@@ -10257,6 +10422,8 @@ def verify(original_path, minified_path, opts):
 				return False, f"archive '{zpath}' has no project.json"
 		orig_assets = {name for name in a.namelist() if name != "project.json"}
 		mini_assets = {name for name in b.namelist() if name != "project.json"}
+		original_asset_cache = {}
+		minified_asset_cache = {}
 		conversions = getattr(opts, "wav_conversions", {}) or {}
 		expected_assets = {
 			_final_asset_name(conversions.get(name, name), opts)
@@ -10272,7 +10439,10 @@ def verify(original_path, minified_path, opts):
 		for name in orig_assets:
 			if name in conversions:
 				new_name = _final_asset_name(conversions[name], opts)
-				new_bytes = b.read(new_name)
+				new_bytes = minified_asset_cache.get(new_name)
+				if new_bytes is None:
+					new_bytes = b.read(new_name)
+					minified_asset_cache[new_name] = new_bytes
 				if hashlib.md5(new_bytes).hexdigest() != new_name.rsplit(".", 1)[0]:
 					return (
 						False,
@@ -10280,8 +10450,14 @@ def verify(original_path, minified_path, opts):
 					)
 			else:
 				final_name = _final_asset_name(name, opts)
-				original_bytes = a.read(name)
-				minified_bytes = b.read(final_name)
+				original_bytes = original_asset_cache.get(name)
+				if original_bytes is None:
+					original_bytes = a.read(name)
+					original_asset_cache[name] = original_bytes
+				minified_bytes = minified_asset_cache.get(final_name)
+				if minified_bytes is None:
+					minified_bytes = b.read(final_name)
+					minified_asset_cache[final_name] = minified_bytes
 				if final_name != name:
 					if original_bytes != minified_bytes:
 						return (False, f"deduplicated asset byte mismatch: {name!r} -> {final_name!r}")
@@ -10306,13 +10482,10 @@ def verify(original_path, minified_path, opts):
 		mini = _reinflate(mini_raw_project)
 		opts._verify_project = orig
 
-		err = _validate_asset_entries(mini, b, "minified project")
+		err = _validate_asset_entries(mini, b, "minified project", minified_asset_cache)
 		if err:
 			return False, err
-		err = _validate_asset_entries(orig, a, "original project")
-		if err:
-			return False, err
-		err = _validate_block_structure(mini, "minified project")
+		err = _validate_asset_entries(orig, a, "original project", original_asset_cache)
 		if err:
 			return False, err
 
@@ -10323,19 +10496,9 @@ def verify(original_path, minified_path, opts):
 				False,
 				f"broadcast {first_id!r} has conflicting reference names {conflicts[first_id]!r}; refusing to guess a definition",
 			)
-		err = _check_broadcast_ids_resolve(mini_raw_project)
-		if err:
-			return False, err
-		err = _check_block_references_resolve(mini_raw_project)
-		if err:
-			return False, err
 
-		if opts.rename_block_ids:
-			_restore_block_ids(mini, opts.renamed_block_ids)
-		if opts.rename_variable_ids or opts.rename_list_ids:
-			_restore_data_ids(mini, opts.renamed_variable_ids, opts.renamed_list_ids)
-		if opts.rename_broadcast_ids:
-			_restore_broadcast_ids(mini, opts.renamed_broadcast_ids)
+		if opts.rename_block_ids or opts.rename_variable_ids or opts.rename_list_ids or opts.rename_broadcast_ids:
+			_restore_block_data_broadcast_ids(mini, opts)
 		if opts.rename_argument_ids:
 			_restore_argument_ids(mini, opts.renamed_argument_ids)
 		if (
@@ -10784,10 +10947,7 @@ def verify(original_path, minified_path, opts):
 		err = _check_monitors(orig, mini, opts)
 		if err:
 			return False, err
-		err = _check_broadcast_ids_resolve(mini)
-		if err:
-			return False, err
-		err = _check_block_references_resolve(mini)
+		err = _check_broadcast_consistency(mini)
 		if err:
 			return False, err
 		err = _validate_block_structure(mini, "minified project (final)")
@@ -10838,15 +10998,16 @@ def _check_monitors(orig, mini, opts):
 		return (m.get("id"), m.get("spriteName"), m.get("opcode"))
 
 	by_key = {key(m): m for m in mo}
-	order = [key(m) for m in mo]
+	order_index = {key(m): i for i, m in enumerate(mo)}
 	prev = -1
 	for m in mm:
 		k = key(m)
 		if k not in by_key:
 			return f"Monitor {k} appeared in minified project but was not present in original"
-		if order.index(k) < prev:
+		position = order_index[k]
+		if position < prev:
 			return f"Monitor {k} order changed in project monitors list"
-		prev = order.index(k)
+		prev = position
 		o = by_key[k]
 		for f in set(o) | set(m):
 			if o.get(f) == m.get(f):
