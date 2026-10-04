@@ -265,9 +265,6 @@ def dumps_exact_layout(project, order, short_numbers=False):
 	return "".join(parts).encode("utf-8", "backslashreplace")
 
 
-# Performance guardrails for very large Scratch project.json files.
-# The semantic transforms remain unchanged; only the optional compression/layout
-# search is made progressively cheaper as the JSON becomes expensive to re-compress.
 FAST_JSON_RAW_THRESHOLD = 1_500_000
 FAST_JSON_BLOCK_THRESHOLD = 8_000
 FAST_JSON_ORDER_COUNT = 2
@@ -501,8 +498,8 @@ def _block_slots(target):
 
 
 def _identifier_names(reserved):
-	# All admissible names of JSON payload cost 1 or 2 are enumerated. Cost 3+
-	# ties use printable ASCII; see the identifier assignment proof.
+	# All admissible names of JSON payload cost 1 or 2 are enumerated.
+	# Cost 3+ ties use printable ASCII.
 	chars = tuple(chr(value) for value in range(32, 128) if chr(value) not in '\"\\<&')
 	def allowed(name):
 		return name not in reserved and name not in ("__proto__", "constructor", "prototype") and not _index_key(name)
@@ -561,8 +558,8 @@ def relabel_blocks(project):
 		names = _identifier_names(reserved)
 		ordered = sorted(ids, key=lambda bid: -frequencies[bid])
 		mapping = {bid: next(names) for bid in ordered}
-		# Beyond all cost-3 names this generator omits some UTF-8 ties. Do not
-		# advertise a complete lower-bound certificate beyond that domain.
+
+		# Beyond all cost-3 names this generator omits some UTF-8 ties.
 		if any(len(_quote(name).encode("utf-8")) - 2 > 3 for name in mapping.values()):
 			raise ValueError("block ID minimum certificate supports names of at most 3 payload bytes")
 		maps[ti] = mapping
@@ -773,6 +770,7 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 	identifier_cost = None
 	if relabel_block_ids and not already_relabelled:
 		search_project, _, identifier_cost = relabel_blocks(search_project)
+	
 	prepared_relabelled = bool(relabel_block_ids or already_relabelled)
 	short_minimum_raw = dumps_exact(search_project, True)
 	short_minimum_bytes = len(short_minimum_raw)
@@ -782,12 +780,10 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 	) >= FAST_JSON_BLOCK_THRESHOLD
 	search_level = FAST_JSON_SEARCH_LEVEL if large_project else level
 	best_compressed = deflate(best_raw, search_level)
-	# Always initialize the encoding label from the baseline candidate. Some valid
-	# projects have no candidate that beats the baseline, but the later Zopfli/
-	# DEFLATE checks still need a defined label.
 	best_label = "minimum/raw-zlib" if minimum_json else "original-order/zlib"
 	rank = (lambda encoded, raw: (len(raw), len(encoded))) if minimum_json else (lambda encoded, raw: (len(encoded), len(raw)))
 	pool = []
+
 	def remember(raw, compressed):
 		if not search_rounds: return
 		score = rank(compressed, raw)
@@ -802,8 +798,6 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 	trials = 1
 	seen = set()
 
-	# Large projects do not need the 120-permutation screen. Screen only the
-	# established core layouts, then carry the best few into full-project tests.
 	if large_project:
 		screened_orders = []
 		probe = _sample_blocks(search_project)
@@ -818,8 +812,8 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 		orders = tuple(dict.fromkeys((*BLOCK_KEY_ORDERS, *screened_orders)))
 	trials += screen_trials
 
-	# For large projects use a single fast compressor while ranking candidate layouts.
-	# The final winner is still recompressed with every enabled strategy below.
+	# single fast compressor while ranking candidate layouts
+	# final winner is still recompressed with every enabled strategy below
 	search_compressions = (("zlib", lambda data: deflate(data, search_level)),)
 	if not large_project:
 		search_compressions = tuple((name, lambda data, memory=memory, strategy=strategy: deflate(data, level, memory, strategy))
@@ -842,8 +836,6 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 				best_raw, best_compressed = candidate, compressed
 				best_label = f"{label_prefix}/{compressor}"
 
-	# Large projects only search the compact numeric representation; its final
-	# compression is compared against the best baseline encoding before return.
 	short_modes = (True,) if large_project else (False, True)
 	for short_numbers in short_modes:
 		if minimum_json and not short_numbers: continue
@@ -854,8 +846,6 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 				candidate = dumps_exact(search_project, short_numbers) if order is None else dumps_exact_layout(search_project, order, short_numbers)
 			consider(candidate, f"layout-{order_index}/{'short-numbers' if short_numbers else 'original-numbers'}")
 
-	# Different sprites can benefit from distinct orders. This is valuable on smaller
-	# projects, but its per-target compression cost is disproportionate on large ones.
 	if isinstance(search_project.get("targets"), list) and not large_project:
 		adaptive = dict(search_project)
 		adaptive["targets"] = []
@@ -872,8 +862,6 @@ def optimize_project_json(project, level=9, use_zopfli=False, iterations=15, zop
 		candidate = dumps_exact(adaptive, True)
 		consider(candidate, "per-target/short-numbers")
 
-	# Specialized grouping is another compression-quality refinement. Keep it on small
-	# projects; on large projects the global screen already captures the useful ordering.
 	if not large_project:
 		for grouping in ("shape", "opcode", "target-opcode"):
 			specialized, specialized_trials = _specialized_layout(search_project, orders, level, grouping)
@@ -1410,7 +1398,6 @@ def _is_boolean_slot(block, input_name):
 
 
 def _scratch_numeric_tag(value):
-	"""Return a Scratch JSON numeric tag as an int, including JsonNumber tags."""
 	if isinstance(value, JsonNumber):
 		try:
 			return int(value)
@@ -2057,12 +2044,6 @@ def _rename_id_map(ids, existing_ids=(), prefix=""):
 
 
 def _frequency_optimal_id_map(ids, frequencies=None, existing_ids=(), prefix=""):
-	"""Assign the shortest available identifiers to the most frequent symbols.
-
-	Generated identifiers have strictly increasing JSON payload length under
-	_short_id(), so descending reference frequency is the byte-optimal assignment
-	for this identifier alphabet. Ties are deterministic by the original name.
-	"""
 	ids = list(ids)
 	if not ids:
 		return {}
@@ -3454,7 +3435,6 @@ def _is_hat(block):
 
 
 class _ScratchGraphIndex:
-	"""Cached block graph and reverse edges for a single Scratch target."""
 	__slots__ = ("target", "edges", "parents", "incoming")
 
 	def __init__(self, target):
@@ -3492,7 +3472,6 @@ class _ScratchGraphIndex:
 		return self
 
 	def refresh_blocks(self, block_ids):
-		"""Refresh only the outgoing reference edges of changed/removed blocks."""
 		blocks = self.target.get("blocks", {})
 		for bid in set(block_ids):
 			old_out = self.edges.get(bid, ())
@@ -4576,9 +4555,6 @@ def _procedure_body_argument_uses(info, blocks):
 	used = set()
 	reporter_ids = {}
 	for bid in info["closure"]:
-		# The argument reporters stored in the procedures_prototype are
-		# formal-parameter declarations, not reads performed by the procedure
-		# body. Counting them here would make every formal argument appear used.
 		if bid == info["prototype_id"]:
 			continue
 		block = blocks.get(bid)
@@ -4614,7 +4590,7 @@ def _procedure_input_is_discardable(value, blocks, graph):
 		op = block.get("opcode")
 		if op in _PROCEDURE_EFFECTFUL_ARGUMENT_OPCODES:
 			return False
-		# Unknown command-ish blocks are conservatively treated as effectful.
+		
 		if isinstance(op, str):
 			if op.startswith(("event_", "control_")):
 				return False
@@ -5116,7 +5092,6 @@ def specialize_procedures(project, stats, opts):
 
 
 def inline_single_use_procedures(project, stats, opts):
-	"""Inline single-use custom procedures only when both sides are warp/no-refresh."""
 	targets = project.get("targets", [])
 	opts.inlined_procedure_removed_blocks = [set() for _ in targets]
 	opts.inlined_procedure_link_edits = {}
@@ -5305,8 +5280,6 @@ def inline_single_use_procedures(project, stats, opts):
 						if changed_input:
 							planned_inputs[(survivor_id, input_name)] = new_raw
 
-				# Ensure no surviving block will continue to reference the removed
-				# procedure scaffolding or argument reporters.
 				for survivor_id in closure - removed:
 					block = blocks.get(survivor_id)
 					if not isinstance(block, dict):
@@ -5406,15 +5379,10 @@ def compact_procedure_prototypes(project, stats, opts):
 			parent_id = proto.get("parent")
 			parent = blocks.get(parent_id) if isinstance(parent_id, str) else None
 
-			# deserializeBlocks() creates procedure prototypes as non-shadow blocks.
-			# Record the canonical value explicitly; compact_block_defaults/minify_blocks
-			# may subsequently omit the false field entirely.
 			if proto.get("shadow") is not False:
 				proto["shadow"] = False
 				opts.procedure_prototype_compaction_shadow_edits[(ti, proto_id)] = False
 
-			# The serialized custom_block input is normally already [1, proto_id].
-			# If an input-shadow slot is present, discard it exactly as the VM does.
 			if isinstance(parent, dict):
 				inputs = parent.get("inputs") or {}
 				custom = inputs.get("custom_block")
@@ -5427,9 +5395,6 @@ def compact_procedure_prototypes(project, stats, opts):
 							"custom_block": copy.deepcopy(canonical)
 						}
 
-			# The loader does not retain the prototype's argument-reporter children
-			# as serialized blocks. Remove all direct argument-reporter children,
-			# including disconnected/orphan duplicates with the same parent.
 			removed = set()
 			for child_id, child in list(blocks.items()):
 				if child_id == proto_id or not isinstance(child, dict):
@@ -5445,14 +5410,11 @@ def compact_procedure_prototypes(project, stats, opts):
 			opts.procedure_prototype_compaction_removed_blocks[ti].update(removed)
 			total_reporters += len(removed)
 
-			# The prototype's inputs are only serialized copies of the argument
-			# reporter children. The VM canonical form has an empty input map.
 			old_inputs = proto.get("inputs") or {}
 			if old_inputs:
 				proto["inputs"] = {}
 				opts.procedure_prototype_compaction_input_edits[(ti, proto_id)] = {}
 			elif "inputs" not in proto:
-				# Leave omission alone; final empty-field compaction can remove it.
 				pass
 			else:
 				proto["inputs"] = {}
@@ -5465,14 +5427,6 @@ def compact_procedure_prototypes(project, stats, opts):
 
 
 def optimize_procedure_arguments(project, stats, opts):
-	"""
-	Remove formal arguments which are never read, and fold non-boolean
-	arguments whose every call supplies the same literal.
-
-	An unused argument is removed only when discarding its actual call input is
-	known to be effect-free. A constant argument is folded only from literal
-	call inputs, so it cannot discard random/procedure-call evaluation.
-	"""
 	opts.procedure_argument_mutation_edits = {}
 	opts.procedure_argument_removed_inputs = {}
 	opts.procedure_argument_input_edits = {}
@@ -5499,15 +5453,13 @@ def optimize_procedure_arguments(project, stats, opts):
 		for proc, infos in by_proc.items():
 			if not infos:
 				continue
-			# Multiple definitions sharing a proccode must agree on the formal
-			# signature before any argument can be optimized globally.
 			base_ids = infos[0]["argument_ids"]
 			base_mut = infos[0]["mutation"]
 			kinds = _procedure_argument_kinds(proc, len(base_ids))
 			if kinds is None:
 				continue
 			if any(info["argument_ids"] != base_ids for info in infos):
-				# Different argument IDs are okay, but the positions/count must agree.
+				# different argument IDs are OK, but the positions/count must agree
 				if any(len(info["argument_ids"]) != len(base_ids) for info in infos):
 					continue
 
@@ -5534,7 +5486,6 @@ def optimize_procedure_arguments(project, stats, opts):
 			for idx, kind in enumerate(kinds):
 				used = idx in used_any
 				if not used:
-					# Removing a call argument also removes its evaluation.
 					safe = True
 					for call_id, call in calls:
 						call_ids = _parse_argumentids(call.get("mutation"))
@@ -5549,9 +5500,6 @@ def optimize_procedure_arguments(project, stats, opts):
 						removable.append(idx)
 						continue
 
-				# Constant folding is deliberately restricted to %s/%n-like
-				# arguments; boolean literals are not serialized uniformly enough
-				# for a safe direct insertion into a boolean slot.
 				if used and kind == "%b":
 					continue
 				if not calls:
@@ -5619,8 +5567,6 @@ def optimize_procedure_arguments(project, stats, opts):
 				if not can_constant_fold:
 					break
 			if not can_constant_fold:
-				# Do not fold constants, but an unused argument may still be safe
-				# to remove independently.
 				only_unused = [
 					idx for idx in removable if idx not in constants
 				]
@@ -5665,14 +5611,8 @@ def optimize_procedure_arguments(project, stats, opts):
 				old_inputs = proto.get("inputs") or {}
 				for idx in removed_set:
 					old_inputs.pop(old_ids[idx], None)
-				if not old_inputs:
-					# Keep the dict: Scratch blocks are verifier-reinflated to
-					# the canonical shape later.
-					proto["inputs"] = {}
-				else:
-					proto["inputs"] = old_inputs
-
-				# Replace constant formal reporters inside this procedure body.
+				proto["inputs"] = old_inputs if old_inputs else {}
+				
 				for idx, literal in constants.items():
 					reporters = constant_reporters.get((info["definition_id"], idx), set())
 					if not reporters:
@@ -5701,7 +5641,7 @@ def optimize_procedure_arguments(project, stats, opts):
 						opts.procedure_argument_removed_blocks[ti].add(reporter_id)
 						total_reporters_removed += 1
 
-			# Rewrite every call with the same signature.
+			# rewrite every call with the same signature
 			for call_id, call in calls:
 				call_mut = call.get("mutation")
 				call_ids = _parse_argumentids(call_mut)
@@ -5731,10 +5671,6 @@ def optimize_procedure_arguments(project, stats, opts):
 					old_ids[i] for i in removed_set
 				}
 
-			# After the prototype and calls have been rewritten, remove any
-			# argument_reporter_* blocks for deleted unused formals that are now
-			# genuinely orphaned. Recompute references because the prototype input
-			# that formerly pointed at the reporter has just been removed.
 			reference_counts = _count_block_references(target)
 			old_names = json.loads(base_mut.get("argumentnames") or "[]")
 			removed_names = {old_names[i] for i in removed_set if i < len(old_names)}
@@ -5748,9 +5684,7 @@ def optimize_procedure_arguments(project, stats, opts):
 				name = field[0] if isinstance(field, list) and field and isinstance(field[0], str) else None
 				if name not in removed_names or reference_counts.get(reporter_id, 1) != 1:
 					continue
-				# Restrict cleanup to reporters owned by a procedure being rewritten.
-				# This catches orphan reporters that were never reachable from the
-				# prototype's inputs while avoiding unrelated argument reporters.
+
 				if not any(
 					reporter_id in info["closure"]
 					or block.get("parent") == info["prototype_id"]
@@ -5827,8 +5761,6 @@ def _canonicalize_procedure(target, info, graph=None, procedure_aliases=None):
 	def canonical_proccode_signature(proccode, argument_count):
 		if not isinstance(proccode, str):
 			return None
-		# Scratch custom procedure signatures use %s/%b placeholders. Ignore the
-		# human-readable procedure name but retain placeholder types and order.
 		kinds = tuple(re.findall(r"(?<!\S)(%s|%b)(?!\S)", proccode))
 		return kinds if len(kinds) == argument_count else None
 
@@ -5886,8 +5818,6 @@ def _canonicalize_procedure(target, info, graph=None, procedure_aliases=None):
 		return out
 
 	result = {
-		# Procedure text is intentionally not part of the identity. Placeholder
-		# kinds are carried in prototype_mutation.proccode instead.
 		"prototype_mutation": canonical_mutation(info["prototype"], True),
 		"blocks": [],
 	}
@@ -5932,7 +5862,6 @@ def _procedure_merge_safe(target, info, graph, commented):
 	closure = set(info["closure"])
 	if closure & commented:
 		return False
-	# Every removed procedure must be exclusively owned by its definition.
 	return not any(
 		any(parent not in closure for parent in graph.parents.get(bid, set()))
 		for bid in closure
@@ -5940,7 +5869,6 @@ def _procedure_merge_safe(target, info, graph, commented):
 
 
 def _rewrite_procedure_call_to_canonical(call, canonical_proc, canonical_ids):
-	"""Rewrite a call to a canonical procedure, remapping argument IDs by position."""
 	mut = call.get("mutation")
 	old_ids = _parse_argumentids(mut)
 	if not isinstance(mut, dict) or old_ids is None or len(old_ids) != len(canonical_ids):
@@ -6000,9 +5928,6 @@ def merge_duplicate_procedures(project, stats, opts):
 			for entries in buckets.values():
 				if len(entries) < 2:
 					continue
-				# A procedure code may have multiple definitions. We may only redirect
-				# that code when every definition of it is represented by this equivalence
-				# class; otherwise some calls could acquire different semantics.
 				group_by_proc = {}
 				for proc, info in entries:
 					group_by_proc.setdefault(proc, []).append(info)
@@ -6011,8 +5936,6 @@ def merge_duplicate_procedures(project, stats, opts):
 				if len(group_by_proc) == 1 and len(entries) <= 1:
 					continue
 
-				# Choose the canonical procedure by the cheapest call representation,
-				# then by procedure code and definition ID for deterministic output.
 				call_counts = Counter()
 				for block in (target.get("blocks") or {}).values():
 					if isinstance(block, dict) and block.get("opcode") == "procedures_call":
@@ -6025,7 +5948,6 @@ def merge_duplicate_procedures(project, stats, opts):
 				if any(len(info["argument_ids"]) != len(canonical_ids) for _, info in entries):
 					continue
 
-				# Validate every source procedure's calls before changing anything.
 				valid = True
 				for source_proc, info in entries:
 					if source_proc == canonical_proc:
@@ -6759,7 +6681,7 @@ def remove_constant_variable_setters(project, setters, stats, opts):
 
 
 def _to_scratch_number(val):
-	"""Scratch Cast.toNumber implementation"""
+	
 	if isinstance(val, bool):
 		return 1.0 if val else 0.0
 	if isinstance(val, (int, float)):
@@ -6800,7 +6722,7 @@ def _to_scratch_number(val):
 
 
 def _to_scratch_bool(val):
-	"""Scratch Cast.toBoolean implementation; whitespace is not stripped first."""
+	
 	if isinstance(val, bool):
 		return val
 	if isinstance(val, str):
@@ -6813,7 +6735,7 @@ def _to_scratch_bool(val):
 
 
 def _scratch_string(val):
-	"""Scratch Cast.toString implementation"""
+	
 	if isinstance(val, bool):
 		return "true" if val else "false"
 	if isinstance(val, str):
@@ -7182,7 +7104,6 @@ def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
 		return set()
 
 	if graph is None:
-		# Keep the legacy API usable for callers outside hot paths.
 		graph = _ScratchGraphIndex({"blocks": blocks})
 
 	candidate = set()
@@ -7844,7 +7765,7 @@ def _simplify_double_boolean_negation(value, blocks, owner_id, input_name, incom
 
 
 def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
-	"""Apply safe numeric identities to definitely-numeric reporter expressions."""
+	
 	if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
 		return None
 	block_id = value[1]
@@ -7911,9 +7832,6 @@ def _replace_owner_block_ref(parent_block, old_id, new_id):
 
 
 def _control_substack(value, blocks):
-	# `loads_exact()` represents JSON numbers as JsonNumber (a str subclass),
-	# so comparing the tag directly with integer literals is not reliable.
-	# Normalize the Scratch input tag before testing it.
 	if not isinstance(value, list) or not value:
 		return None
 	tag = _input_tag(value[0])
@@ -7951,7 +7869,7 @@ def _substack_tail(blocks, closure):
 
 
 def _control_owner_edge(blocks, control_id):
-	"""Return (owner_id, edge_kind, edge_name) for a unique direct owner."""
+	
 	control = blocks.get(control_id)
 	if not isinstance(control, dict):
 		return None
@@ -7975,7 +7893,7 @@ def _control_owner_edge(blocks, control_id):
 
 
 def _control_input_replacement(owner, edge_kind, edge_name, old_id, new_id):
-	"""Return a copied owner reference with one direct control edge replaced."""
+	
 	if not isinstance(owner, dict):
 		return None
 	if edge_kind == "next":
@@ -8143,8 +8061,6 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 	if selected_tail is not None and blocks[selected_tail].get("next") is not None:
 		return None
 
-	# Every removed block must belong to this control. No outside edge may
-	# enter the removed closure.
 	for bid in removed:
 		if bid == control_id:
 			continue
@@ -8154,8 +8070,6 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 
 	replacement = selected_closure and _control_substack(selected_raw, blocks) or continuation
 
-	# For a surviving branch, the branch root and continuation get new parents.
-	# For a deletion-only transformation, continuation takes the control's old owner.
 	parent_updates = []
 	next_updates = []
 	if selected_closure:
@@ -8185,7 +8099,7 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 
 
 def simplify_boolean_controls(project, stats, opts, only_repeat_one=False):
-	"""Structurally eliminate constant control-flow constructs."""
+	
 	targets = project.get("targets", [])
 	removed_sets = getattr(opts, "constant_control_removed_blocks", None)
 	if removed_sets is None or len(removed_sets) != len(targets):
@@ -8321,7 +8235,7 @@ def _script_input_root(value, blocks):
 
 
 def _script_condition_is_pure(value, blocks, graph):
-	"""Conservatively prove that a condition has no observable side effects."""
+	
 	seen = set()
 	stack = list(_input_block_ids(value, blocks))
 	while stack:
@@ -8534,7 +8448,7 @@ def _script_plan_nested_if(blocks, outer_id, incoming_refs, graph, commented):
 
 
 def _branch_factor_sequence(blocks, root, closure):
-	"""Follow the lexical next-chain of one substack."""
+	
 	if not isinstance(root, str) or root not in closure:
 		return None
 	sequence = []
@@ -8556,7 +8470,7 @@ def _branch_factor_sequence(blocks, root, closure):
 
 
 def _branch_factor_segment_closure(blocks, sequence, graph):
-	"""Return statement blocks plus their nested reporter/substack input closures."""
+	
 	closure = set(sequence)
 	stack = []
 	for bid in sequence:
@@ -8578,7 +8492,7 @@ def _branch_factor_segment_closure(blocks, sequence, graph):
 
 
 def _branch_factor_value_equal(left, right, blocks, left_closure, right_closure, memo, active):
-	"""Structural comparison of Scratch inputs modulo branch-local block IDs."""
+	
 	if left is right:
 		return True
 	if isinstance(left, str) or isinstance(right, str):
@@ -8758,9 +8672,6 @@ def _branch_factor_plan(target, control_id, graph, commented):
 		then_sequence, else_sequence, blocks, then_closure, else_closure
 	)
 
-	# Identical complete branches can delete the conditional itself. This is
-	# deliberately restricted to nested conditionals so topLevel bookkeeping stays
-	# untouched by this first implementation.
 	if prefix_len == len(then_sequence) == len(else_sequence):
 		keep_closure = _branch_factor_segment_closure(blocks, then_sequence, graph)
 		remove_closure = _branch_factor_segment_closure(blocks, else_sequence, graph)
@@ -8935,7 +8846,7 @@ def _branch_factor_apply(target, plan, opts, stats, ti):
 
 
 def factor_branches(project, stats, opts):
-	"""Factor identical if/else prefixes and suffixes when the exact JSON gets smaller."""
+	
 	total = 0
 	for ti, target in enumerate(project.get("targets", [])):
 		while True:
@@ -8978,7 +8889,7 @@ def factor_branches(project, stats, opts):
 
 
 def simplify_script_structures(project, stats, opts):
-	"""Apply local control rewrites with explicit verifier bookkeeping."""
+	
 	targets = project.get("targets", [])
 	_script_prepare_maps(opts, targets)
 	for ti, target in enumerate(targets):
@@ -9219,7 +9130,6 @@ def _script_literal_payload(value):
 
 
 def _cfg_statement_roots(blocks):
-	"""Return top-level executable script/procedure roots for CFG analysis."""
 	roots = []
 	for bid, block in blocks.items():
 		if not isinstance(block, dict):
@@ -9232,7 +9142,6 @@ def _cfg_statement_roots(blocks):
 
 
 def _cfg_linear_tail(blocks, root):
-	"""Follow lexical `next` links to the last statement in one substack."""
 	if not isinstance(root, str) or root not in blocks:
 		return None
 	current = root
@@ -9250,7 +9159,6 @@ def _cfg_linear_tail(blocks, root):
 
 
 def _cfg_may_fall_through(blocks, block_id, memo=None, active=None):
-	"""Conservatively determine whether a statement can reach its lexical `next`."""
 	if memo is None:
 		memo = {}
 	if active is None:
@@ -9258,8 +9166,6 @@ def _cfg_may_fall_through(blocks, block_id, memo=None, active=None):
 	if block_id in memo:
 		return memo[block_id]
 	if block_id in active:
-		# Recursive structured controls are cyclic only through loops; treating the
-		# cycle as fall-through here is the conservative choice for edge creation.
 		return True
 	block = blocks.get(block_id)
 	if not isinstance(block, dict):
@@ -9352,7 +9258,6 @@ def _build_script_cfg(target):
 		predecessors[b].add(a)
 
 	def process_chain(first, fallthrough, root, active=None):
-		"""Process one lexical statement chain with an explicit continuation."""
 		if active is None:
 			active = set()
 		current = first
@@ -9360,8 +9265,6 @@ def _build_script_cfg(target):
 		while isinstance(current, str) and current in blocks and current not in local_seen:
 			local_seen.add(current)
 			if current in active:
-				# A malformed/cyclic lexical chain. The node is already represented;
-				# do not recurse forever.
 				return
 			active.add(current)
 			block = blocks.get(current)
@@ -9379,7 +9282,7 @@ def _build_script_cfg(target):
 				if body_root is not None:
 					add_edge(current, body_root, root)
 					process_chain(body_root, continuation, root, active)
-				# False branch skips the body.
+
 				if continuation is not None:
 					add_edge(current, continuation, root)
 
@@ -9399,12 +9302,11 @@ def _build_script_cfg(target):
 
 			elif op in {"control_repeat", "control_repeat_until", "control_while"}:
 				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
-				# Loop condition/count can exit before the body executes.
+
 				if continuation is not None:
 					add_edge(current, continuation, root)
 				if body_root is not None:
 					add_edge(current, body_root, root)
-					# Falling off the body starts the next iteration.
 					process_chain(body_root, current, root, active)
 
 			elif op == "control_forever":
@@ -9414,8 +9316,6 @@ def _build_script_cfg(target):
 					process_chain(body_root, current, root, active)
 
 			elif op in {"control_stop", "control_stop_all", "control_stop_other_scripts", "control_delete_this_clone"}:
-				# These terminate the current script/clone.  The special
-				# "other scripts in sprite" form leaves this script running.
 				if op == "control_stop":
 					field = (block.get("fields") or {}).get("STOP_OPTION")
 					option = field[0] if isinstance(field, list) and field and isinstance(field[0], str) else None
@@ -9427,9 +9327,6 @@ def _build_script_cfg(target):
 					add_edge(current, continuation, root)
 
 			active.discard(current)
-			# Continue along the lexical chain. For a control statement whose
-			# body was processed recursively, its own `next` is still the lexical
-			# successor of the control in the enclosing chain.
 			if not isinstance(nxt, str) or nxt not in blocks:
 				return
 			current = nxt
@@ -9439,8 +9336,6 @@ def _build_script_cfg(target):
 			continue
 		process_chain(root, None, root)
 
-	# Restrict each root to its own graph. A malformed project can contain shared
-	# links; constant facts must never leak between unrelated scripts/procedures.
 	for root, nodes in seen_by_root.items():
 		for bid in nodes:
 			successors.setdefault(bid, set()).intersection_update(nodes)
@@ -9450,7 +9345,6 @@ def _build_script_cfg(target):
 
 
 def _cfg_meet_constant_envs(envs):
-	"""Meet known-constant environments: only identical constants on all paths survive."""
 	if not envs:
 		return {}
 	common = dict(envs[0])
@@ -9479,7 +9373,7 @@ def _cfg_is_hard_constant_barrier(block):
 
 
 def _cfg_transfer_constants(block, env):
-	"""Transfer function for the small variable-constant abstract domain."""
+	
 	out = dict(env)
 	if not isinstance(block, dict):
 		return out
@@ -9503,16 +9397,13 @@ def _cfg_transfer_constants(block, env):
 def _cfg_propagate_root_constants(
 	blocks, root, nodes, successors, predecessors, ti, opts, graph
 ):
-	"""Analyze one executable root, then rewrite using only final fixed-point facts."""
+	
 	in_env = {bid: {} for bid in nodes}
 	out_env = {bid: None for bid in nodes}
-	# Start at the root. Successors are scheduled as their predecessor facts
-	# become available, which lets loop backedges refine an already-seen header.
 	worklist = [root]
 	queued = {root}
 	changes = 0
 
-	# Phase 1: fixed-point analysis. Nothing in `blocks` is mutated here.
 	while worklist:
 		bid = worklist.pop()
 		queued.discard(bid)
@@ -9547,9 +9438,6 @@ def _cfg_propagate_root_constants(
 					worklist.append(succ)
 					queued.add(succ)
 
-	# Phase 2: commit replacements only from the converged IN facts. This avoids
-	# permanently materializing a value that was true only on an early iteration
-	# of a loop/branch analysis.
 	propagated = 0
 	for bid in nodes:
 		block = blocks.get(bid)
@@ -9582,7 +9470,6 @@ def _cfg_propagate_root_constants(
 
 
 def propagate_script_constants(project, stats, opts):
-	"""Propagate known variable constants through structured control-flow graphs."""
 	_script_prepare_maps(opts, project.get("targets", []))
 	total = 0
 	analysis_changes = 0
@@ -10682,10 +10569,6 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			before[ti] - set((target.get("blocks") or {}))
 			for ti, target in enumerate(project.get("targets", []))
 		]
-		# This is a second dead-procedure sweep after specialization, argument
-		# optimization, duplicate merging, and/or inlining. Those earlier passes
-		# can make a formerly live procedure unreachable, so every block removed by
-		# this final cleanup must be part of the verifier's approved-removal set.
 		if not hasattr(opts, "unused_procedure_removed_blocks"):
 			opts.unused_procedure_removed_blocks = [set() for _ in project.get("targets", [])]
 		for ti, removed_ids in enumerate(final_removed):
@@ -10978,7 +10861,7 @@ def _restore_argument_ids(project, mapping):
 
 
 def _restore_block_data_broadcast_ids(project, opts):
-	"""Restore block, variable/list, and broadcast IDs in one graph traversal."""
+	
 	targets = project.get("targets", [])
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
 
@@ -11251,9 +11134,6 @@ def _check_argument_id_consistency(target, where, opts=None):
 			and getattr(opts, "compact_procedure_prototypes", False)
 			and not (b.get("inputs") or {})
 		):
-			# Scratch VM deserializeBlocks() canonicalizes procedure prototypes by
-			# discarding their serialized argument-reporter inputs. The mutation
-			# remains the source of truth for the formal argument signature.
 			continue
 		if set(vals) != set((b.get("inputs") or {}).keys()):
 			return (
@@ -11279,10 +11159,6 @@ def _input_val_eq(vo, vm, opts):
 	if opts.normalize_numbers and (_num_eq(vo, vm, opts.normalize_epsilon) or vo == vm):
 		return True
 
-	# The JSON layout optimizer can spell an integral number using exponent
-	# notation (for example 10000 -> 1e4), which changes only the Python
-	# int/float type returned by json.loads. Accept that exact numeric
-	# re-encoding when JSON optimization is enabled.
 	if getattr(opts, "optimize_json", False):
 		if (
 			isinstance(vo, (int, float))
@@ -11300,7 +11176,6 @@ def _input_val_eq(vo, vm, opts):
 
 	if opts.compact_numeric_inputs:
 		if isinstance(vo, str) and isinstance(vm, (int, float)) and not isinstance(vm, bool):
-			# Mirror the integer branch of compact_numeric_inputs exactly.
 			try:
 				iv = int(vo)
 			except (ValueError, OverflowError):
@@ -11310,7 +11185,6 @@ def _input_val_eq(vo, vm, opts):
 					return False
 				return Decimal(str(iv)) == Decimal(str(vm))
 
-			# Mirror the float branch of compact_numeric_inputs exactly.
 			try:
 				fv = float(vo)
 			except (ValueError, OverflowError):
@@ -11575,10 +11449,6 @@ def _check_blocks(
 	target_index=None,
 	block_id=None,
 ):
-	# Most surviving blocks are byte-for-byte/field-for-field unchanged after
-	# the verifier's reinflation and ID restoration. Avoid the per-property
-	# validation machinery in that common case. Equality is stronger than every
-	# individual rule below, so this cannot mask an allowed-but-required change.
 	if o == m:
 		return None
 	remaining_blocks = (
@@ -11665,11 +11535,6 @@ def _check_blocks(
 			script_removed_inputs = getattr(opts, "script_rewrite_removed_inputs", {}) or {}
 			allowed_gone.update(gone_inputs & set(script_removed_inputs.get((target_index, block_id), set())))
 
-			# Schema-changing script rewrites may rename an input slot along with the opcode.
-			# In particular, control_if_else -> control_if moves the surviving else branch
-			# from SUBSTACK2 to SUBSTACK. A later pass may legitimately update that same
-			# surviving input, so accept either the final value as directly equivalent to the
-			# original value, or the optimizer's recorded input edit as the provenance.
 			script_opcodes = getattr(opts, "script_rewrite_opcode_edits", {}) or {}
 			expected_script_opcode = script_opcodes.get((target_index, block_id))
 			script_input_edits = getattr(opts, "script_rewrite_input_edits", {}) or {}
@@ -11831,11 +11696,8 @@ def _check_blocks(
 				and _is_known_orphan_argument_reporter(o, original_blocks or {})
 				and o[k] not in (original_blocks or {})
 			):
-				# Scratch projects can contain shadow argument reporters whose parent
-				# points at an already-missing prototype shadow block. The structural
-				# validator explicitly permits this quirk; accept its canonicalization
-				# here as well without opening generic parent-link repair.
 				continue
+			
 			if (
 				allow_repairs
 				and k in ("next", "parent")
@@ -12371,10 +12233,6 @@ def _make_verify_worker_state(to, tm, opts, target_index, changed):
 		attrs[name] = getattr(opts, name, False)
 	for name in _VERIFY_BLOCK_MAP_ATTRS:
 		value = getattr(opts, name, None)
-		# These two maps are indexed by the *owner* target of the folded
-		# variable, not by the target containing the use. A stage/global
-		# constant can therefore be folded inside another target, so filtering
-		# them to target_index would make the verifier forget the legal rewrite.
 		if name in ("folded_constant_variables", "folded_constant_variable_literals"):
 			attrs[name] = dict(value) if isinstance(value, dict) else {}
 		else:
@@ -12461,13 +12319,8 @@ def _verify_block_chunk(bounds):
 def _verify_target_blocks_parallel(to, tm, opts, target_index):
 	original_blocks = to.get("blocks", {})
 	minified_blocks = tm.get("blocks", {})
-	remaining_blocks = set(minified_blocks)
 	changed = []
 
-	# The equality fast path is intentionally kept in the parent process. Most
-	# Scratch projects contain far more unchanged blocks than changed blocks;
-	# there is no reason to serialize and process those just to rediscover that
-	# they are equal.
 	for position, bid in enumerate(original_blocks):
 		if bid not in minified_blocks:
 			continue
@@ -13689,8 +13542,7 @@ if __name__ == "__main__":
 	args = [a for a in sys.argv[1:] if not a.startswith("--")]
 	values, bad = {}, []
 
-	# Expand named groups recursively while preserving first-seen order. This keeps
-	# ordinary individual flags and valued options fully backwards compatible.
+	# expand named groups recursively while preserving first-seen order
 	expanded_flags = []
 	seen_flags = set()
 	def expand_group(flag, stack=()):
