@@ -62,6 +62,9 @@ toggles = {
 	"--remove-empty-target-containers",
 	"--deduplicate-assets",
 	"--simplify-boolean-control",
+	"--procedure-prototype-compaction",
+	"--compact-procedure-prototypes",
+	"--compact-custom-procedure-prototypes",
 	"--optimize-procedure-arguments",
 	"--optimize-custom-procedure-arguments",
 	"--drop-procedure-arguments",
@@ -137,6 +140,7 @@ groups = {
 		"--rename-argument-names",
 		"--rename-procedure-names",
 		"--all-flags",
+		"--procedure-prototype-compaction",
 		"--optimize-procedure-arguments",
 		"--merge-duplicate-procedures",
 		"--associative-constants",
@@ -153,6 +157,7 @@ groups = {
 		"--specialize-procedures",
 	),
 	"--procedures": (
+		"--procedure-prototype-compaction",
 		"--optimize-procedure-arguments",
 		"--merge-duplicate-procedures",
 		"--inline-single-use-procedures",
@@ -198,6 +203,7 @@ groups = {
 	),
 	"--data-optimization": (
 		"--fold-constant-variables",
+		"--procedure-prototype-compaction",
 		"--optimize-procedure-arguments",
 		"--compact-data-literals",
 		"--compact-numeric-inputs",
