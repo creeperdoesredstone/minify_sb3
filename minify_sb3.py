@@ -3506,6 +3506,33 @@ class _ScratchGraphIndex:
 				self.incoming[ref] += 1
 		return self
 
+	def refresh_after_mutation(self, changed=(), removed=()):
+		removed = set(removed)
+		changed = set(changed) - removed
+
+		for bid in removed:
+			changed.update(self.parents.get(bid, ()))
+		changed.difference_update(removed)
+
+		for bid in removed:
+			for ref in self.edges.get(bid, ()):
+				owners = self.parents.get(ref)
+				if owners is not None:
+					owners.discard(bid)
+					if not owners:
+						del self.parents[ref]
+				count = self.incoming.get(ref, 0) - 1
+				if count > 0:
+					self.incoming[ref] = count
+				else:
+					del self.incoming[ref]
+			self.edges.pop(bid, None)
+			self.parents.pop(bid, None)
+			self.incoming.pop(bid, None)
+
+		self.refresh_blocks(changed)
+		return self
+
 
 def _build_block_graph(target, graph=None):
 	if graph is None:
@@ -4439,7 +4466,10 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			stats["sequence_blocks_removed"] += len(removed)
 			stats["sequence_blocks_added"] += len(generated)
 			stats["sequence_bytes_saved"] += byte_delta
-			graph.rebuild()
+			graph.refresh_after_mutation(
+				changed=set(owner_previews) | set(generated),
+				removed=removed,
+			)
 
 
 
@@ -7294,7 +7324,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				for bid in removed:
 					blocks.pop(bid, None)
 				opts.simplified_block_removed_blocks[ti].update(removed)
-				graph.rebuild()
+				graph.refresh_after_mutation(changed={set_id}, removed=removed)
 
 				total += 1
 				add_count += 1
@@ -7325,7 +7355,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				for bid in removed:
 					blocks.pop(bid, None)
 				opts.simplified_block_removed_blocks[ti].update(removed)
-				graph.rebuild()
+				graph.refresh_after_mutation(changed={set_id}, removed=removed)
 
 				total += 1
 				subtract_count += 1
@@ -7346,7 +7376,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				for bid in removed:
 					blocks.pop(bid, None)
 				opts.simplified_block_removed_blocks[ti].update(removed)
-			graph.rebuild()
+			graph.refresh_after_mutation(changed={set_id, rhs_id}, removed=removed)
 
 			total += 1
 			subtract_count += 1
@@ -8186,7 +8216,6 @@ def simplify_boolean_controls(project, stats, opts, only_repeat_one=False):
 				for bid, next_id in plan["next_updates"]:
 					blocks[bid]["next"] = next_id
 
-				# Record the exact structural differences expected by the verifier.
 				if plan["owner_edge_kind"] == "next":
 					link_edits[(ti, owner_id, "next")] = plan["replacement"]
 				else:
@@ -8202,7 +8231,10 @@ def simplify_boolean_controls(project, stats, opts, only_repeat_one=False):
 				for bid in removed:
 					blocks.pop(bid, None)
 
-				graph.rebuild()
+				graph.refresh_after_mutation(
+					changed={bid} | {x for x, _ in plan["parent_updates"]} | {x for x, _ in plan["next_updates"]},
+					removed=removed,
+				)
 				total += 1
 				changed = True
 				stats["boolean_control_simplifications"] += 1
@@ -8889,7 +8921,6 @@ def factor_branches(project, stats, opts):
 
 
 def simplify_script_structures(project, stats, opts):
-	
 	targets = project.get("targets", [])
 	_script_prepare_maps(opts, targets)
 	for ti, target in enumerate(targets):
@@ -9075,7 +9106,11 @@ def merge_associative_constants(project, stats, opts):
 				for remove_id in plan["removed"]:
 					blocks.pop(remove_id, None)
 				_script_record_removed(opts, ti, plan["removed"])
-				graph.rebuild(); stats["associative_constant_merges"] += 1; count += 1; changed = True; break
+				graph.refresh_after_mutation(
+					changed={bid} | set(_direct_input_block_refs(plan["base"], blocks)),
+					removed=set(plan["removed"]),
+				)
+				stats["associative_constant_merges"] += 1; count += 1; changed = True; break
 			if not changed: break
 	return count
 
@@ -9223,17 +9258,6 @@ def _cfg_substack_may_fall_through(blocks, root, memo=None, active=None):
 
 
 def _build_script_cfg(target):
-	"""
-	Build a structured statement-level CFG for one Scratch target.
-
-	Scratch substacks are represented as ordinary ``next`` chains whose final
-	statement has ``next: null``.  The important detail is that a null ``next``
-	does *not* necessarily mean script termination: the statement may be the
-	last statement of an enclosing ``if``/loop substack and must fall through to
-	that enclosing control's continuation (or loop header).  The previous CFG
-	builder lost those edges, which could incorrectly preserve a constant across
-	a nested conditional.
-	"""
 	blocks = target.get("blocks") or {}
 	roots = _cfg_statement_roots(blocks)
 	successors = {bid: set() for bid in roots}
@@ -9462,8 +9486,7 @@ def _cfg_propagate_root_constants(
 			for dead_id in dead:
 				blocks.pop(dead_id, None)
 			_script_record_removed(opts, ti, dead)
-			if dead:
-				graph.rebuild()
+			graph.refresh_after_mutation(changed={bid}, removed=set(dead))
 			propagated += 1
 
 	return propagated, changes
