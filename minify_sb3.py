@@ -4701,10 +4701,12 @@ def _procedure_update_mutation(mut, arg_ids, arg_names, removed_indices, new_pro
 
 
 def _procedure_warp_enabled(value):
+    """Return whether a procedure is explicitly configured to run without screen refresh."""
     return value is True or (isinstance(value, str) and value.lower() == "true")
 
 
 def _procedure_recursive_set(by_proc):
+    """Find procedures that participate in recursive call cycles."""
     call_graph = {proc: set() for proc in by_proc}
     for proc, infos in by_proc.items():
         for info in infos:
@@ -4734,6 +4736,7 @@ def _procedure_recursive_set(by_proc):
 
 
 def _inline_argument_reporter_refs(value, reporter_ids, replacement):
+    """Replace references to formal-argument reporters with a safe literal."""
     if not isinstance(value, list) or not value:
         return value, False
     tag = value[0]
@@ -4765,6 +4768,7 @@ def _inline_argument_reporter_refs(value, reporter_ids, replacement):
 
 
 def _specialized_proccode(proccode, serial):
+    """Create a deterministic private procedure name for a specialization variant."""
     if not isinstance(proccode, str):
         return None
     percent = proccode.find("%")
@@ -4778,12 +4782,16 @@ def _specialized_proccode(proccode, serial):
 
 
 def _clone_procedure_closure(target, info, specialized_proccode, constant_replacements, stats, opts):
+    """Clone a complete custom procedure and specialize selected argument reporters."""
     blocks = target.get("blocks") or {}
     closure = set(info["closure"])
     if not closure:
         return None
     graph = _ScratchGraphIndex(target)
 
+    # Comments are attached to block IDs rather than procedure instances. Do not
+    # duplicate them implicitly; the normal comment stripping pass runs before
+    # specialization in the optimizer pipeline.
     comments = target.get("comments") or {}
     if any(
         isinstance(comment, dict) and comment.get("blockId") in closure
@@ -4791,6 +4799,9 @@ def _clone_procedure_closure(target, info, specialized_proccode, constant_replac
     ):
         return None
 
+    # Every edge from the procedure closure must remain inside the closure. This
+    # is already guaranteed by _procedure_definition_closure, but recheck the
+    # actual serialized inputs before cloning so malformed projects are skipped.
     for old_id in closure:
         block = blocks.get(old_id)
         if not isinstance(block, dict):
@@ -4800,6 +4811,8 @@ def _clone_procedure_closure(target, info, specialized_proccode, constant_replac
             return None
         parent = block.get("parent")
         if isinstance(parent, str) and parent not in closure:
+            # The definition is allowed to have no parent; all other blocks are
+            # expected to be owned by another block within the procedure.
             return None
         for raw in (block.get("inputs") or {}).values():
             if any(ref not in closure for ref in _iter_input_block_refs(raw)):
@@ -4824,6 +4837,8 @@ def _clone_procedure_closure(target, info, specialized_proccode, constant_replac
         if isinstance(new.get("inputs"), dict):
             for raw in new["inputs"].values():
                 _replace_input_block_ids(raw, new_ids)
+        # A cloned procedure definition is a fresh top-level script, while all
+        # other cloned records retain their original structural metadata.
         if old_id == info["definition_id"]:
             new["parent"] = None
         clones[new_ids[old_id]] = new
@@ -4840,6 +4855,8 @@ def _clone_procedure_closure(target, info, specialized_proccode, constant_replac
         return None
     prototype_mutation["proccode"] = specialized_proccode
 
+    # Locate the cloned argument reporters using the original reporter map, then
+    # replace all of their serialized input references with complete literals.
     body_info = dict(info)
     prototype_owned = {info["prototype_id"]}
     stack = [info["prototype_id"]]
@@ -4875,6 +4892,8 @@ def _clone_procedure_closure(target, info, specialized_proccode, constant_replac
                 )
                 if changed:
                     block.setdefault("inputs", {})[name] = new_raw
+        # A constant formal reporter must now be unreachable from the specialized
+        # body. Refuse the specialization if any serialized reference remains.
         still_referenced = False
         for block_id, block in clones.items():
             if not isinstance(block, dict):
@@ -4892,6 +4911,7 @@ def _clone_procedure_closure(target, info, specialized_proccode, constant_replac
             clones.pop(reporter_id, None)
         removed_reporters.update(cloned_reporters)
 
+    # Ensure no clone input points at a removed reporter or at an original block.
     for block in clones.values():
         if not isinstance(block, dict):
             continue
@@ -4914,9 +4934,10 @@ def specialize_procedures(project, stats, opts):
 
     Unlike safe single-use inlining, specialization does not require a warp
     caller/callee because the call boundary remains intact. To make this a
-    minification optimization, the default mode only specializes a literal signature
-	shared by every live call. The generic procedure is then replaced by the specialized closure,
-	and an exact serialized-size check must prove a strict size decrease before commiting.
+    minification optimization rather than code duplication, the default mode
+    only specializes a literal signature shared by every live call. The generic
+    procedure is then replaced by the specialized closure, and an exact
+    serialized-size check must prove a strict win before anything is committed.
     """
     targets = project.get("targets", [])
     opts.specialized_procedure_new_blocks = [set() for _ in targets]
@@ -4975,6 +4996,9 @@ def specialize_procedures(project, stats, opts):
                 if used is None or not used:
                     continue
 
+                # Build partial constant signatures. Each signature includes only
+                # arguments actually read by the body, so dynamic arguments remain
+                # ordinary call-time values in the specialized variant.
                 groups = {}
                 for call_id, call in calls:
                     call_ids = _parse_argumentids(call.get("mutation"))
@@ -4999,6 +5023,16 @@ def specialize_procedures(project, stats, opts):
                     signature = tuple(signature_items)
                     groups.setdefault(signature, []).append((call_id, call, replacement_constants))
 
+                # There is no gain when all calls already share the same literal
+                # signature: optimize_procedure_arguments can fold those in place.
+                # Partial specialization duplicates a procedure while the generic
+                # definition must remain for the other call signatures. That is
+                # fundamentally hostile to *minification* unless another pass can
+                # immediately eliminate the generic definition. The ordinary
+                # inliner/cleanup pipeline cannot guarantee that, so the default
+                # specialization mode only materializes a variant when one constant
+                # signature covers every live call. In that case the generic closure
+                # can be replaced rather than duplicated.
                 qualifying = [
                     (signature, members)
                     for signature, members in groups.items()
@@ -5007,11 +5041,17 @@ def specialize_procedures(project, stats, opts):
                 if not qualifying:
                     continue
 
+                # Bound code growth per source procedure. Each qualifying variant
+                # is shared by multiple calls, and small procedures are the safest
+                # candidates for the resulting clone.
                 body_size = len(body_info["closure"])
                 if body_size > 192:
                     continue
                 existing_variant_count = 0
                 for signature, members in qualifying[:8]:
+                    # Do not repeat a specialization already materialized in a
+                    # previous pass. Calls now point at the generated proccode, so
+                    # that variant has no matching original procedure entry here.
                     if existing_variant_count >= 8:
                         break
                     representative_constants = members[0][2]
@@ -5033,6 +5073,11 @@ def specialize_procedures(project, stats, opts):
                         continue
                     clones, id_map, new_definition_id, new_prototype_id, removed_reporter_count = cloned
 
+                    # Reject specializations that immediately make the serialized
+                    # project larger. When procedure-name renaming is enabled,
+                    # estimate the eventual short generated name rather than the
+                    # temporary !sN name used during this pass. Later constant
+                    # folding can only improve candidates that survive this gate.
                     def estimated_variant_block(block_id, block):
                         if not isinstance(block, dict):
                             return block
@@ -5067,6 +5112,12 @@ def specialize_procedures(project, stats, opts):
                         after_call = len(dumps_compact(probe_call).encode("utf-8", "backslashreplace"))
                         call_delta += after_call - before_call
 
+                    # This is a replacement, not a duplicate: the generic procedure
+                    # closure is deleted after every live call is redirected. Therefore
+                    # the specialization must prove an actual serialized-size win
+                    # before it is materialized. This prevents the large regression
+                    # caused by cloning procedure bodies whose constants did not expose
+                    # enough simplification.
                     estimated_delta = clone_cost + call_delta - original_cost
                     if estimated_delta >= 0:
                         continue
@@ -5078,7 +5129,8 @@ def specialize_procedures(project, stats, opts):
                     stats["procedure_specialization_blocks_added"] += len(clones)
                     stats["procedure_specialization_blocks_removed"] += len(info["closure"])
                     stats["procedure_specialization_argument_reporters_removed"] += removed_reporter_count
-                   
+                    # Record origin IDs so the verifier can distinguish deliberate
+                    # specialized clones from accidental new blocks.
                     for old_id, new_id in id_map.items():
                         opts.specialized_procedure_block_origins[(ti, new_id)] = old_id
                     opts.specialized_procedure_new_blocks[ti].update(clones)
@@ -5226,6 +5278,9 @@ def inline_single_use_procedures(project, stats, opts):
                 if parent_mode is None:
                     continue
 
+                # Argument reporter shadows attached to the prototype are part of
+                # the procedure scaffold, not actual body uses. Exclude them from
+                # the usage analysis while still removing them with the prototype.
                 prototype_owned = {prototype_id}
                 prototype_stack = [prototype_id]
                 while prototype_stack:
@@ -5294,6 +5349,8 @@ def inline_single_use_procedures(project, stats, opts):
                         if changed_input:
                             planned_inputs[(survivor_id, input_name)] = new_raw
 
+                # Ensure no surviving block will continue to reference the removed
+                # procedure scaffolding or argument reporters.
                 for survivor_id in closure - removed:
                     block = blocks.get(survivor_id)
                     if not isinstance(block, dict):
@@ -8639,44 +8696,406 @@ def _script_literal_payload(value):
 	return literal
 
 
+def _cfg_statement_roots(blocks):
+	"""Return top-level executable script/procedure roots for CFG analysis."""
+	roots = []
+	for bid, block in blocks.items():
+		if not isinstance(block, dict):
+			continue
+		if block.get("topLevel") is True:
+			roots.append(bid)
+		elif block.get("parent") is None and _is_hat(block):
+			roots.append(bid)
+	return roots
+
+
+def _cfg_linear_tail(blocks, root):
+	"""Follow lexical `next` links to the last statement in one substack."""
+	if not isinstance(root, str) or root not in blocks:
+		return None
+	current = root
+	seen = set()
+	while current in blocks and current not in seen:
+		seen.add(current)
+		block = blocks.get(current)
+		if not isinstance(block, dict):
+			return None
+		nxt = block.get("next")
+		if not isinstance(nxt, str) or nxt not in blocks:
+			return current
+		current = nxt
+	return None
+
+
+def _cfg_may_fall_through(blocks, block_id, memo=None, active=None):
+	"""Conservatively determine whether a statement can reach its lexical `next`."""
+	if memo is None:
+		memo = {}
+	if active is None:
+		active = set()
+	if block_id in memo:
+		return memo[block_id]
+	if block_id in active:
+		# Recursive structured controls are cyclic only through loops; treating the
+		# cycle as fall-through here is the conservative choice for edge creation.
+		return True
+	block = blocks.get(block_id)
+	if not isinstance(block, dict):
+		memo[block_id] = False
+		return False
+	op = block.get("opcode", "")
+	if op == "control_stop":
+		field = (block.get("fields") or {}).get("STOP_OPTION")
+		option = field[0] if isinstance(field, list) and field and isinstance(field[0], str) else None
+		result = option == "other scripts in sprite"
+		memo[block_id] = result
+		return result
+	if op in {
+		"control_forever",
+		"control_stop_all",
+		"control_stop_other_scripts",
+		"control_delete_this_clone",
+	}:
+		memo[block_id] = False
+		return False
+
+	active.add(block_id)
+	try:
+		if op == "control_if":
+			inputs = block.get("inputs") or {}
+			root = _control_substack(inputs.get("SUBSTACK"), blocks)
+			result = True if root is None else _cfg_substack_may_fall_through(blocks, root, memo, active)
+		elif op == "control_if_else":
+			inputs = block.get("inputs") or {}
+			then_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+			else_root = _control_substack(inputs.get("SUBSTACK2"), blocks)
+			then_fall = True if then_root is None else _cfg_substack_may_fall_through(blocks, then_root, memo, active)
+			else_fall = True if else_root is None else _cfg_substack_may_fall_through(blocks, else_root, memo, active)
+			result = then_fall or else_fall
+		elif op in {"control_repeat", "control_repeat_until", "control_while"}:
+			# These loops have a lexical exit unless they are a syntactic `forever`.
+			result = True
+		elif op == "control_wait_until":
+			result = True
+		else:
+			result = True
+	finally:
+		active.discard(block_id)
+	memo[block_id] = result
+	return result
+
+
+def _cfg_substack_may_fall_through(blocks, root, memo=None, active=None):
+	if root is None:
+		return True
+	tail = _cfg_linear_tail(blocks, root)
+	if tail is None:
+		return True
+	return _cfg_may_fall_through(blocks, tail, memo, active)
+
+
+def _build_script_cfg(target):
+	"""
+	Build a statement-level CFG for every executable root in one Scratch target.
+
+	Reporter/input blocks are deliberately excluded: they are expression trees,
+	not control-flow statements. Control substacks introduce branch/loop edges;
+	their lexical tails fall through to the enclosing control's `next` where
+	appropriate.
+	"""
+	blocks = target.get("blocks") or {}
+	roots = _cfg_statement_roots(blocks)
+	successors = {bid: set() for bid in roots}
+	predecessors = {bid: set() for bid in roots}
+	seen_by_root = {root: set() for root in roots}
+	falls_memo = {}
+
+	def add_node(root, bid):
+		if bid not in blocks or not isinstance(blocks.get(bid), dict):
+			return False
+		seen = seen_by_root[root]
+		if bid in seen:
+			return True
+		seen.add(bid)
+		successors.setdefault(bid, set())
+		predecessors.setdefault(bid, set())
+		return True
+
+	def add_edge(a, b, root):
+		if not isinstance(b, str) or b not in blocks or not isinstance(blocks.get(b), dict):
+			return
+		add_node(root, b)
+		successors.setdefault(a, set()).add(b)
+		predecessors.setdefault(b, set()).add(a)
+
+	for root in roots:
+		if not add_node(root, root):
+			continue
+		queue = [root]
+		while queue:
+			bid = queue.pop()
+			block = blocks.get(bid)
+			if not isinstance(block, dict):
+				continue
+			op = block.get("opcode", "")
+			inputs = block.get("inputs") or {}
+			nxt = block.get("next")
+			before = set(successors.get(bid, ()))
+
+			if op == "control_if":
+				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+				if body_root is not None:
+					add_edge(bid, body_root, root)
+					queue.append(body_root)
+				else:
+					add_edge(bid, nxt, root)
+				if body_root is not None:
+					tail = _cfg_linear_tail(blocks, body_root)
+					if tail is not None and _cfg_substack_may_fall_through(blocks, body_root, falls_memo, set()):
+						if isinstance(nxt, str) and nxt in blocks:
+							add_edge(tail, nxt, root)
+							queue.append(tail)
+					else:
+						queue.append(tail) if tail is not None else None
+			elif op == "control_if_else":
+				then_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+				else_root = _control_substack(inputs.get("SUBSTACK2"), blocks)
+				if then_root is not None:
+					add_edge(bid, then_root, root)
+					queue.append(then_root)
+				elif isinstance(nxt, str) and nxt in blocks:
+					add_edge(bid, nxt, root)
+				if else_root is not None:
+					add_edge(bid, else_root, root)
+					queue.append(else_root)
+				elif isinstance(nxt, str) and nxt in blocks:
+					# The missing else branch falls through directly.
+					add_edge(bid, nxt, root)
+				for branch_root in (then_root, else_root):
+					if branch_root is None:
+						continue
+					tail = _cfg_linear_tail(blocks, branch_root)
+					if tail is not None:
+						if _cfg_substack_may_fall_through(blocks, branch_root, falls_memo, set()):
+							if isinstance(nxt, str) and nxt in blocks:
+								add_edge(tail, nxt, root)
+							queue.append(tail)
+						else:
+							queue.append(tail)
+			elif op in {"control_repeat", "control_repeat_until", "control_while"}:
+				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+				if body_root is not None:
+					add_edge(bid, body_root, root)
+					queue.append(body_root)
+				if isinstance(nxt, str) and nxt in blocks:
+					add_edge(bid, nxt, root)
+				if body_root is not None:
+					tail = _cfg_linear_tail(blocks, body_root)
+					if tail is not None:
+						if _cfg_substack_may_fall_through(blocks, body_root, falls_memo, set()):
+							add_edge(tail, bid, root)
+							queue.append(tail)
+			elif op == "control_forever":
+				body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
+				if body_root is not None:
+					add_edge(bid, body_root, root)
+					queue.append(body_root)
+					tail = _cfg_linear_tail(blocks, body_root)
+					if tail is not None and _cfg_substack_may_fall_through(blocks, body_root, falls_memo, set()):
+						add_edge(tail, bid, root)
+			elif op in {"control_stop", "control_stop_all", "control_stop_other_scripts", "control_delete_this_clone"}:
+				# These statement-level stops have no normal fall-through in the
+				# forms that terminate the current script. `control_stop` with the
+				# "other scripts" option is handled below as a conservative barrier.
+				if op == "control_stop":
+					option = None
+					field = (block.get("fields") or {}).get("STOP_OPTION")
+					if isinstance(field, list) and field and isinstance(field[0], str):
+						option = field[0]
+					if option == "other scripts in sprite":
+						add_edge(bid, nxt, root)
+			else:
+				add_edge(bid, nxt, root)
+
+			for succ in successors.get(bid, ()) - before:
+				queue.append(succ)
+
+	# Restrict edges to nodes belonging to each individual root. A custom
+	# procedure's CFG must not accidentally meet facts from an unrelated script.
+	root_of = {}
+	for root, nodes in seen_by_root.items():
+		for bid in nodes:
+			root_of.setdefault(bid, root)
+	for bid in list(successors):
+		owner = root_of.get(bid)
+		if owner is None:
+			continue
+		successors[bid].intersection_update(seen_by_root[owner])
+	for bid in list(predecessors):
+		owner = root_of.get(bid)
+		if owner is None:
+			continue
+		predecessors[bid].intersection_update(seen_by_root[owner])
+	return roots, seen_by_root, successors, predecessors
+
+
+def _cfg_meet_constant_envs(envs):
+	"""Meet known-constant environments: only identical constants on all paths survive."""
+	if not envs:
+		return {}
+	common = dict(envs[0])
+	for env in envs[1:]:
+		for vid in list(common):
+			if vid not in env or env[vid] != common[vid]:
+				del common[vid]
+	return common
+
+
+def _cfg_is_hard_constant_barrier(block):
+	if not isinstance(block, dict):
+		return True
+	op = block.get("opcode", "")
+	return (
+		op == "procedures_call"
+		or op in {
+			"control_wait_until",
+			"sensing_askandwait",
+			"sound_playuntildone",
+			"event_broadcastandwait",
+			"control_create_clone_of",
+			"control_delete_this_clone",
+		}
+	)
+
+
+def _cfg_transfer_constants(block, env):
+	"""Transfer function for the small variable-constant abstract domain."""
+	out = dict(env)
+	if not isinstance(block, dict):
+		return out
+	op = block.get("opcode", "")
+	if op == "data_setvariableto":
+		vid = _script_var_id(block)
+		lit = _script_literal_payload((block.get("inputs") or {}).get("VALUE"))
+		if vid and lit is not None:
+			out[vid] = lit
+		elif vid:
+			out.pop(vid, None)
+	elif op == "data_changevariableby":
+		vid = _script_var_id(block)
+		if vid:
+			out.pop(vid, None)
+	if _cfg_is_hard_constant_barrier(block):
+		out.clear()
+	return out
+
+
+def _cfg_propagate_root_constants(
+	blocks, root, nodes, successors, predecessors, ti, opts, graph
+):
+	"""Analyze one executable root, then rewrite using only final fixed-point facts."""
+	in_env = {bid: {} for bid in nodes}
+	out_env = {bid: None for bid in nodes}
+	# Start at the root. Successors are scheduled as their predecessor facts
+	# become available, which lets loop backedges refine an already-seen header.
+	worklist = [root]
+	queued = {root}
+	changes = 0
+
+	# Phase 1: fixed-point analysis. Nothing in `blocks` is mutated here.
+	while worklist:
+		bid = worklist.pop()
+		queued.discard(bid)
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+
+		if bid == root:
+			new_in = {}
+		else:
+			pred_envs = [
+				out_env[p]
+				for p in predecessors.get(bid, ())
+				if out_env.get(p) is not None
+			]
+			new_in = _cfg_meet_constant_envs(pred_envs)
+
+		node_changed = new_in != in_env.get(bid, {})
+		if node_changed:
+			in_env[bid] = new_in
+			changes += 1
+
+		new_out = _cfg_transfer_constants(block, new_in)
+		if new_out != out_env.get(bid):
+			out_env[bid] = new_out
+			node_changed = True
+			changes += 1
+
+		if node_changed:
+			for succ in successors.get(bid, ()):
+				if succ not in queued:
+					worklist.append(succ)
+					queued.add(succ)
+
+	# Phase 2: commit replacements only from the converged IN facts. This avoids
+	# permanently materializing a value that was true only on an early iteration
+	# of a loop/branch analysis.
+	propagated = 0
+	for bid in nodes:
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		env = in_env.get(bid, {})
+		for input_name, raw in list((block.get("inputs") or {}).items()):
+			new, changed, dead = _script_replace_known_reads(
+				raw,
+				env,
+				blocks,
+				bid,
+				ti,
+				opts,
+				graph,
+				allow_literal=not _is_boolean_slot(block, input_name),
+			)
+			if not changed:
+				continue
+			block.setdefault("inputs", {})[input_name] = new
+			opts.script_rewrite_input_edits[(ti, bid, input_name)] = copy.deepcopy(new)
+			for dead_id in dead:
+				blocks.pop(dead_id, None)
+			_script_record_removed(opts, ti, dead)
+			if dead:
+				graph.rebuild()
+			propagated += 1
+
+	return propagated, changes
+
+
 def propagate_script_constants(project, stats, opts):
+	"""Propagate known variable constants through structured control-flow graphs."""
 	_script_prepare_maps(opts, project.get("targets", []))
-	count = 0
+	total = 0
+	analysis_changes = 0
+
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks") or {}
+		if not blocks:
+			continue
+		roots, nodes_by_root, successors, predecessors = _build_script_cfg(target)
 		graph = _ScratchGraphIndex(target)
-		roots = [
-			bid for bid, block in blocks.items()
-			if isinstance(block, dict) and (block.get("topLevel") is True or (block.get("parent") is None and _is_hat(block)))
-		]
 		for root in roots:
-			env = {}; seen = set(); current = root
-			while isinstance(current, str) and current in blocks and current not in seen:
-				seen.add(current)
-				block = blocks[current]
-				if not isinstance(block, dict): break
-				for input_name, raw in list((block.get("inputs") or {}).items()):
-					new, changed, dead = _script_replace_known_reads(raw, env, blocks, current, ti, opts, graph, allow_literal=not _is_boolean_slot(block, input_name))
-					if changed:
-						block.setdefault("inputs", {})[input_name] = new
-						opts.script_rewrite_input_edits[(ti, current, input_name)] = copy.deepcopy(new)
-						for dead_id in dead: blocks.pop(dead_id, None)
-						_script_record_removed(opts, ti, dead)
-						graph.rebuild(); count += 1
-				op = block.get("opcode")
-				if op == "data_setvariableto":
-					vid = _script_var_id(block)
-					lit = _script_literal_payload((block.get("inputs") or {}).get("VALUE"))
-					if vid and lit is not None: env[vid] = lit
-					else: env.pop(vid, None)
-				elif op == "data_changevariableby":
-					env.pop(_script_var_id(block), None)
-				if op.startswith(("event_", "control_", "procedures_")) or op in {"sensing_askandwait", "sound_playuntildone", "event_broadcastandwait"}:
-					env.clear()
-				current = block.get("next") if isinstance(block.get("next"), str) else None
-	stats["script_constants_propagated"] += count
-	return count
+			nodes = nodes_by_root.get(root, set())
+			if not nodes:
+				continue
+			count, iterations = _cfg_propagate_root_constants(
+				blocks, root, nodes, successors, predecessors, ti, opts, graph
+			)
+			total += count
+			analysis_changes += iterations
 
+	stats["script_constants_propagated"] += total
+	stats["script_constant_cfg_changes"] += analysis_changes
+	return total
 
 def _numeric_data_literal(value):
 	if not isinstance(value, str) or not value:
