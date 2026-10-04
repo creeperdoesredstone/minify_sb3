@@ -1065,6 +1065,7 @@ def _progress_stage_count(opts):
 	count += bool(opts.group_similar_sequences)
 	count += bool(opts.optimize_procedure_arguments)
 	count += bool(opts.merge_duplicate_procedures)
+	count += bool(opts.specialize_procedures)
 	count += bool(opts.inline_single_use_procedures)
 	count += bool(opts.remove_unused_procedures and (opts.optimize_procedure_arguments or opts.merge_duplicate_procedures))
 	count += bool(opts.remove_unused_variables or opts.remove_unused_lists)
@@ -4700,12 +4701,10 @@ def _procedure_update_mutation(mut, arg_ids, arg_names, removed_indices, new_pro
 
 
 def _procedure_warp_enabled(value):
-    """Return whether a procedure is explicitly configured to run without screen refresh."""
     return value is True or (isinstance(value, str) and value.lower() == "true")
 
 
 def _procedure_recursive_set(by_proc):
-    """Find procedures that participate in recursive call cycles."""
     call_graph = {proc: set() for proc in by_proc}
     for proc, infos in by_proc.items():
         for info in infos:
@@ -4735,7 +4734,6 @@ def _procedure_recursive_set(by_proc):
 
 
 def _inline_argument_reporter_refs(value, reporter_ids, replacement):
-    """Replace references to formal-argument reporters with a safe literal."""
     if not isinstance(value, list) or not value:
         return value, False
     tag = value[0]
@@ -4763,6 +4761,347 @@ def _inline_argument_reporter_refs(value, reporter_ids, replacement):
                 value[index] = new_item
                 return value, True
     return value, False
+
+
+
+def _specialized_proccode(proccode, serial):
+    if not isinstance(proccode, str):
+        return None
+    percent = proccode.find("%")
+    if percent >= 0:
+        prefix = proccode[:percent]
+        suffix_start = percent
+        while suffix_start > 0 and proccode[suffix_start - 1].isspace():
+            suffix_start -= 1
+        return f"{prefix} !s{serial}{proccode[suffix_start:]}"
+    return f"{proccode} !s{serial}"
+
+
+def _clone_procedure_closure(target, info, specialized_proccode, constant_replacements, stats, opts):
+    blocks = target.get("blocks") or {}
+    closure = set(info["closure"])
+    if not closure:
+        return None
+    graph = _ScratchGraphIndex(target)
+
+    comments = target.get("comments") or {}
+    if any(
+        isinstance(comment, dict) and comment.get("blockId") in closure
+        for comment in comments.values()
+    ):
+        return None
+
+    for old_id in closure:
+        block = blocks.get(old_id)
+        if not isinstance(block, dict):
+            return None
+        nxt = block.get("next")
+        if isinstance(nxt, str) and nxt not in closure:
+            return None
+        parent = block.get("parent")
+        if isinstance(parent, str) and parent not in closure:
+            return None
+        for raw in (block.get("inputs") or {}).values():
+            if any(ref not in closure for ref in _iter_input_block_refs(raw)):
+                return None
+
+    old_ids = list(closure)
+    new_ids = {}
+    for old_id in old_ids:
+        new_id = _create_scratch_id()
+        while new_id in blocks or new_id in new_ids.values():
+            new_id = _create_scratch_id()
+        new_ids[old_id] = new_id
+
+    clones = {}
+    for old_id in old_ids:
+        old = blocks.get(old_id)
+        new = copy.deepcopy(old)
+        if isinstance(new.get("next"), str):
+            new["next"] = new_ids.get(new["next"], new["next"])
+        if isinstance(new.get("parent"), str):
+            new["parent"] = new_ids.get(new["parent"], new["parent"])
+        if isinstance(new.get("inputs"), dict):
+            for raw in new["inputs"].values():
+                _replace_input_block_ids(raw, new_ids)
+        if old_id == info["definition_id"]:
+            new["parent"] = None
+        clones[new_ids[old_id]] = new
+
+    new_prototype_id = new_ids[info["prototype_id"]]
+    new_definition_id = new_ids[info["definition_id"]]
+    new_root = clones[new_definition_id].get("next")
+    if not isinstance(new_root, str) or new_root not in clones:
+        return None
+
+    prototype = clones[new_prototype_id]
+    prototype_mutation = prototype.get("mutation")
+    if not isinstance(prototype_mutation, dict):
+        return None
+    prototype_mutation["proccode"] = specialized_proccode
+
+    body_info = dict(info)
+    prototype_owned = {info["prototype_id"]}
+    stack = [info["prototype_id"]]
+    while stack:
+        current = stack.pop()
+        for ref in graph.edges.get(current, ()):
+            if ref in closure and ref not in prototype_owned:
+                prototype_owned.add(ref)
+                stack.append(ref)
+    body_info["closure"] = closure - prototype_owned - {info["definition_id"]}
+    used, reporter_map, _ = _procedure_body_argument_uses(body_info, blocks)
+    if used is None:
+        return None
+
+    removed_reporters = set()
+    for arg_index, replacement in constant_replacements.items():
+        reporter_ids = set(reporter_map.get(arg_index, ()))
+        if not reporter_ids:
+            continue
+        cloned_reporters = {new_ids[rid] for rid in reporter_ids if rid in new_ids}
+        if not cloned_reporters:
+            continue
+        for block_id in list(clones):
+            if block_id in cloned_reporters:
+                continue
+            block = clones.get(block_id)
+            if not isinstance(block, dict):
+                continue
+            for name, raw in list((block.get("inputs") or {}).items()):
+                new_raw = copy.deepcopy(raw)
+                new_raw, changed = _inline_argument_reporter_refs(
+                    new_raw, cloned_reporters, replacement
+                )
+                if changed:
+                    block.setdefault("inputs", {})[name] = new_raw
+        still_referenced = False
+        for block_id, block in clones.items():
+            if not isinstance(block, dict):
+                continue
+            if any(
+                rid in cloned_reporters
+                for raw in (block.get("inputs") or {}).values()
+                for rid in _iter_input_block_refs(raw)
+            ):
+                still_referenced = True
+                break
+        if still_referenced:
+            return None
+        for reporter_id in cloned_reporters:
+            clones.pop(reporter_id, None)
+        removed_reporters.update(cloned_reporters)
+
+    for block in clones.values():
+        if not isinstance(block, dict):
+            continue
+        for key in ("next", "parent"):
+            ref = block.get(key)
+            if isinstance(ref, str) and ref not in clones and ref not in (None,):
+                # The only legal external parent would have been the original
+                # definition; that relationship was remapped above.
+                return None
+        for raw in (block.get("inputs") or {}).values():
+            refs = set(_iter_input_block_refs(raw))
+            if any(ref not in clones for ref in refs):
+                return None
+
+    return clones, new_ids, new_definition_id, new_prototype_id, len(removed_reporters)
+
+
+def specialize_procedures(project, stats, opts):
+    """Specialize a procedure only when the specialized closure replaces the generic one profitably.
+
+    Unlike safe single-use inlining, specialization does not require a warp
+    caller/callee because the call boundary remains intact. To make this a
+    minification optimization, the default mode only specializes a literal signature
+	shared by every live call. The generic procedure is then replaced by the specialized closure,
+	and an exact serialized-size check must prove a strict size decrease before commiting.
+    """
+    targets = project.get("targets", [])
+    opts.specialized_procedure_new_blocks = [set() for _ in targets]
+    opts.specialized_procedure_removed_blocks = [set() for _ in targets]
+    opts.specialized_procedure_call_proccodes = {}
+    opts.specialized_procedure_block_origins = {}
+
+    max_passes = max(1, int(getattr(opts, "procedure_specialization_passes", 4)))
+    min_calls = max(2, int(getattr(opts, "procedure_specialization_min_calls", 2)))
+    total_variants = 0
+    total_calls = 0
+    completed_passes = 0
+    serial = 0
+
+    for _pass in range(max_passes):
+        changed_this_pass = False
+        for ti, target in enumerate(targets):
+            blocks = target.get("blocks") or {}
+            if not blocks:
+                continue
+            by_proc, graph = _procedure_infos(target)
+            if not by_proc:
+                continue
+            for infos in by_proc.values():
+                for info in infos:
+                    info["blocks"] = blocks
+            recursive = _procedure_recursive_set(by_proc)
+
+            calls_by_proc = {}
+            for call_id, block in blocks.items():
+                if not isinstance(block, dict) or block.get("opcode") != "procedures_call":
+                    continue
+                proc = _procedure_key(block)
+                if proc is not None:
+                    calls_by_proc.setdefault(proc, []).append((call_id, block))
+
+            for proc, infos in list(by_proc.items()):
+                if proc in recursive or len(infos) != 1:
+                    continue
+                calls = calls_by_proc.get(proc, ())
+                if len(calls) < min_calls:
+                    continue
+                info = infos[0]
+
+                prototype_owned = {info["prototype_id"]}
+                stack = [info["prototype_id"]]
+                while stack:
+                    current = stack.pop()
+                    for ref in graph.edges.get(current, ()):
+                        if ref in info["closure"] and ref not in prototype_owned:
+                            prototype_owned.add(ref)
+                            stack.append(ref)
+                body_info = dict(info)
+                body_info["closure"] = set(info["closure"]) - prototype_owned - {info["definition_id"]}
+                used, reporter_map, _arg_names = _procedure_body_argument_uses(body_info, blocks)
+                if used is None or not used:
+                    continue
+
+                groups = {}
+                for call_id, call in calls:
+                    call_ids = _parse_argumentids(call.get("mutation"))
+                    if call_ids is None or len(call_ids) != len(info["argument_ids"]):
+                        continue
+                    signature_items = []
+                    replacement_constants = {}
+                    for idx in sorted(used):
+                        if idx >= len(call_ids):
+                            signature_items = []
+                            break
+                        raw = (call.get("inputs") or {}).get(call_ids[idx])
+                        literal = _procedure_input_literal(raw)
+                        if literal is None:
+                            continue
+                        signature_items.append((idx, literal[0], literal[1]))
+                        replacement, _ = _constant_to_scratch_input(literal, blocks, None)
+                        if replacement is not None:
+                            replacement_constants[idx] = replacement
+                    if not signature_items:
+                        continue
+                    signature = tuple(signature_items)
+                    groups.setdefault(signature, []).append((call_id, call, replacement_constants))
+
+                qualifying = [
+                    (signature, members)
+                    for signature, members in groups.items()
+                    if len(members) >= min_calls and len(members) == len(calls)
+                ]
+                if not qualifying:
+                    continue
+
+                body_size = len(body_info["closure"])
+                if body_size > 192:
+                    continue
+                existing_variant_count = 0
+                for signature, members in qualifying[:8]:
+                    if existing_variant_count >= 8:
+                        break
+                    representative_constants = members[0][2]
+                    if not representative_constants:
+                        continue
+                    serial += 1
+                    specialized_proc = _specialized_proccode(proc, serial)
+                    if not specialized_proc or specialized_proc in by_proc:
+                        continue
+                    cloned = _clone_procedure_closure(
+                        target,
+                        info,
+                        specialized_proc,
+                        representative_constants,
+                        stats,
+                        opts,
+                    )
+                    if cloned is None:
+                        continue
+                    clones, id_map, new_definition_id, new_prototype_id, removed_reporter_count = cloned
+
+                    def estimated_variant_block(block_id, block):
+                        if not isinstance(block, dict):
+                            return block
+                        if not getattr(opts, "rename_procedure_names", False):
+                            return block
+                        if block_id != new_prototype_id:
+                            return block
+                        probe = copy.deepcopy(block)
+                        mutation = probe.get("mutation")
+                        if isinstance(mutation, dict) and mutation.get("proccode") == specialized_proc:
+                            mutation["proccode"] = "a"
+                        return probe
+
+                    clone_cost = sum(
+                        len(_quote(bid).encode("utf-8", "backslashreplace")) + 1
+                        + len(dumps_compact(estimated_variant_block(bid, block)).encode("utf-8", "backslashreplace"))
+                        for bid, block in clones.items()
+                    )
+                    original_cost = sum(
+                        len(_quote(bid).encode("utf-8", "backslashreplace")) + 1
+                        + len(dumps_compact(block).encode("utf-8", "backslashreplace"))
+                        for bid, block in blocks.items()
+                        if bid in info["closure"]
+                    )
+                    call_delta = 0
+                    for call_id, call, _ in members:
+                        before_call = len(dumps_compact(call).encode("utf-8", "backslashreplace"))
+                        probe_call = copy.deepcopy(call)
+                        probe_mutation = probe_call.get("mutation")
+                        if isinstance(probe_mutation, dict):
+                            probe_mutation["proccode"] = "a" if getattr(opts, "rename_procedure_names", False) else specialized_proc
+                        after_call = len(dumps_compact(probe_call).encode("utf-8", "backslashreplace"))
+                        call_delta += after_call - before_call
+
+                    estimated_delta = clone_cost + call_delta - original_cost
+                    if estimated_delta >= 0:
+                        continue
+
+                    blocks.update(clones)
+                    for old_id in info["closure"]:
+                        blocks.pop(old_id, None)
+                    opts.specialized_procedure_removed_blocks[ti].update(info["closure"])
+                    stats["procedure_specialization_blocks_added"] += len(clones)
+                    stats["procedure_specialization_blocks_removed"] += len(info["closure"])
+                    stats["procedure_specialization_argument_reporters_removed"] += removed_reporter_count
+                   
+                    for old_id, new_id in id_map.items():
+                        opts.specialized_procedure_block_origins[(ti, new_id)] = old_id
+                    opts.specialized_procedure_new_blocks[ti].update(clones)
+                    for call_id, call, _ in members:
+                        mutation = call.get("mutation")
+                        if not isinstance(mutation, dict):
+                            continue
+                        mutation["proccode"] = specialized_proc
+                        opts.specialized_procedure_call_proccodes[(ti, call_id)] = specialized_proc
+                    total_variants += 1
+                    total_calls += len(members)
+                    existing_variant_count += 1
+                    changed_this_pass = True
+
+        if not changed_this_pass:
+            break
+        completed_passes += 1
+
+    stats["procedure_specialized"] += total_variants
+    stats["procedure_specialization_variants"] += total_variants
+    stats["procedure_specialization_calls"] += total_calls
+    stats["procedure_specialization_passes"] += completed_passes
+    return total_variants
 
 
 def inline_single_use_procedures(project, stats, opts):
@@ -4887,9 +5226,6 @@ def inline_single_use_procedures(project, stats, opts):
                 if parent_mode is None:
                     continue
 
-                # Argument reporter shadows attached to the prototype are part of
-                # the procedure scaffold, not actual body uses. Exclude them from
-                # the usage analysis while still removing them with the prototype.
                 prototype_owned = {prototype_id}
                 prototype_stack = [prototype_id]
                 while prototype_stack:
@@ -4958,8 +5294,6 @@ def inline_single_use_procedures(project, stats, opts):
                         if changed_input:
                             planned_inputs[(survivor_id, input_name)] = new_raw
 
-                # Ensure no surviving block will continue to reference the removed
-                # procedure scaffolding or argument reporters.
                 for survivor_id in closure - removed:
                     block = blocks.get(survivor_id)
                     if not isinstance(block, dict):
@@ -5308,15 +5642,31 @@ def optimize_procedure_arguments(project, stats, opts):
 	return total_removed
 
 
-def _canonicalize_procedure(target, info, graph=None):
-	"""Return a stable body/signature representation for duplicate detection."""
+def _canonicalize_procedure(target, info, graph=None, procedure_aliases=None):
+	"""Return a stable representation for semantic custom-procedure merging.
+
+	Procedure names and argument IDs/names are deliberately ignored. Calls to
+	already-merged procedures are represented by their canonical procedure code,
+	which lets merging propagate through layers of helper procedures over several
+	passes without treating differently-named but equivalent procedures as distinct.
+	"""
 	blocks = target.get("blocks") or {}
 	closure = info["closure"]
 	if graph is None:
 		graph = _ScratchGraphIndex(target)
+	procedure_aliases = procedure_aliases or {}
+	self_proc = info["mutation"].get("proccode")	
+	procedure_arg_ids = list(info.get("argument_ids") or [])
+	procedure_arg_id_map = {old: f"@arg{i}" for i, old in enumerate(procedure_arg_ids)}
+	procedure_arg_names = {}
+	raw_argument_names = info["mutation"].get("argumentnames")
+	try:
+		decoded_argument_names = json.loads(raw_argument_names) if isinstance(raw_argument_names, str) else None
+	except (TypeError, ValueError):
+		decoded_argument_names = None
+	if isinstance(decoded_argument_names, list) and len(decoded_argument_names) == len(procedure_arg_ids):
+		procedure_arg_names = {name: f"@arg{i}" for i, name in enumerate(decoded_argument_names) if isinstance(name, str)}
 
-	# Deterministically discover nodes from the definition root. Inputs are
-	# traversed in key order; next is visited first to preserve stack order.
 	order = []
 	seen = set()
 	stack = [info["definition_id"]]
@@ -5339,9 +5689,20 @@ def _canonicalize_procedure(target, info, graph=None):
 			stack.append(nxt)
 
 	labels = {bid: f"$B{index}" for index, bid in enumerate(order)}
-	arg_positions = {
-		"@arg" + str(i): i for i in range(len(info["argument_ids"]))
-	}
+
+	def canonical_proc_reference(proccode):
+		if not isinstance(proccode, str):
+			return proccode
+		alias = procedure_aliases.get(proccode, proccode)
+		return "@SELF" if alias == self_proc else f"@PROC:{alias}"
+
+	def canonical_proccode_signature(proccode, argument_count):
+		if not isinstance(proccode, str):
+			return None
+		# Scratch custom procedure signatures use %s/%b placeholders. Ignore the
+		# human-readable procedure name but retain placeholder types and order.
+		kinds = tuple(re.findall(r"(?<!\S)(%s|%b)(?!\S)", proccode))
+		return kinds if len(kinds) == argument_count else None
 
 	def canonical_input(value, arg_id_map=None):
 		if not isinstance(value, list) or not value:
@@ -5366,26 +5727,40 @@ def _canonicalize_procedure(target, info, graph=None):
 					out[i] = canonical_input(item, arg_id_map)
 		return out
 
-	def canonical_mutation(block):
-		mut = block.get("mutation")
+	def canonical_mutation(block, is_prototype=False):
+		mut = block.get("mutation") if isinstance(block, dict) else None
 		if not isinstance(mut, dict):
 			return None
 		out = {}
+		argids = _parse_argumentids(mut)
+		arg_map = {old: f"@arg{i}" for i, old in enumerate(argids or [])}
 		for key in sorted(mut):
 			value = mut[key]
+			if key == "proccode":
+				if is_prototype:
+					out[key] = canonical_proccode_signature(value, len(argids or []))
+				else:
+					out[key] = canonical_proc_reference(value)
+				continue
 			if key == "argumentids":
-				ids = _parse_argumentids(mut)
-				if ids is not None:
-					out[key] = [
-						f"@arg{i}" for i in range(len(ids))
-					]
+				if argids is not None:
+					out[key] = [f"@arg{i}" for i in range(len(argids))]
+					continue
+			if key == "argumentnames":
+				try:
+					names = json.loads(value) if isinstance(value, str) else None
+				except (TypeError, ValueError):
+					names = None
+				if isinstance(names, list) and len(names) == len(argids or []):
+					out[key] = [f"@arg{i}" for i in range(len(names))]
 					continue
 			out[key] = copy.deepcopy(value)
 		return out
 
 	result = {
-		"proccode": info["mutation"].get("proccode"),
-		"prototype_mutation": canonical_mutation(info["prototype"]),
+		# Procedure text is intentionally not part of the identity. Placeholder
+		# kinds are carried in prototype_mutation.proccode instead.
+		"prototype_mutation": canonical_mutation(info["prototype"], True),
 		"blocks": [],
 	}
 	for bid in order:
@@ -5399,15 +5774,24 @@ def _canonicalize_procedure(target, info, graph=None):
 			if key == "inputs":
 				inputs = {}
 				ids = _parse_argumentids(block.get("mutation"))
-				arg_map = {
-					old: f"@arg{i}" for i, old in enumerate(ids or [])
-				}
+				arg_map = {old: f"@arg{i}" for i, old in enumerate(ids or [])}
 				for name in sorted(block["inputs"]):
 					cname = arg_map.get(name, name)
 					inputs[cname] = canonical_input(block["inputs"][name], arg_map)
 				item[key] = inputs
 			elif key == "mutation":
-				item[key] = canonical_mutation(block)
+				item[key] = canonical_mutation(block, block.get("opcode") == "procedures_prototype")
+			elif key == "fields":
+				fields = {}
+				for name, value in block.get("fields", {}).items():
+					field = copy.deepcopy(value)
+					if block.get("opcode", "").startswith("argument_reporter_") and name == "VALUE" and isinstance(field, list):
+						if field and isinstance(field[0], str):
+							field[0] = procedure_arg_names.get(field[0], field[0])
+						if len(field) > 1 and isinstance(field[1], str):
+							field[1] = procedure_arg_id_map.get(field[1], field[1])
+					fields[name] = field
+				item[key] = fields
 			else:
 				item[key] = copy.deepcopy(block[key])
 		item["next"] = labels.get(block.get("next"))
@@ -5416,60 +5800,139 @@ def _canonicalize_procedure(target, info, graph=None):
 	return json.dumps(result, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
 
+def _procedure_merge_safe(target, info, graph, commented):
+	closure = set(info["closure"])
+	if closure & commented:
+		return False
+	# Every removed procedure must be exclusively owned by its definition.
+	return not any(
+		any(parent not in closure for parent in graph.parents.get(bid, set()))
+		for bid in closure
+	)
+
+
+def _rewrite_procedure_call_to_canonical(call, canonical_proc, canonical_ids):
+	"""Rewrite a call to a canonical procedure, remapping argument IDs by position."""
+	mut = call.get("mutation")
+	old_ids = _parse_argumentids(mut)
+	if not isinstance(mut, dict) or old_ids is None or len(old_ids) != len(canonical_ids):
+		return False
+	inputs = call.get("inputs") or {}
+	new_inputs = {}
+	for index, old_id in enumerate(old_ids):
+		if old_id in inputs:
+			new_inputs[canonical_ids[index]] = inputs[old_id]
+	for key, value in inputs.items():
+		if key not in old_ids:
+			new_inputs[key] = value
+	new_mut = copy.deepcopy(mut)
+	new_mut["proccode"] = canonical_proc
+	new_mut["argumentids"] = json.dumps(canonical_ids, separators=(",", ":"), ensure_ascii=False)
+	call["mutation"] = new_mut
+	call["inputs"] = new_inputs
+	return True
+
+
 def merge_duplicate_procedures(project, stats, opts):
-	"""Merge whole custom procedures whose signatures and bodies are identical."""
-	opts.merged_procedure_removed_blocks = [
-		set() for _ in project.get("targets", [])
-	]
+	"""Merge semantically equivalent custom procedures, not merely identical names.
+
+	Procedures are canonicalized modulo human-readable procedure text, argument
+	names/IDs and block IDs. The pass repeats so equivalence can propagate through
+	helper procedures whose callees were merged on an earlier iteration.
+	"""
+	opts.merged_procedure_removed_blocks = [set() for _ in project.get("targets", [])]
+	stats["duplicate_procedures_merged"] += 0
+	stats["duplicate_procedure_blocks_removed"] += 0
 	total_procedures = 0
 	total_blocks = 0
 
 	for ti, target in enumerate(project.get("targets", [])):
-		by_proc, graph = _procedure_infos(target)
-		if not by_proc:
-			continue
-		blocks = target.get("blocks") or {}
-		comments = target.get("comments") or {}
-		commented = {
-			c.get("blockId")
-			for c in comments.values()
-			if isinstance(c, dict) and c.get("blockId") is not None
-		}
-		for proc, infos in by_proc.items():
-			if len(infos) < 2:
-				continue
+		max_passes = max(1, len(target.get("blocks") or {}) // 2 + 1)
+		procedure_aliases = {}
+		for _pass in range(max_passes):
+			by_proc, graph = _procedure_infos(target)
+			if not by_proc:
+				break
+			procedure_aliases.update({proc: procedure_aliases.get(proc, proc) for proc in by_proc})
+			comments = target.get("comments") or {}
+			commented = {
+				c.get("blockId")
+				for c in comments.values()
+				if isinstance(c, dict) and c.get("blockId") is not None
+			}
 			buckets = {}
-			for info in infos:
-				closure = info["closure"]
-				if closure & commented:
-					continue
-				# No member of a duplicate procedure may be externally owned.
-				if any(
-					any(parent not in closure for parent in graph.parents.get(bid, set()))
-					for bid in closure
-				):
-					continue
-				signature = _canonicalize_procedure(target, info, graph)
-				buckets.setdefault(signature, []).append(info)
-
-			for duplicates in buckets.values():
-				if len(duplicates) < 2:
-					continue
-				duplicates = sorted(
-					duplicates, key=lambda info: info["definition_id"]
-				)
-				canonical = duplicates[0]
-				canonical_def = canonical["definition_id"]
-				for duplicate in duplicates[1:]:
-					closure = set(duplicate["closure"])
-					# Never delete a block that the canonical procedure needs.
-					if closure & canonical["closure"]:
+			for proc, infos in by_proc.items():
+				for info in infos:
+					if not _procedure_merge_safe(target, info, graph, commented):
 						continue
+					signature = _canonicalize_procedure(target, info, graph, procedure_aliases)
+					buckets.setdefault(signature, []).append((proc, info))
+
+			merged_this_pass = 0
+			for entries in buckets.values():
+				if len(entries) < 2:
+					continue
+				# A procedure code may have multiple definitions. We may only redirect
+				# that code when every definition of it is represented by this equivalence
+				# class; otherwise some calls could acquire different semantics.
+				group_by_proc = {}
+				for proc, info in entries:
+					group_by_proc.setdefault(proc, []).append(info)
+				if any(len(group_by_proc[proc]) != len(by_proc.get(proc, ())) for proc in group_by_proc):
+					continue
+				if len(group_by_proc) == 1 and len(entries) <= 1:
+					continue
+
+				# Choose the canonical procedure by the cheapest call representation,
+				# then by procedure code and definition ID for deterministic output.
+				call_counts = Counter()
+				for block in (target.get("blocks") or {}).values():
+					if isinstance(block, dict) and block.get("opcode") == "procedures_call":
+						call_counts[_procedure_key(block)] += 1
+				def key(item):
+					proc, info = item
+					return (len(proc or "") * call_counts.get(proc, 0) + len(proc or ""), len(proc or ""), proc or "", info["definition_id"])
+				canonical_proc, canonical = min(entries, key=key)
+				canonical_ids = list(canonical["argument_ids"])
+				if any(len(info["argument_ids"]) != len(canonical_ids) for _, info in entries):
+					continue
+
+				# Validate every source procedure's calls before changing anything.
+				valid = True
+				for source_proc, info in entries:
+					if source_proc == canonical_proc:
+						continue
+					for call in (target.get("blocks") or {}).values():
+						if isinstance(call, dict) and call.get("opcode") == "procedures_call" and _procedure_key(call) == source_proc:
+							old_ids = _parse_argumentids(call.get("mutation"))
+							if old_ids is None or len(old_ids) != len(canonical_ids):
+								valid = False
+								break
+					if not valid:
+						break
+				if not valid:
+					continue
+
+				for source_proc, info in entries:
+					if info is canonical:
+						continue
+					if source_proc != canonical_proc:
+						for call in list((target.get("blocks") or {}).values()):
+							if isinstance(call, dict) and call.get("opcode") == "procedures_call" and _procedure_key(call) == source_proc:
+								_rewrite_procedure_call_to_canonical(call, canonical_proc, canonical_ids)
+						procedure_aliases[source_proc] = canonical_proc
+
+					closure = set(info["closure"])
+					blocks = target.get("blocks") or {}
 					for bid in closure:
 						blocks.pop(bid, None)
 					opts.merged_procedure_removed_blocks[ti].update(closure)
 					total_blocks += len(closure)
 					total_procedures += 1
+					merged_this_pass += 1
+
+			if not merged_this_pass:
+				break
 
 	stats["duplicate_procedures_merged"] += total_procedures
 	stats["duplicate_procedure_blocks_removed"] += total_blocks
@@ -8958,6 +9421,9 @@ class Options:
 		merge_duplicate_procedures=False,
 		inline_single_use_procedures=False,
 		procedure_inline_passes=8,
+		specialize_procedures=False,
+		procedure_specialization_passes=4,
+		procedure_specialization_min_calls=2,
 		branch_swapping=False,
 		trivial_loops=False,
 		nested_conditionals=False,
@@ -9011,7 +9477,7 @@ class Options:
 					or name in ("normalize_numbers", "convert_wav_to_mp3", "sort_keys",
 						"compact_numeric_inputs", "compact_field_ids", "compact_mutation_hasnext",
 						"compact_mutation_metadata", "deduplicate_assets", "group_similar_sequences",
-						"optimize_procedure_arguments", "merge_duplicate_procedures", "inline_single_use_procedures",
+						"optimize_procedure_arguments", "merge_duplicate_procedures", "inline_single_use_procedures", "specialize_procedures",
 						"branch_swapping", "trivial_loops", "nested_conditionals",
 						"associative_constant_merging", "script_constant_propagation",
 						"strip_reference_names", "compact_data_literals", "remove_unused_extensions",
@@ -9083,6 +9549,13 @@ class Options:
 		self.procedure_inline_passes = int(procedure_inline_passes)
 		if self.procedure_inline_passes < 1:
 			raise ValueError("procedure_inline_passes must be positive")
+		self.specialize_procedures = specialize_procedures
+		self.procedure_specialization_passes = int(procedure_specialization_passes)
+		self.procedure_specialization_min_calls = int(procedure_specialization_min_calls)
+		if self.procedure_specialization_passes < 1:
+			raise ValueError("procedure_specialization_passes must be positive")
+		if self.procedure_specialization_min_calls < 2:
+			raise ValueError("procedure_specialization_min_calls must be at least 2")
 		self.branch_swapping = branch_swapping
 		self.trivial_loops = trivial_loops
 		self.nested_conditionals = nested_conditionals
@@ -9138,6 +9611,9 @@ class Options:
 		self.inlined_procedure_removed_blocks = []
 		self.inlined_procedure_link_edits = {}
 		self.inlined_procedure_input_edits = {}
+		self.specialized_procedure_new_blocks = []
+		self.specialized_procedure_call_proccodes = {}
+		self.specialized_procedure_block_origins = {}
 
 		self.script_rewrite_removed_blocks = []
 		self.script_rewrite_new_blocks = []
@@ -9225,6 +9701,9 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.associative_constant_merging:
 		stage('Merge associative constants')
 		merge_associative_constants(project, stats, opts)
+	if opts.specialize_procedures:
+		stage('Specialize custom procedures')
+		specialize_procedures(project, stats, opts)
 	if opts.fold_constant_expressions:
 		stage('Fold constant expressions')
 		fold_constant_expressions(project, stats, opts)
@@ -9250,10 +9729,28 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		stage('Inline safe single-use procedures')
 		inline_single_use_procedures(project, stats, opts)
 	if opts.remove_unused_procedures and (
-		opts.optimize_procedure_arguments or opts.merge_duplicate_procedures
+		opts.optimize_procedure_arguments
+		or opts.merge_duplicate_procedures
+		or opts.inline_single_use_procedures
+		or opts.specialize_procedures
 	):
 		stage("Remove procedures made unused")
+		before = [set((target.get("blocks") or {})) for target in project.get("targets", [])]
 		remove_unused_procedures(project, stats)
+		final_removed = [
+			before[ti] - set((target.get("blocks") or {}))
+			for ti, target in enumerate(project.get("targets", []))
+		]
+		# This is a second dead-procedure sweep after specialization, argument
+		# optimization, duplicate merging, and/or inlining. Those earlier passes
+		# can make a formerly live procedure unreachable, so every block removed by
+		# this final cleanup must be part of the verifier's approved-removal set.
+		if not hasattr(opts, "unused_procedure_removed_blocks"):
+			opts.unused_procedure_removed_blocks = [set() for _ in project.get("targets", [])]
+		for ti, removed_ids in enumerate(final_removed):
+			if ti >= len(opts.unused_procedure_removed_blocks):
+				opts.unused_procedure_removed_blocks.append(set())
+			opts.unused_procedure_removed_blocks[ti].update(removed_ids)
 	if opts.remove_unused_variables or opts.remove_unused_lists:
 		stage('Remove unused variables/lists')
 		remove_unused_data(
@@ -10063,7 +10560,7 @@ def _cached_json_loads(value):
 	return json.loads(value)
 
 
-def _check_mutation_match(original_mutation, minified_mutation, opts):
+def _check_mutation_match(original_mutation, minified_mutation, opts, target_index=None, block_id=None):
 	if original_mutation == minified_mutation:
 		return True
 	if not (
@@ -10094,6 +10591,11 @@ def _check_mutation_match(original_mutation, minified_mutation, opts):
 				continue
 			return False
 		mv = minified_mutation[key]
+		if key == "proccode" and target_index is not None and block_id is not None:
+			specialized_calls = getattr(opts, "specialized_procedure_call_proccodes", {}) or {}
+			expected_specialized = specialized_calls.get((target_index, block_id))
+			if expected_specialized is not None and mv == expected_specialized:
+				continue
 		if ov == mv:
 			continue
 		if (
@@ -10174,9 +10676,9 @@ def _check_blocks(
 						expected_mutation["warp"] = "true"
 					elif expected_mutation.get("warp") is False:
 						expected_mutation["warp"] = "false"
-				if _check_mutation_match(expected_mutation, m[k], opts):
+				if _check_mutation_match(expected_mutation, m[k], opts, target_index, block_id):
 					continue
-			if not _check_mutation_match(o[k], m[k], opts):
+			if not _check_mutation_match(o[k], m[k], opts, target_index, block_id):
 				return f"{where} (opcode: {o.get('opcode')}): mutation changed from original {o[k]!r} to minified {m[k]!r}"
 		elif k in ("x", "y") and opts.positions:
 			if not _position_num_eq(o[k], m[k]) and o[k] != m[k]:
@@ -10868,7 +11370,7 @@ _VERIFY_BLOCK_OPT_ATTRS = (
     "compact_mutation_hasnext", "compact_mutation_metadata",
     "rename_argument_ids", "strip_reference_names", "normalize_epsilon",
     "normalize_numbers", "optimize_json", "minimum_json", "compact_numeric_inputs",
-    "inline_single_use_procedures",
+    "inline_single_use_procedures", "specialize_procedures",
 )
 _VERIFY_BLOCK_MAP_ATTRS = (
     "variable_setter_input_edits", "variable_setter_link_edits",
@@ -10878,6 +11380,7 @@ _VERIFY_BLOCK_MAP_ATTRS = (
     "folded_constant_expression_opcode_edits",
     "grouped_sequence_input_edits", "grouped_sequence_link_edits",
     "inlined_procedure_input_edits", "inlined_procedure_link_edits",
+    "specialized_procedure_call_proccodes",
     "script_rewrite_input_edits", "script_rewrite_link_edits",
     "script_rewrite_opcode_edits", "script_rewrite_removed_inputs",
     "simplified_block_input_edits", "simplified_block_link_edits",
@@ -11420,6 +11923,9 @@ def verify(original_path, minified_path, opts):
 			if ti < len(group_new_block_sets):
 				allowed_new_blocks = set(allowed_new_blocks) | set(group_new_block_sets[ti])
 			script_new_block_sets = getattr(opts, "script_rewrite_new_blocks", None) or []
+		specialized_new_block_sets = getattr(opts, "specialized_procedure_new_blocks", None) or []
+		if ti < len(specialized_new_block_sets):
+			allowed_new_blocks = set(allowed_new_blocks) | set(specialized_new_block_sets[ti])
 			if ti < len(script_new_block_sets):
 				allowed_new_blocks = set(allowed_new_blocks) | set(script_new_block_sets[ti])
 			unexpected_blocks = (
@@ -11834,8 +12340,19 @@ def _print_transform_stats(stats, opts):
 					("control_branch_blocks_removed", "branch/condition blocks removed"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.specialize_procedures:
+				print(Ansi.subheading("  12d. Specialize custom procedures"))
+				for key, label in (
+					("procedure_specialized", "procedure variants specialized"),
+					("procedure_specialization_calls", "calls rewritten to specialized variants"),
+					("procedure_specialization_blocks_added", "specialized blocks added"),
+					("procedure_specialization_blocks_removed", "generic procedure blocks replaced"),
+					("procedure_specialization_argument_reporters_removed", "constant argument reporters removed"),
+					("procedure_specialization_passes", "specialization passes completed"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.optimize_procedure_arguments:
-				print(Ansi.subheading("  12d. Optimize custom procedure arguments"))
+				print(Ansi.subheading("  12e. Optimize custom procedure arguments"))
 				for key, label in (
 					("procedure_arguments_removed", "procedure arguments removed"),
 					("procedure_constant_arguments_folded", "constant procedure arguments folded"),
@@ -11843,14 +12360,14 @@ def _print_transform_stats(stats, opts):
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.merge_duplicate_procedures:
-				print(Ansi.subheading("  12e. Merge duplicate custom procedures"))
+				print(Ansi.subheading("  12f. Merge duplicate custom procedures"))
 				for key, label in (
 					("duplicate_procedures_merged", "duplicate procedures merged"),
 					("duplicate_procedure_blocks_removed", "duplicate procedure blocks removed"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.inline_single_use_procedures:
-				print(Ansi.subheading("  12f. Inline safe single-use procedures"))
+				print(Ansi.subheading("  12g. Inline safe single-use procedures"))
 				for key, label in (
 					("procedure_inlined", "single-use procedures inlined"),
 					("procedure_inline_blocks_removed", "procedure scaffolding blocks removed"),
@@ -12176,11 +12693,34 @@ def minify_sb3(src, dst, opts=None):
 
 
 if __name__ == "__main__":
-	from minify_flags import toggles, valued
+	from minify_flags import groups, toggles, valued
 
-	flags = [a for a in sys.argv[1:] if a.startswith("--")]
+	raw_flags = [a for a in sys.argv[1:] if a.startswith("--")]
 	args = [a for a in sys.argv[1:] if not a.startswith("--")]
 	values, bad = {}, []
+
+	# Expand named groups recursively while preserving first-seen order. This keeps
+	# ordinary individual flags and valued options fully backwards compatible.
+	expanded_flags = []
+	seen_flags = set()
+	def expand_group(flag, stack=()):
+		if flag in stack:
+			raise ValueError(f"cyclic flag group: {' -> '.join((*stack, flag))}")
+		for member in groups.get(flag, (flag,)):
+			if member in groups:
+				expand_group(member, (*stack, flag))
+			elif member not in seen_flags:
+				seen_flags.add(member)
+				expanded_flags.append(member)
+
+	try:
+		for f in raw_flags:
+			expand_group(f) if f.split("=", 1)[0] in groups and "=" not in f else expanded_flags.append(f)
+	except ValueError as error:
+		print(Ansi.error(f"Invalid flag group: {error}"))
+		sys.exit(1)
+
+	flags = expanded_flags
 
 	for f in flags:
 		key, eq, val = f.partition("=")
@@ -12211,7 +12751,7 @@ if __name__ == "__main__":
 		print(Ansi.error(f"Unknown or malformed option(s): {bad}"))
 		print(
 			Ansi.muted(
-				f"Valid: {sorted(toggles)} and --list-bytes=N --list-items=N --sequence-threshold=N --zopfli-iterations=N --json-search-rounds=N --procedure-inline-passes=N (positive), --compression-level=N (0-9), --normalize-epsilon=N (positive)"
+				f"Valid toggles: {sorted(toggles)}; groups: {sorted(groups)}; and valued options: --list-bytes=N --list-items=N --sequence-threshold=N --zopfli-iterations=N --json-search-rounds=N --procedure-inline-passes=N --procedure-specialization-passes=N --procedure-specialization-min-calls=N (positive), --compression-level=N (0-9), --normalize-epsilon=N (positive)"
 			)
 		)
 		sys.exit(1)
@@ -12348,6 +12888,11 @@ if __name__ == "__main__":
 			)
 		),
 		procedure_inline_passes=values.get("--procedure-inline-passes", 8),
+		specialize_procedures=all_optimizations or any(
+			f in flags for f in ("--specialize-procedures", "--specialize-custom-procedures", "--procedure-specialization")
+		),
+		procedure_specialization_passes=values.get("--procedure-specialization-passes", 4),
+		procedure_specialization_min_calls=values.get("--procedure-specialization-min-calls", 2),
 		branch_swapping=all_optimizations or any(f in flags for f in ("--branch-swapping", "--swap-branches", "--branch-swap")),
 		trivial_loops=all_optimizations or any(f in flags for f in ("--trivial-loops", "--simplify-trivial-loops")),
 		nested_conditionals=all_optimizations or any(f in flags for f in ("--nested-conditionals", "--merge-nested-conditionals", "--merge-nested-ifs")),
