@@ -5622,15 +5622,6 @@ def _clone_procedure_closure(target, info, specialized_proccode, constant_replac
 
 
 def specialize_procedures(project, stats, opts):
-	"""Specialize a procedure only when the specialized closure replaces the generic one profitably.
-
-	Unlike safe single-use inlining, specialization does not require a warp
-	caller/callee because the call boundary remains intact. To make this a
-	minification optimization rather than code duplication, the default mode
-	only specializes a literal signature shared by every live call. The generic
-	procedure is then replaced by the specialized closure, and an exact
-	serialized-size check must prove a strict win before anything is committed.
-	"""
 	targets = project.get("targets", [])
 	opts.specialized_procedure_new_blocks = [set() for _ in targets]
 	opts.specialized_procedure_removed_blocks = [set() for _ in targets]
@@ -5801,9 +5792,11 @@ def specialize_procedures(project, stats, opts):
 
 					for old_id, new_id in id_map.items():
 						opts.specialized_procedure_block_origins[(ti, new_id)] = old_id
+					
 					# Mark both the original and cloned prototype IDs
 					opts.specialized_procedure_prototype_blocks[(ti, info["prototype_id"])] = True
 					opts.specialized_procedure_prototype_blocks[(ti, new_prototype_id)] = True
+					
 					# Record the semantic signature transition & the prototype by block ID
 					opts.specialized_procedure_prototype_proccodes[(ti, info["prototype_id"])] = specialized_proc
 					opts.specialized_procedure_prototype_proccodes[(ti, new_prototype_id)] = specialized_proc
@@ -5887,7 +5880,9 @@ def inline_single_use_procedures(project, stats, opts):
 				if not _procedure_warp_enabled(info["mutation"].get("warp")):
 					continue
 
-				# a procedure containing `control_stop` must never be inlined.
+				# ``stop this script`` has procedure-call-boundary semantics in Scratch.
+				# Inlining removes that boundary, so a procedure containing
+				# ``control_stop`` must never be inlined.
 				if any(
 					isinstance(blocks.get(body_id), dict)
 					and blocks[body_id].get("opcode") == "control_stop"
@@ -9577,7 +9572,7 @@ def _branch_factor_apply(target, plan, opts, stats, ti):
 		stats["branch_factor_blocks_removed"] += len(plan["remove"])
 		return True
 
-	# Common suffix
+	# Common suffix.
 	suffix = plan["keep_segment"]
 	suffix_root = suffix[0]
 	suffix_tail = suffix[-1]
@@ -11044,7 +11039,8 @@ class Options:
 		rebuild_procedure_displays=False,
 		compact_terminal_links=False,
 	):
-		# Lossless representation optimizations now run through the same pipeline as all other optimizations
+		# ``lossless`` is retained as a compatibility marker. Lossless representation
+		# optimizations now run through the same pipeline as all other optimizations.
 		self.lossless = bool(lossless or all_lossless)
 		self.rebuild_procedure_displays = rebuild_procedure_displays or all_lossless
 		self.compact_terminal_links = compact_terminal_links or all_lossless
@@ -11058,7 +11054,7 @@ class Options:
 		self.compact_reporter_defaults = compact_reporter_defaults or all_lossless
 		self.all_lossless = all_lossless
 		self.optimize_json = optimize_json or self.lossless or zopfli or auto_zopfli or compact_block_defaults or compact_costume_references or compact_block_flags or minimum_json or bool(json_search_rounds) or relabel_block_ids
-		self.optimize_assets = optimize_assets or all_lossless or zopfli_assets or auto_zopfli
+		self.optimize_assets = optimize_assets or compress_assets or all_lossless or zopfli_assets or auto_zopfli
 		self.compact_block_defaults = compact_block_defaults or all_lossless
 		self.zopfli = zopfli or ((all_lossless or auto_zopfli) and not fast_json)
 		self.zopfli_assets = zopfli_assets or all_lossless
@@ -12212,7 +12208,7 @@ def _check_mutation_match(original_mutation, minified_mutation, opts, target_ind
 			return False
 		if mv in candidates:
 			return True
-		
+
 		if getattr(opts, "rename_procedure_names", False):
 			rename_map = getattr(opts, "renamed_identifiers", {}) or {}
 			procedure_names = rename_map.get("procedures", {})
@@ -13288,8 +13284,17 @@ only changes that are actually visible in the candidate.
 			restored_block_ids = True
 		except (ValueError, KeyError, TypeError):
 			if getattr(opts, "rename_block_ids", False):
-				_restore_block_ids(result, getattr(opts, "renamed_block_ids", {}) or {})
-				restored_block_ids = True
+				_rename_map = getattr(opts, "renamed_block_ids", {}) or {}
+				_restore_block_ids(result, _rename_map)
+				restored_block_ids = bool(_rename_map)
+
+	if (
+		getattr(opts, "rename_block_ids", False)
+		and not restored_block_ids
+	):
+		_rename_map = getattr(opts, "renamed_block_ids", {}) or {}
+		_restore_block_ids(result, _rename_map)
+		restored_block_ids = bool(_rename_map)
 
 	if getattr(opts, "compact_procedure_symbols", False):
 		try:
@@ -14733,7 +14738,8 @@ if __name__ == "__main__":
 	if "--fast-json" in flags and "--thorough-json" in flags:
 		print(Ansi.error("--fast-json is incompatible with --thorough-json"))
 		sys.exit(1)
-	
+	# ``--all-optimizations`` is a normal flag group expanded above.  It must
+	# not activate the special ``all_flags`` behavior used by ``--all-flags``.
 	all_flags = "--all-flags" in flags
 	all_lossless = any(flag in flags for flag in ("--all-lossless", "--all-safe", "--all-safe-flags"))
 	lossless = "--lossless" in flags or all_lossless
