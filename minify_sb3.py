@@ -468,7 +468,19 @@ def _terminal_link_ids(project):
 				parent = blocks.get(block.get("parent")) if type(block.get("parent")) is str else None
 				inputs = parent.get("inputs") if isinstance(parent, dict) and parent.get("opcode") == "procedures_definition" else None
 				desc = inputs.get("custom_block") if isinstance(inputs, dict) else None
-				candidate = isinstance(desc, list) and len(desc) == 2 and _input_tag(desc[0]) in (1, 2) and desc[1] == bid
+				candidate = (
+					isinstance(desc, list)
+					and desc[1] == bid
+					and (
+						(len(desc) == 2 and _input_tag(desc[0]) in (1, 2))
+						# Before clear_procedure_definition_shadows, Scratch projects may
+						# represent the same prototype as the active side of a shadow
+						# input: [3, prototype, shadow]. compact_terminal_links can
+						# subsequently omit the prototype's explicit next:null after
+						# that representation is canonicalized to [2, prototype].
+							or (len(desc) == 3 and _input_tag(desc[0]) == 3)
+					)
+				)
 			if not candidate: continue
 			refs = input_refs(block)
 			if refs is not None and all(synchronous(child) for child in refs): eligible.add(bid)
@@ -606,9 +618,17 @@ def _compact_procedure_symbols(project, *, copy_result=True):
 	return project
 
 
-def _restore_procedure_symbols(original, result, *, copy_result=True):
+def _restore_procedure_symbols(original, result, *, copy_result=True, opts=None):
 	if copy_result: result = copy.deepcopy(result)
-	for left, right in zip(original.get("targets", []), result.get("targets", [])):
+	mut_edits = (getattr(opts, "procedure_argument_mutation_edits", None) or {}) if opts is not None else {}
+	removed_in = (getattr(opts, "procedure_argument_removed_inputs", None) or {}) if opts is not None else {}
+	spec_calls = (getattr(opts, "specialized_procedure_call_proccodes", None) or {}) if opts is not None else {}
+	arg_renames = (getattr(opts, "renamed_argument_ids", None) or {}) if opts is not None else {}
+	proc_names = ((getattr(opts, "renamed_identifiers", None) or {}).get("procedures") or {}) if opts is not None else {}
+	proc_forward = {(pk[0], original): pk[1] for pk, original in proc_names.items() if isinstance(pk, tuple) and len(pk) == 2}
+	def renamed_ids(ti, proccode, ids):
+		return [arg_renames.get((ti, proccode, i), i) for i in ids]
+	for ti, (left, right) in enumerate(zip(original.get("targets", []), result.get("targets", []))):
 		if _procedure_symbol_info(left) is None: continue
 		forward, reverse = [{}, {}, {}], [{}, {}, {}]
 		def pair(index, old, new):
@@ -627,6 +647,17 @@ def _restore_procedure_symbols(original, result, *, copy_result=True):
 			op = block.get("opcode")
 			if op in ("procedures_prototype", "procedures_call"):
 				a, b = block["mutation"], other.get("mutation", {})
+				expected = mut_edits.get((ti, bid))
+				if isinstance(expected, dict):
+					a = dict(expected)
+				if (ti, bid) in spec_calls:
+					a = dict(a); a["proccode"] = spec_calls[(ti, bid)]
+				if (arg_renames or proc_forward):
+					a = dict(a)
+					current_code = proc_forward.get((ti, a["proccode"]), a["proccode"])
+					if arg_renames and isinstance(a.get("argumentids"), str):
+						a["argumentids"] = json.dumps(renamed_ids(ti, current_code, json.loads(a["argumentids"])), separators=(",", ":"), ensure_ascii=False)
+					a["proccode"] = current_code
 				pair(0, a["proccode"], b.get("proccode"))
 				if re.findall(r"%[snb]", a["proccode"]) != re.findall(r"%[snb]", b["proccode"]):
 					raise ValueError("procedure placeholder types changed")
@@ -635,16 +666,18 @@ def _restore_procedure_symbols(original, result, *, copy_result=True):
 					x, y = json.loads(a[key]), json.loads(b.get(key))
 					if not isinstance(y, list) or len(x) != len(y): raise ValueError("procedure argument count changed")
 					for old, new in zip(x, y): pair(index, old, new)
-				pairs.append((block, other))
+				pairs.append((block, other, a, bid))
 			elif op in ("argument_reporter_string_number", "argument_reporter_boolean"):
 				pair(2, block["fields"]["VALUE"][0], other["fields"]["VALUE"][0])
-		for block, other in pairs:
-			a, b = block["mutation"], other["mutation"]
+		for block, other, a, bid in pairs:
+			b = other["mutation"]
 			b["proccode"] = reverse[0][b["proccode"]]
 			for key in ("argumentids", "argumentnames"):
 				if key in a: b[key] = a[key]
 			if "inputs" in other:
-				if list(other["inputs"]) != [forward[1][key] for key in block.get("inputs", {})]:
+				removed = removed_in.get((ti, bid)) or ()
+				expected_inputs = [arg_renames.get((ti, a["proccode"], key), key) for key in block.get("inputs", {}) if key not in removed]
+				if list(other["inputs"]) != [forward[1][key] for key in expected_inputs]:
 					raise ValueError("procedure input keys or evaluation order changed")
 				other["inputs"] = {reverse[1][key]: value for key, value in other["inputs"].items()}
 		for block in (right.get("blocks") or {}).values():
@@ -672,7 +705,6 @@ _DATA_PRUNING_OPCODES = _COVERED_INPUT_OPCODES | frozenset((
 	"sensing_resettimer", "sensing_setdragmode", "sound_play", "sound_playuntildone", "sound_sounds_menu", "sound_stopallsounds", "sound_cleareffects",
 	"math_number", "math_positive_number", "math_whole_number", "math_integer", "math_angle", "colour_picker", "text",
 ))
-
 
 def _unused_data_ids(project):
 	"""Conservatively identify declarations unreachable by native ID or name lookup."""
@@ -792,7 +824,10 @@ def _editor_comment_ids(target):
 def _editor_position_keys(block):
 	if not isinstance(block, dict) or block.get("topLevel") is not True or block.get("parent", False) is not None:
 		return ()
-	return tuple(key for key in ("x", "y") if isinstance(block.get(key), JsonNumber))
+	return tuple(
+		key for key in ("x", "y")
+		if type(block.get(key)) in (JsonNumber, int, float)
+	)
 
 
 def _restore_editor_metadata(original, result, strip_editor_comments, strip_script_positions):
@@ -5600,6 +5635,9 @@ def specialize_procedures(project, stats, opts):
 	opts.specialized_procedure_new_blocks = [set() for _ in targets]
 	opts.specialized_procedure_removed_blocks = [set() for _ in targets]
 	opts.specialized_procedure_call_proccodes = {}
+	opts.specialized_procedure_prototype_proccodes = {}
+	opts.specialized_procedure_prototype_code_pairs = {}
+	opts.specialized_procedure_prototype_blocks = {}
 	opts.specialized_procedure_block_origins = {}
 
 	max_passes = max(1, int(getattr(opts, "procedure_specialization_passes", 4)))
@@ -5749,6 +5787,10 @@ def specialize_procedures(project, stats, opts):
 					if estimated_delta >= 0:
 						continue
 
+					original_prototype = blocks.get(info["prototype_id"])
+					original_mutation = (original_prototype or {}).get("mutation") if isinstance(original_prototype, dict) else None
+					original_proccode = original_mutation.get("proccode") if isinstance(original_mutation, dict) else None
+
 					blocks.update(clones)
 					for old_id in info["closure"]:
 						blocks.pop(old_id, None)
@@ -5759,6 +5801,15 @@ def specialize_procedures(project, stats, opts):
 
 					for old_id, new_id in id_map.items():
 						opts.specialized_procedure_block_origins[(ti, new_id)] = old_id
+					# Mark both the original and cloned prototype IDs
+					opts.specialized_procedure_prototype_blocks[(ti, info["prototype_id"])] = True
+					opts.specialized_procedure_prototype_blocks[(ti, new_prototype_id)] = True
+					# Record the semantic signature transition & the prototype by block ID
+					opts.specialized_procedure_prototype_proccodes[(ti, info["prototype_id"])] = specialized_proc
+					opts.specialized_procedure_prototype_proccodes[(ti, new_prototype_id)] = specialized_proc
+					if isinstance(original_proccode, str):
+						pairs = opts.specialized_procedure_prototype_code_pairs.setdefault((ti, original_proccode), set())
+						pairs.add(specialized_proc)
 					opts.specialized_procedure_new_blocks[ti].update(clones)
 					for call_id, call, _ in members:
 						mutation = call.get("mutation")
@@ -5834,6 +5885,14 @@ def inline_single_use_procedures(project, stats, opts):
 					continue
 				info = infos[0]
 				if not _procedure_warp_enabled(info["mutation"].get("warp")):
+					continue
+
+				# a procedure containing `control_stop` must never be inlined.
+				if any(
+					isinstance(blocks.get(body_id), dict)
+					and blocks[body_id].get("opcode") == "control_stop"
+					for body_id in info["closure"]
+				):
 					continue
 
 				call_id, call = calls_by_proc[proc][0]
@@ -9518,7 +9577,7 @@ def _branch_factor_apply(target, plan, opts, stats, ti):
 		stats["branch_factor_blocks_removed"] += len(plan["remove"])
 		return True
 
-	# Common suffix.
+	# Common suffix
 	suffix = plan["keep_segment"]
 	suffix_root = suffix[0]
 	suffix_tail = suffix[-1]
@@ -9835,10 +9894,6 @@ def _script_replace_known_reads(value, env, blocks, owner_id, ti, opts, graph, a
 			if i >= len(value) or not isinstance(value[i], list): continue
 			new, c, dead = _script_replace_known_reads(value[i], env, blocks, owner_id, ti, opts, graph, allow_literal=True)
 			if c:
-				# A [3, actual, shadow] input cannot contain an input wrapper
-				# as its actual value.  When constant propagation turns the
-				# primary value into [1, literal], collapse the entire covered
-				# input to that literal and discard the now-redundant shadow.
 				if i == 1 and _is_bare_literal_input(new):
 					return new, True, removed | dead
 				value[i] = new
@@ -10989,56 +11044,36 @@ class Options:
 		rebuild_procedure_displays=False,
 		compact_terminal_links=False,
 	):
-		self.lossless = lossless or all_lossless or prune_orphan_arguments or compact_procedure_symbols or compact_reporter_defaults or fast_json or strip_covered_shadows or strip_editor_comments or strip_script_positions or prune_unused_data or rebuild_procedure_displays or compact_terminal_links
-		self.rebuild_procedure_displays = rebuild_procedure_displays
-		self.compact_terminal_links = compact_terminal_links
-		self.strip_covered_shadows = strip_covered_shadows
-		self.strip_editor_comments = strip_editor_comments
-		self.prune_unused_data = prune_unused_data
-		self.strip_script_positions = strip_script_positions
+		# Lossless representation optimizations now run through the same pipeline as all other optimizations
+		self.lossless = bool(lossless or all_lossless)
+		self.rebuild_procedure_displays = rebuild_procedure_displays or all_lossless
+		self.compact_terminal_links = compact_terminal_links or all_lossless
+		self.strip_covered_shadows = strip_covered_shadows or all_lossless
+		self.strip_editor_comments = strip_editor_comments or all_lossless
+		self.prune_unused_data = prune_unused_data or all_lossless
+		self.strip_script_positions = strip_script_positions or all_lossless
 		self.fast_json = fast_json
-		self.prune_orphan_arguments = prune_orphan_arguments
-		self.compact_procedure_symbols = compact_procedure_symbols
-		self.compact_reporter_defaults = compact_reporter_defaults
+		self.prune_orphan_arguments = prune_orphan_arguments or all_lossless
+		self.compact_procedure_symbols = compact_procedure_symbols or all_lossless
+		self.compact_reporter_defaults = compact_reporter_defaults or all_lossless
 		self.all_lossless = all_lossless
 		self.optimize_json = optimize_json or self.lossless or zopfli or auto_zopfli or compact_block_defaults or compact_costume_references or compact_block_flags or minimum_json or bool(json_search_rounds) or relabel_block_ids
 		self.optimize_assets = optimize_assets or all_lossless or zopfli_assets or auto_zopfli
 		self.compact_block_defaults = compact_block_defaults or all_lossless
 		self.zopfli = zopfli or ((all_lossless or auto_zopfli) and not fast_json)
-		self.zopfli_assets = zopfli_assets
+		self.zopfli_assets = zopfli_assets or all_lossless
 		self.auto_zopfli = auto_zopfli
-		self.relabel_block_ids = relabel_block_ids
+		self.relabel_block_ids = relabel_block_ids or all_lossless
 		self.zopfli_required = zopfli or zopfli_assets
 		self.zopfli_iterations = int(zopfli_iterations)
 		self.compact_costume_references = compact_costume_references or all_lossless
-		self.compact_block_flags = compact_block_flags
+		self.compact_block_flags = compact_block_flags or all_lossless
 		self.minimum_json = minimum_json or all_lossless or fast_json
 		self.json_search_rounds = int(json_search_rounds) or (1 if all_lossless else 0)
 		if self.json_search_rounds < 0:
 			raise ValueError("json_search_rounds must be nonnegative")
 		if self.zopfli_iterations < 1:
 			raise ValueError("zopfli_iterations must be positive")
-		if self.lossless:
-			conflicts = [
-				name for name, enabled in locals().copy().items()
-				if enabled is True and (
-					name.startswith("rename_") or name.startswith("remove_")
-					or name.startswith("fold_") or name.startswith("simplify_")
-					or name in ("normalize_numbers", "convert_wav_to_mp3", "sort_keys",
-						"compact_numeric_inputs", "compact_field_ids", "compact_mutation_hasnext",
-						"compact_mutation_metadata", "deduplicate_assets", "group_similar_sequences",
-						"optimize_procedure_arguments", "merge_duplicate_procedures", "inline_single_use_procedures", "specialize_procedures",
-						"compact_procedure_prototypes", "clear_procedure_definition_shadows",
-						"branch_swapping", "branch_factoring", "trivial_loops", "nested_conditionals",
-						"associative_constant_merging", "script_constant_propagation",
-						"compact_data_literals", "remove_unused_extensions",
-						"frequency_block_ids", "frequency_data_ids")
-				)
-			]
-			if conflicts:
-				raise ValueError(f"lossless mode is incompatible with: {', '.join(conflicts)}")
-			comments = positions = covered = monitors = lists = False
-			keep_sound_metadata = preserve_asset_compression = True
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
 			positions,
@@ -11115,7 +11150,7 @@ class Options:
 		self.nested_conditionals = nested_conditionals
 		self.associative_constant_merging = associative_constant_merging
 		self.script_constant_propagation = script_constant_propagation
-		self.strip_reference_names = strip_reference_names
+		self.strip_reference_names = strip_reference_names or all_lossless
 		self.compact_data_literals = compact_data_literals
 		self.remove_unused_extensions = remove_unused_extensions
 		self.group_similar_sequences = group_similar_sequences
@@ -11170,6 +11205,9 @@ class Options:
 		self.inlined_procedure_input_edits = {}
 		self.specialized_procedure_new_blocks = []
 		self.specialized_procedure_call_proccodes = {}
+		self.specialized_procedure_prototype_proccodes = {}
+		self.specialized_procedure_prototype_code_pairs = {}
+		self.specialized_procedure_prototype_blocks = {}
 		self.specialized_procedure_block_origins = {}
 
 		self.script_rewrite_removed_blocks = []
@@ -11192,8 +11230,6 @@ class Options:
 
 
 def apply_transforms(project, opts: Options, assets=None, progress=None):
-	if opts.lossless:
-		return Counter()
 	inherited_dangling = [_dangling_block_ids(target) for target in project.get("targets", [])]
 	progress = progress or ProgressBar(_progress_stage_count(opts))
 	stage = progress.next
@@ -12042,6 +12078,19 @@ def _check_inputs_match(
 				target_index,
 				_allow_folded=_allow_folded,
 			)
+	
+	if (
+		target_index is not None
+		and getattr(opts, "_verify_block_opcode", None) == "procedures_definition"
+		and getattr(opts, "_verify_block_input_name", None) == "custom_block"
+		and isinstance(oi, list)
+		and isinstance(mi, list)
+		and len(oi) == len(mi) == 2
+		and oi[1] == mi[1]
+		and _input_tag(oi[0]) in (1, 2)
+		and _input_tag(mi[0]) in (1, 2)
+	):
+		return True
 	if not (isinstance(oi, list) and isinstance(mi, list) and len(oi) == len(mi)):
 		return False
 	if not oi or not mi or oi[0] != mi[0]:
@@ -12151,6 +12200,34 @@ def _check_mutation_match(original_mutation, minified_mutation, opts, target_ind
 			missing_keys - allowed_missing or extra_keys
 		):
 			return False
+
+	def _specialized_proccode_match(expected_values, mv):
+		if not expected_values:
+			return False
+		if isinstance(expected_values, str):
+			expected_values = (expected_values,)
+		try:
+			candidates = set(expected_values)
+		except TypeError:
+			return False
+		if mv in candidates:
+			return True
+		
+		if getattr(opts, "rename_procedure_names", False):
+			rename_map = getattr(opts, "renamed_identifiers", {}) or {}
+			procedure_names = rename_map.get("procedures", {})
+			if isinstance(procedure_names, dict):
+				for key, original_name in procedure_names.items():
+					if (
+						isinstance(key, tuple)
+						and len(key) == 2
+						and key[0] == target_index
+						and original_name in candidates
+						and mv == key[1]
+					):
+						return True
+		return False
+
 	for key, ov in original_mutation.items():
 		if key not in minified_mutation:
 			if key in allowed_missing:
@@ -12160,8 +12237,24 @@ def _check_mutation_match(original_mutation, minified_mutation, opts, target_ind
 		if key == "proccode" and target_index is not None and block_id is not None:
 			specialized_calls = getattr(opts, "specialized_procedure_call_proccodes", {}) or {}
 			expected_specialized = specialized_calls.get((target_index, block_id))
-			if expected_specialized is not None and mv == expected_specialized:
+			if _specialized_proccode_match(expected_specialized, mv):
 				continue
+
+			specialized_prototypes = getattr(opts, "specialized_procedure_prototype_proccodes", {}) or {}
+			expected_specialized = specialized_prototypes.get((target_index, block_id))
+			if _specialized_proccode_match(expected_specialized, mv):
+				continue
+
+			prototype_pairs = getattr(opts, "specialized_procedure_prototype_code_pairs", {}) or {}
+			expected_variants = prototype_pairs.get((target_index, ov))
+			if _specialized_proccode_match(expected_variants, mv):
+				continue
+
+			specialized_prototype_blocks = getattr(opts, "specialized_procedure_prototype_blocks", {}) or {}
+			if specialized_prototype_blocks.get((target_index, block_id)):
+				if re.findall(r"%[snb]", ov) == re.findall(r"%[snb]", mv):
+					continue
+
 		if ov == mv:
 			continue
 		if (
@@ -12200,7 +12293,21 @@ def _check_blocks(
 	if set(o) != set(m):
 		gone = set(o) - set(m)
 		extra = set(m) - set(o)
-		if extra or not (opts.comments and gone <= {"comment"}):
+		allowed_gone = set()
+		if opts.comments:
+			allowed_gone.add("comment")
+		if getattr(opts, "strip_script_positions", False):
+			allowed_gone.update(("x", "y"))
+		if (
+			"next" in gone
+			and len(gone) == 1
+			and getattr(opts, "compact_terminal_links", False)
+			and o.get("next") is None
+			and block_id is not None
+			and block_id in (getattr(opts, "_terminal_link_ids", {}) or {}).get(target_index, ())
+		):
+			allowed_gone.add("next")
+		if extra or not gone <= allowed_gone:
 			return f"{where} (opcode: {o.get('opcode')}): block keys changed. Missing keys: {sorted(gone)}, unexpected extra keys: {sorted(extra)}"
 	allow_repairs = (
 		opts.remove_unreachable
@@ -12316,6 +12423,23 @@ def _check_blocks(
 				return f"{where} (opcode: {o.get('opcode')}): input names changed. Original inputs: {sorted(o['inputs'])}, minified inputs: {sorted(m['inputs'])}"
 			for name in set(o["inputs"]) & set(m["inputs"]):
 				oi, mi = o["inputs"][name], m["inputs"][name]
+				if (
+					name == "custom_block"
+					and o.get("opcode") == "procedures_definition"
+					and isinstance(oi, list)
+					and isinstance(mi, list)
+					and len(oi) == len(mi) == 2
+					and oi[1] == mi[1]
+					and (
+						_input_tag(oi[0]) in (1, 2)
+							or (type(oi[0]) is str and oi[0] in ("1", "2"))
+					)
+					and (
+						_input_tag(mi[0]) in (1, 2)
+							or (type(mi[0]) is str and mi[0] in ("1", "2"))
+					)
+				):
+					continue
 				setter_inputs = getattr(opts, "variable_setter_input_edits", None) or {}
 				setter_input = setter_inputs.get((target_index, block_id, name))
 				if setter_input is not None and (
@@ -12956,8 +13080,8 @@ _VERIFY_WORKER_STATE_PATH = None
 
 
 _VERIFY_BLOCK_OPT_ATTRS = (
-	"comments", "positions", "covered", "remove_unreachable",
-	"remove_unused_procedures", "compact_field_ids",
+	"comments", "positions", "strip_script_positions", "covered", "remove_unreachable",
+	"remove_unused_procedures", "compact_terminal_links", "compact_field_ids",
 	"compact_mutation_hasnext", "compact_mutation_metadata",
 	"rename_argument_ids", "strip_reference_names", "normalize_epsilon",
 	"normalize_numbers", "optimize_json", "minimum_json", "compact_numeric_inputs",
@@ -12972,7 +13096,8 @@ _VERIFY_BLOCK_MAP_ATTRS = (
 	"folded_constant_expression_opcode_edits",
 	"grouped_sequence_input_edits", "grouped_sequence_link_edits",
 	"inlined_procedure_input_edits", "inlined_procedure_link_edits",
-	"specialized_procedure_call_proccodes",
+	"specialized_procedure_call_proccodes", "specialized_procedure_prototype_proccodes",
+	"specialized_procedure_prototype_blocks", "specialized_procedure_prototype_code_pairs", "specialized_procedure_block_origins",
 	"script_rewrite_input_edits", "script_rewrite_link_edits",
 	"script_rewrite_opcode_edits", "script_rewrite_removed_inputs",
 	"simplified_block_input_edits", "simplified_block_link_edits",
@@ -13011,6 +13136,13 @@ def _make_verify_worker_state(to, tm, opts, target_index, changed):
 		if isinstance(target, dict)
 	]
 	attrs["_verify_project"] = {"targets": owner_targets}
+	terminal_links = getattr(opts, "_terminal_link_ids", {}) or {}
+	if isinstance(terminal_links, dict):
+		attrs["_terminal_link_ids"] = {
+			target_index: set(terminal_links.get(target_index, ()))
+		}
+	else:
+		attrs["_terminal_link_ids"] = {}
 
 	return {
 		"checks": changed,
@@ -13057,7 +13189,15 @@ def _verify_one_changed_block(item, state):
 		return position, err
 	if not isinstance(bm.get("inputs"), dict) or not isinstance(bm.get("fields"), dict):
 		return position, f"{where}, block {bid!r} ({bm.get('opcode')}): inputs or fields is not a dict (violates Scratch VM format)"
-	if "next" not in bm or "parent" not in bm:
+	if "next" not in bm:
+		terminal_links = getattr(opts, "_terminal_link_ids", {}) or {}
+		if not (
+			getattr(opts, "compact_terminal_links", False)
+			and bid in terminal_links.get(target_index, ())
+			and bo.get("next") is None
+		):
+			return position, f"{where}, block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute"
+	if "parent" not in bm:
 		return position, f"{where}, block {bid!r} ({bm.get('opcode')}): missing required 'next' or 'parent' attribute"
 	mu = bm.get("mutation")
 	if mu is not None:
@@ -13126,9 +13266,114 @@ def _verify_target_blocks_parallel(to, tm, opts, target_index):
 	return None
 
 
+def _restore_representation_for_verify(original, result, opts):
+	"""Restore optional representation changes so the normal verifier can compare semantics.
+
+	Each representation optimization is conditional: the JSON optimizer may keep the
+	original representation when the ZIP-compressed candidate is not smaller. Restore
+only changes that are actually visible in the candidate.
+	"""
+	restored_block_ids = False
+
+	if getattr(opts, "rebuild_procedure_displays", False):
+		original = _rebuild_procedure_displays(original)
+		result = _rebuild_procedure_displays(result)
+
+	if getattr(opts, "prune_orphan_arguments", False):
+		original = _prune_orphan_arguments(original, result)
+
+	if getattr(opts, "relabel_block_ids", False):
+		try:
+			result = restore_block_labels(original, result, copy_result=False)
+			restored_block_ids = True
+		except (ValueError, KeyError, TypeError):
+			if getattr(opts, "rename_block_ids", False):
+				_restore_block_ids(result, getattr(opts, "renamed_block_ids", {}) or {})
+				restored_block_ids = True
+
+	if getattr(opts, "compact_procedure_symbols", False):
+		try:
+			result = _restore_procedure_symbols(original, result, copy_result=False, opts=opts)
+		except (ValueError, KeyError, TypeError, IndexError):
+			pass
+
+	if getattr(opts, "compact_reference_names", False):
+		result = _restore_reference_names(original, result, copy_result=False)
+
+	if getattr(opts, "prune_unused_data", False):
+		try:
+			result = _restore_unused_data(original, result)
+		except (ValueError, KeyError, TypeError):
+			pass
+
+	if getattr(opts, "strip_editor_comments", False) or getattr(opts, "strip_script_positions", False):
+		try:
+			result = _restore_editor_metadata(
+				original,
+				result,
+				getattr(opts, "strip_editor_comments", False) and not getattr(opts, "comments", False),
+				getattr(opts, "strip_script_positions", False),
+			)
+		except (ValueError, KeyError, TypeError):
+			pass
+
+	terminal = _terminal_link_ids(original) if getattr(opts, "compact_terminal_links", False) else {}
+	opts._terminal_link_ids = terminal
+
+	for ti, (left_target, right_target) in enumerate(zip(original.get("targets", []), result.get("targets", []))):
+		left_blocks = left_target.get("blocks") or {}
+		right_blocks = right_target.get("blocks") or {}
+		for bid, left in left_blocks.items():
+			right = right_blocks.get(bid)
+			if not isinstance(left, dict) or not isinstance(right, dict):
+				continue
+
+			if getattr(opts, "compact_defaults", False):
+				for key in ("inputs", "fields"):
+					if left.get(key) == {} and key not in right:
+						right[key] = {}
+
+			if getattr(opts, "compact_block_flags", False):
+				for key in ("topLevel", "shadow"):
+					if left.get(key) is False and key not in right:
+						right[key] = False
+
+			if bid in terminal.get(ti, ()) and left.get("next", False) is None and "next" not in right:
+				right["next"] = None
+
+			if getattr(opts, "compact_reporter_defaults", False) and left.get("opcode") in _SYNC_REPORTERS:
+				if left.get("next", False) is None and "next" not in right:
+					right["next"] = None
+				left_fields = left.get("fields") or {}
+				right_fields = right.get("fields")
+				if isinstance(right_fields, dict):
+					for name, value in left_fields.items():
+						if (
+							name not in ("VARIABLE", "LIST", "BROADCAST_OPTION")
+							and isinstance(value, list)
+							and len(value) == 2
+							and value[1] is None
+							and right_fields.get(name) == value[:1]
+						):
+							right_fields[name] = value
+
+	if getattr(opts, "compact_costume_references", False):
+		for left_target, right_target in zip(original.get("targets", []), result.get("targets", [])):
+			left_costumes = left_target.get("costumes")
+			right_costumes = right_target.get("costumes")
+			if not isinstance(left_costumes, list) or not isinstance(right_costumes, list):
+				continue
+			for left, right in zip(left_costumes, right_costumes):
+				if not isinstance(left, dict) or not isinstance(right, dict):
+					continue
+				canonical = _canonical_costume_filename(left)
+				if canonical is not None and left.get("md5ext") == canonical and "md5ext" not in right:
+					right["md5ext"] = canonical
+
+	return original, result, restored_block_ids
+
+
 def verify(original_path, minified_path, opts):
-	if opts.lossless:
-		return _verify_lossless(original_path, minified_path, opts.compact_block_defaults, opts.compact_costume_references, opts.compact_block_flags, opts.relabel_block_ids, opts.strip_reference_names, opts.prune_orphan_arguments, opts.compact_procedure_symbols, opts.compact_reporter_defaults, opts.strip_covered_shadows, opts.strip_editor_comments, opts.strip_script_positions, opts.prune_unused_data, opts.rebuild_procedure_displays, opts.compact_terminal_links)
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
 		# All project and asset members are read later; zipfile.read() validates their
 		# CRCs, so a separate testzip() pass would decompress the same data again.
@@ -13196,6 +13441,9 @@ def verify(original_path, minified_path, opts):
 			mini_raw_project.get("targets"), list
 		):
 			return False, "project.json targets must be arrays"
+		orig_raw, mini_raw_project, representation_block_ids_restored = _restore_representation_for_verify(
+			orig_raw, mini_raw_project, opts
+		)
 		orig = _reinflate(orig_raw)
 		mini = _reinflate(mini_raw_project)
 		opts._verify_project = orig
@@ -13206,7 +13454,7 @@ def verify(original_path, minified_path, opts):
 		err = _validate_asset_entries(orig, a, "original project")
 		if err:
 			return False, err
-		if opts.rename_block_ids:
+		if opts.rename_block_ids and not representation_block_ids_restored:
 			_restore_block_ids(mini, opts.renamed_block_ids)
 		err = _validate_block_structure(mini, "minified project", orig)
 		if err:
@@ -13232,6 +13480,8 @@ def verify(original_path, minified_path, opts):
 			_restore_broadcast_ids(mini, opts.renamed_broadcast_ids)
 		if opts.rename_argument_ids:
 			_restore_argument_ids(mini, opts.renamed_argument_ids)
+		if opts.strip_covered_shadows:
+			mini = _restore_covered_shadows(orig, mini)
 		if (
 			opts.rename_identifiers
 			or opts.rename_variable_names
@@ -13398,7 +13648,7 @@ def verify(original_path, minified_path, opts):
 					f"Target {ti} ({name!r}): unexpected new variable ID(s) appeared in minified project: {sorted(set(tm_vars) - set(to_vars))}",
 				)
 			missing_vars = set(to_vars) - set(tm_vars)
-			if missing_vars and not opts.remove_unused_variables:
+			if missing_vars and not (opts.remove_unused_variables or opts.prune_unused_data):
 				return (
 					False,
 					f"Target {ti} ({name!r}): {len(missing_vars)} variable(s) removed without --remove-unused-variables: {sorted(missing_vars)}",
@@ -13450,7 +13700,7 @@ def verify(original_path, minified_path, opts):
 					f"Target {ti} ({name!r}): unexpected new list ID(s) appeared in minified project: {sorted(set(tm_lists) - set(to_lists))}",
 				)
 			missing_lists = set(to_lists) - set(tm_lists)
-			if missing_lists and not opts.remove_unused_lists:
+			if missing_lists and not (opts.remove_unused_lists or opts.prune_unused_data):
 				return (
 					False,
 					f"Target {ti} ({name!r}): {len(missing_lists)} list(s) removed without --remove-unused-lists: {sorted(missing_lists)}",
@@ -14172,8 +14422,6 @@ def minify_sb3(src, dst, opts=None):
 	if not os.path.isfile(src):
 		print(Ansi.error(f'Error: file not found: "{src}"'))
 		return 1
-	if opts.lossless:
-		return _minify_lossless_sb3(src, dst, opts)
 	try:
 		zopfli = get_zopfli(opts.zopfli_required) if (opts.zopfli or opts.zopfli_assets) else None
 	except ValueError as error:
@@ -14238,7 +14486,12 @@ def minify_sb3(src, dst, opts=None):
 			out_json, compressed_json, encoding_stats = optimize_project_json(
 				loads_exact(out_json), opts.compression_level, opts.zopfli,
 				opts.zopfli_iterations, opts.zopfli_required, opts.compact_block_defaults,
-				opts.compact_costume_references, opts.compact_block_flags, opts.minimum_json, opts.json_search_rounds
+				opts.compact_costume_references, opts.compact_block_flags, opts.minimum_json,
+				opts.json_search_rounds, False, opts.strip_reference_names,
+				opts.prune_orphan_arguments, opts.compact_procedure_symbols,
+				opts.compact_reporter_defaults, opts.fast_json, opts.strip_covered_shadows,
+				opts.strip_editor_comments, opts.strip_script_positions, opts.prune_unused_data,
+				opts.rebuild_procedure_displays, opts.compact_terminal_links
 			)
 			stats.update({key: value for key, value in encoding_stats.items() if isinstance(value, int)})
 
@@ -14480,57 +14733,40 @@ if __name__ == "__main__":
 	if "--fast-json" in flags and "--thorough-json" in flags:
 		print(Ansi.error("--fast-json is incompatible with --thorough-json"))
 		sys.exit(1)
-	all_flags = "--all-flags" in flags or "--all-optimizations" in flags
-	all_safe = any(flag in flags for flag in ("--all-lossless", "--all-safe", "--all-safe-flags"))
-	lossless = "--lossless" in flags or all_safe or all_flags or any(flag in flags for flag in ("--prune-orphan-arguments", "--compact-procedure-symbols", "--compact-reporter-defaults", "--strip-covered-shadows", "--strip-editor-comments", "--strip-script-positions", "--prune-unused-data", "--rebuild-procedure-displays", "--compact-terminal-links", "--fast-json", "--thorough-json"))
-	if lossless:
-		allowed = {
-			"--lossless", "--all-lossless", "--all-flags", "--all-optimizations", "--optimize-json", "--optimize-assets",
-			"--zopfli", "--zopfli-assets", "--zopfli-iterations", "--compression-level",
-			"--compact-block-defaults", "--compact-costume-references", "--compact-block-flags",
-			"--all-safe", "--all-safe-flags", "--minimum-json", "--json-search-rounds", "--relabel-block-ids",
-			"--strip-reference-names", "--drop-reference-names", "--empty-reference-names",
-			"--prune-orphan-arguments", "--compact-procedure-symbols", "--compact-reporter-defaults", "--strip-covered-shadows", "--fast-json", "--thorough-json",
-			"--strip-editor-comments", "--strip-script-positions", "--prune-unused-data", "--keep-unused-data",
-			"--rebuild-procedure-displays", "--keep-procedure-displays",
-			"--compact-terminal-links", "--keep-terminal-links",
-			"--keep-comments", "--keep-positions", "--keep-covered", "--keep-monitors",
-			"--keep-sound-metadata", "--preserve-asset-compression", "--compress-assets",
-		}
-		conflicts = [flag for flag in flags if flag.partition("=")[0] not in allowed]
-		if conflicts:
-			print(Ansi.error(f"Lossless mode is incompatible with: {', '.join(conflicts)}"))
-			sys.exit(1)
+	
+	all_flags = "--all-flags" in flags
+	all_lossless = any(flag in flags for flag in ("--all-lossless", "--all-safe", "--all-safe-flags"))
+	lossless = "--lossless" in flags or all_lossless
 	opts = Options(
 		lossless=lossless,
-		rebuild_procedure_displays=(all_flags and "--keep-procedure-displays" not in flags) or "--rebuild-procedure-displays" in flags,
-		compact_terminal_links=(all_flags and "--keep-terminal-links" not in flags) or "--compact-terminal-links" in flags,
+		rebuild_procedure_displays=((all_flags or all_lossless) and "--keep-procedure-displays" not in flags) or "--rebuild-procedure-displays" in flags,
+		compact_terminal_links=((all_flags or all_lossless) and "--keep-terminal-links" not in flags) or "--compact-terminal-links" in flags,
 		fast_json="--fast-json" in flags or (all_flags and "--thorough-json" not in flags),
-		prune_orphan_arguments=all_flags or "--prune-orphan-arguments" in flags,
-		compact_procedure_symbols=all_flags or "--compact-procedure-symbols" in flags,
-		compact_reporter_defaults=all_flags or "--compact-reporter-defaults" in flags,
-		strip_covered_shadows=(all_flags and "--keep-covered" not in flags) or "--strip-covered-shadows" in flags,
-		strip_editor_comments=(all_flags and "--keep-comments" not in flags) or "--strip-editor-comments" in flags,
-		prune_unused_data=(all_flags and "--keep-unused-data" not in flags) or "--prune-unused-data" in flags,
-		strip_script_positions=(all_flags and "--keep-positions" not in flags) or "--strip-script-positions" in flags,
-		all_lossless=all_safe or all_flags,
-		compact_costume_references="--compact-costume-references" in flags,
-		compact_block_flags=all_flags or "--compact-block-flags" in flags,
-		minimum_json=all_flags or "--minimum-json" in flags or "--thorough-json" in flags,
+		prune_orphan_arguments=all_flags or all_lossless or "--prune-orphan-arguments" in flags,
+		compact_procedure_symbols=all_flags or all_lossless or "--compact-procedure-symbols" in flags,
+		compact_reporter_defaults=all_flags or all_lossless or "--compact-reporter-defaults" in flags,
+		strip_covered_shadows=((all_flags or all_lossless) and "--keep-covered" not in flags) or "--strip-covered-shadows" in flags,
+		strip_editor_comments=((all_flags or all_lossless) and "--keep-comments" not in flags) or "--strip-editor-comments" in flags,
+		prune_unused_data=((all_flags or all_lossless) and "--keep-unused-data" not in flags) or "--prune-unused-data" in flags,
+		strip_script_positions=((all_flags or all_lossless) and "--keep-positions" not in flags) or "--strip-script-positions" in flags,
+		all_lossless=all_lossless,
+		compact_costume_references=all_lossless or "--compact-costume-references" in flags,
+		compact_block_flags=all_flags or all_lossless or "--compact-block-flags" in flags,
+		minimum_json=all_flags or all_lossless or "--minimum-json" in flags or "--thorough-json" in flags,
 		json_search_rounds=values.get("--json-search-rounds", 0),
-		relabel_block_ids=all_flags or "--relabel-block-ids" in flags,
+		relabel_block_ids=all_flags or all_lossless or "--relabel-block-ids" in flags,
 		auto_zopfli=all_flags,
 		optimize_json="--optimize-json" in flags,
-		optimize_assets="--optimize-assets" in flags,
+		optimize_assets="--optimize-assets" in flags or all_lossless,
 		compact_block_defaults="--compact-block-defaults" in flags,
-		zopfli="--zopfli" in flags,
-		zopfli_assets="--zopfli-assets" in flags,
+		zopfli="--zopfli" in flags or (all_lossless and "--fast-json" not in flags),
+		zopfli_assets="--zopfli-assets" in flags or all_lossless,
 		zopfli_iterations=values.get("--zopfli-iterations", 5),
-		comments=("--keep-comments" not in flags),
-		positions=("--keep-positions" not in flags),
-		covered=("--keep-covered" not in flags),
-		monitors=("--keep-monitors" not in flags),
-		lists=("--clear-large-lists" in flags),
+		comments=not lossless and "--keep-comments" not in flags,
+		positions=not lossless and "--keep-positions" not in flags,
+		covered=not lossless and "--keep-covered" not in flags,
+		monitors=not lossless and "--keep-monitors" not in flags,
+		lists=not lossless and "--clear-large-lists" in flags,
 		rename_block_ids="--rename-block-ids" in flags
 		or "--frequency-block-ids" in flags
 		or "--order-block-ids-by-frequency" in flags,
@@ -14563,7 +14799,7 @@ if __name__ == "__main__":
 		remove_empty_target_containers="--remove-empty-containers" in flags
 		or "--remove-empty-target-containers" in flags,
 		remove_project_meta="--remove-project-meta" in flags,
-		preserve_asset_compression="--preserve-asset-compression" in flags,
+		preserve_asset_compression=lossless or "--preserve-asset-compression" in flags,
 		frequency_block_ids="--frequency-block-ids" in flags
 		or "--order-block-ids-by-frequency" in flags,
 		frequency_data_ids="--frequency-data-ids" in flags
@@ -14603,7 +14839,7 @@ if __name__ == "__main__":
 		nested_conditionals=any(f in flags for f in ("--nested-conditionals", "--merge-nested-conditionals", "--merge-nested-ifs")),
 		associative_constant_merging=any(f in flags for f in ("--associative-constants", "--merge-associative-constants", "--reassociate-constants")),
 		script_constant_propagation=any(f in flags for f in ("--script-constant-propagation", "--propagate-script-constants", "--constant-propagation")),
-		strip_reference_names=all_flags or any(f in flags for f in ("--strip-reference-names", "--drop-reference-names", "--empty-reference-names")),
+		strip_reference_names=all_flags or all_lossless or any(f in flags for f in ("--strip-reference-names", "--drop-reference-names", "--empty-reference-names")),
 		compact_data_literals=any(f in flags for f in ("--compact-data-literals", "--numeric-data-literals", "--convert-numeric-data")),
 		remove_unused_extensions=any(f in flags for f in ("--remove-unused-extensions", "--unused-extensions")),
 		group_similar_sequences="--group-similar-sequences" in flags,
@@ -14615,7 +14851,7 @@ if __name__ == "__main__":
 		list_bytes=values.get("--list-bytes", DEFAULT_LIST_BYTES),
 		list_items=values.get("--list-items", DEFAULT_LIST_ITEMS),
 		normalize_epsilon=values.get("--normalize-epsilon", DEFAULT_EPSILON),
-		keep_sound_metadata=("--keep-sound-metadata" in flags),
+		keep_sound_metadata=lossless or "--keep-sound-metadata" in flags,
 		compact_procedure_prototypes=any(
 			f in flags
 			for f in (
