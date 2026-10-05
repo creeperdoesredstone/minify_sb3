@@ -31,6 +31,7 @@ toggles = {
 	"--keep-covered",
 	"--keep-monitors",
 	"--clear-large-lists",
+    "--relabel-block-ids",
 	"--rename-block-ids",
 	"--rename-variable-ids",
 	"--rename-list-ids",
