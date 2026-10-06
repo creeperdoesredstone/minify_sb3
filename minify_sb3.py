@@ -7794,7 +7794,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 					res = math.ceil(num)
 				case "sqrt":
 					if num < 0:
-						return None
+						return "NaN"
 					res = math.sqrt(num)
 				case "sin":
 					res = float(f"{math.sin(math.radians(num)):.10f}")
@@ -11039,8 +11039,6 @@ class Options:
 		rebuild_procedure_displays=False,
 		compact_terminal_links=False,
 	):
-		# ``lossless`` is retained as a compatibility marker. Lossless representation
-		# optimizations now run through the same pipeline as all other optimizations.
 		self.lossless = bool(lossless or all_lossless)
 		self.rebuild_procedure_displays = rebuild_procedure_displays or all_lossless
 		self.compact_terminal_links = compact_terminal_links or all_lossless
@@ -14738,8 +14736,7 @@ if __name__ == "__main__":
 	if "--fast-json" in flags and "--thorough-json" in flags:
 		print(Ansi.error("--fast-json is incompatible with --thorough-json"))
 		sys.exit(1)
-	# ``--all-optimizations`` is a normal flag group expanded above.  It must
-	# not activate the special ``all_flags`` behavior used by ``--all-flags``.
+	
 	all_flags = "--all-flags" in flags
 	all_lossless = any(flag in flags for flag in ("--all-lossless", "--all-safe", "--all-safe-flags"))
 	lossless = "--lossless" in flags or all_lossless
@@ -14823,31 +14820,24 @@ if __name__ == "__main__":
 			f in flags
 			for f in (
 				"--optimize-procedure-arguments",
-				"--optimize-custom-procedure-arguments",
-				"--drop-procedure-arguments",
-				"--remove-unused-procedure-arguments",
-				"--remove-unused-custom-procedure-arguments",
-				"--fold-constant-procedure-arguments",
-				"--fold-constant-custom-procedure-arguments",
+				"--opa",
 			)
 		),
 		merge_duplicate_procedures=any(
 			f in flags
 			for f in (
 				"--merge-duplicate-procedures",
-				"--merge-duplicate-custom-procedures",
-				"--merge-duplicate-custom-blocks",
-				"--deduplicate-procedures",
+				"--mdp",
 			)
 		),
-		branch_swapping=any(f in flags for f in ("--branch-swapping", "--swap-branches", "--branch-swap")),
-		trivial_loops=any(f in flags for f in ("--trivial-loops", "--simplify-trivial-loops")),
-		nested_conditionals=any(f in flags for f in ("--nested-conditionals", "--merge-nested-conditionals", "--merge-nested-ifs")),
-		associative_constant_merging=any(f in flags for f in ("--associative-constants", "--merge-associative-constants", "--reassociate-constants")),
-		script_constant_propagation=any(f in flags for f in ("--script-constant-propagation", "--propagate-script-constants", "--constant-propagation")),
-		strip_reference_names=all_flags or all_lossless or any(f in flags for f in ("--strip-reference-names", "--drop-reference-names", "--empty-reference-names")),
-		compact_data_literals=any(f in flags for f in ("--compact-data-literals", "--numeric-data-literals", "--convert-numeric-data")),
-		remove_unused_extensions=any(f in flags for f in ("--remove-unused-extensions", "--unused-extensions")),
+		branch_swapping=any(f in flags for f in ("--branch-swapping", "--bs")),
+		trivial_loops=any(f in flags for f in ("--trivial-loops", "--tl")),
+		nested_conditionals=any(f in flags for f in ("--nested-conditionals", "--nc")),
+		associative_constant_merging=any(f in flags for f in ("--associative-constants", "--ac")),
+		script_constant_propagation=any(f in flags for f in ("--constant-propagation","--cp")),
+		strip_reference_names=all_flags or all_lossless or any(f in flags for f in ("--strip-reference-names", "--srn")),
+		compact_data_literals=any(f in flags for f in ("--compact-data-literals", "--cdl")),
+		remove_unused_extensions=any(f in flags for f in ("--remove-unused-extensions", "--rue")),
 		group_similar_sequences="--group-similar-sequences" in flags,
 		sequence_threshold=values.get("--sequence-threshold", 3),
 		compress_assets="--compress-assets" in flags,
@@ -14862,29 +14852,26 @@ if __name__ == "__main__":
 			f in flags
 			for f in (
 				"--procedure-prototype-compaction",
-				"--compact-procedure-prototypes",
-				"--compact-custom-procedure-prototypes",
+				"--ppc",
 			)
 		),
 		clear_procedure_definition_shadows=any(
 			f in flags
 			for f in (
 				"--clear-procedure-definition-shadows",
-				"--compact-procedure-definition-shadows",
-				"--remove-procedure-definition-shadows",
+				"--cpds",
 			)
 		),
 		inline_single_use_procedures=any(
 			f in flags
 			for f in (
 				"--inline-single-use-procedures",
-				"--inline-single-use-custom-procedures",
-				"--procedure-inlining",
+				"--isup",
 			)
 		),
 		procedure_inline_passes=values.get("--procedure-inline-passes", 8),
 		specialize_procedures=any(
-			f in flags for f in ("--specialize-procedures", "--specialize-custom-procedures", "--procedure-specialization")
+			f in flags for f in ("--specialize-procedures", "--sp")
 		),
 		procedure_specialization_passes=values.get("--procedure-specialization-passes", 4),
 		procedure_specialization_min_calls=values.get("--procedure-specialization-min-calls", 2),
