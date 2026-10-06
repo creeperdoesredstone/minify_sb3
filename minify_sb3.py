@@ -9955,7 +9955,7 @@ def _demorgan_boolean_input(
 	}
 
 
-_NUMERIC_REPORTER_OPCODES = {
+NUMERIC_REPORTER_OPCODES = {
 	"operator_add",
 	"operator_subtract",
 	"operator_multiply",
@@ -9974,7 +9974,7 @@ _NUMERIC_REPORTER_OPCODES = {
 	"sensing_timer",
 	"sensing_dayssince2000",
 }
-_BOOLEAN_REPORTER_OPCODES = {
+BOOLEAN_REPORTER_OPCODES = {
 	"operator_not",
 	"operator_and",
 	"operator_or",
@@ -9990,6 +9990,16 @@ _BOOLEAN_REPORTER_OPCODES = {
 	"sensing_askandwait",
 	"video_sensing_on",
 }
+FINITE_NUMERIC_REPORTER_OPCODES = {
+	"operator_length",
+	"motion_xposition",
+	"motion_yposition",
+	"motion_direction",
+	"looks_size",
+	"sound_volume",
+	"sensing_timer",
+	"sensing_dayssince2000",
+}
 
 
 def _value_is_definitely_numeric(value, blocks, visiting=frozenset()):
@@ -10002,7 +10012,24 @@ def _value_is_definitely_numeric(value, blocks, visiting=frozenset()):
 	if not isinstance(child, str) or child in visiting:
 		return False
 	block = blocks.get(child)
-	return isinstance(block, dict) and block.get("opcode") in _NUMERIC_REPORTER_OPCODES
+	return isinstance(block, dict) and block.get("opcode") in NUMERIC_REPORTER_OPCODES
+
+
+def _value_is_definitely_finite_numeric(value, blocks, visiting=frozenset()):
+	constant = _constant_expression_from_input(value, blocks, visiting)
+	if constant is not None and constant[0][0] in ("number", "bool"):
+		number = _constant_to_number(constant[0])
+		return number is not None and math.isfinite(number)
+	if not (isinstance(value, list) and len(value) > 1):
+		return False
+	child = value[1]
+	if not isinstance(child, str) or child in visiting:
+		return False
+	block = blocks.get(child)
+	return (
+		isinstance(block, dict)
+		and block.get("opcode") in FINITE_NUMERIC_REPORTER_OPCODES
+	)
 
 
 def _value_is_definitely_boolean(value, blocks, visiting=frozenset()):
@@ -10018,7 +10045,7 @@ def _value_is_definitely_boolean(value, blocks, visiting=frozenset()):
 	if not isinstance(block, dict):
 		return False
 	op = block.get("opcode")
-	return op in _BOOLEAN_REPORTER_OPCODES or op == "argument_reporter_boolean"
+	return op in BOOLEAN_REPORTER_OPCODES or op == "argument_reporter_boolean"
 
 
 def _simplify_double_boolean_negation(
@@ -10064,7 +10091,6 @@ def _simplify_double_boolean_negation(
 
 
 def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
-
 	if not (isinstance(value, list) and len(value) > 1 and value[0] in (2, 3)):
 		return None
 	block_id = value[1]
@@ -10073,24 +10099,29 @@ def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 	block = blocks.get(block_id)
 	if not isinstance(block, dict) or block.get("next") is not None:
 		return None
+	
 	op = block.get("opcode")
 	if op not in (
 		"operator_add",
 		"operator_subtract",
 		"operator_multiply",
 		"operator_divide",
+		"operator_mod",
 	):
 		return None
+	
 	inputs = block.get("inputs") or {}
 	left_raw, right_raw = inputs.get("NUM1"), inputs.get("NUM2")
 	if left_raw is None or right_raw is None:
 		return None
+	
 	left = _constant_expression_from_input(left_raw, blocks)
 	right = _constant_expression_from_input(right_raw, blocks)
 	left_num = _constant_to_number(left[0]) if left is not None else None
 	right_num = _constant_to_number(right[0]) if right is not None else None
 	preserve = None
 	dead_side = None
+
 	if op == "operator_add":
 		if left_num == 0 and _value_is_definitely_numeric(right_raw, blocks):
 			preserve, dead_side = right_raw, left
@@ -10102,18 +10133,28 @@ def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 	elif op == "operator_multiply":
 		if left_num == 1 and _value_is_definitely_numeric(right_raw, blocks):
 			preserve, dead_side = right_raw, left
+		elif left_num == 0 and _value_is_definitely_finite_numeric(right_raw, blocks):
+			preserve, dead_side = [1, [4, 0]], value
 		elif right_num == 1 and _value_is_definitely_numeric(left_raw, blocks):
 			preserve, dead_side = left_raw, right
+		elif right_num == 0 and _value_is_definitely_finite_numeric(left_raw, blocks):
+			preserve, dead_side = [1, [4, 0]], value
 	elif op == "operator_divide":
 		if right_num == 1 and _value_is_definitely_numeric(left_raw, blocks):
 			preserve, dead_side = left_raw, right
+	elif op == "operator_mod":
+		if right_num == 1 and _value_is_definitely_numeric(left_raw, blocks) and left_num is not None:
+			preserve, dead_side = [1, [4, left_num % right_num]], right
+	
 	if preserve is None:
 		return None
+	
 	closure = _exclusive_input_block_subtree_fast(
 		value, blocks, owner_id, incoming_refs, graph=graph
 	)
 	if closure is None or block_id not in closure:
 		return None
+	
 	removed = closure - _subtree_block_ids(preserve, blocks)
 	if owner_id in removed or not removed:
 		return None
@@ -11532,7 +11573,7 @@ def simplify_script_structures(project, stats, opts):
 	)
 
 
-def _script_associative_plan(blocks, outer_id, graph, commented):
+def _plan_associations(blocks, outer_id, graph, commented):
 	outer = blocks.get(outer_id)
 	if not isinstance(outer, dict) or outer.get("next") is not None:
 		return None
@@ -11603,7 +11644,7 @@ def merge_associative_constants(project, stats, opts):
 		while True:
 			changed = False
 			for bid in list(blocks):
-				plan = _script_associative_plan(blocks, bid, graph, commented)
+				plan = _plan_associations(blocks, bid, graph, commented)
 				if plan is None:
 					continue
 				outer = blocks[bid]
@@ -11637,7 +11678,7 @@ def merge_associative_constants(project, stats, opts):
 	return count
 
 
-def _script_var_id(block):
+def _get_var_id(block):
 	field = (
 		(block.get("fields") or {}).get("VARIABLE") if isinstance(block, dict) else None
 	)
@@ -11648,11 +11689,20 @@ def _script_var_id(block):
 	)
 
 
-def _script_replace_known_reads(
-	value, env, blocks, owner_id, ti, opts, graph, allow_literal=True
+def _replace_known_reads(
+	value,
+	env,
+	blocks,
+	owner_id,
+	ti,
+	opts,
+	graph,
+	allow_literal=True,
+	visiting=frozenset(),
 ):
 	if not isinstance(value, list) or not value:
 		return value, False, set()
+
 	if (
 		len(value) >= 3
 		and _scratch_numeric_tag(value[0]) == 12
@@ -11663,30 +11713,100 @@ def _script_replace_known_reads(
 			return value, False, set()
 		entry = env[value[2]]
 		return [1, copy.deepcopy(entry)], True, set()
+
+	tag = _scratch_numeric_tag(value[0])
+
 	if (
-		_scratch_numeric_tag(value[0]) in (1, 2, 3)
+		tag in (1, 2, 3)
 		and len(value) > 1
 		and isinstance(value[1], str)
 	):
 		ref = value[1]
 		child = blocks.get(ref)
+
 		if isinstance(child, dict) and child.get("opcode") == "data_variable":
-			vid = _script_var_id(child)
+			vid = _get_var_id(child)
 			if allow_literal and vid in env and child.get("parent") == owner_id:
 				owned = _exclusive_input_block_subtree_fast(
 					value, blocks, owner_id, graph.incoming, graph=graph
 				)
 				if owned == {ref}:
 					return [1, copy.deepcopy(env[vid])], True, {ref}
+
+		if (
+			isinstance(child, dict)
+			and ref not in visiting
+			and child.get("next") is None
+			and not child.get("topLevel", False)
+			and child.get("opcode") not in {
+				"procedures_prototype",
+				"procedures_definition",
+			}
+		):
+			owned = _exclusive_input_block_subtree_fast(
+				value,
+				blocks,
+				owner_id,
+				graph.incoming,
+				graph=graph,
+			)
+			if owned is not None and ref in owned:
+				child_changed = False
+				removed = set()
+				child_visiting = visiting | {ref}
+				for child_input_name, child_raw in list(
+					(child.get("inputs") or {}).items()
+				):
+					new, c, dead = _replace_known_reads(
+						child_raw,
+						env,
+						blocks,
+						ref,
+						ti,
+						opts,
+						graph,
+						allow_literal=not _is_boolean_slot(
+							child, child_input_name
+						),
+						visiting=child_visiting,
+					)
+					if not c:
+						continue
+					child.setdefault("inputs", {})[child_input_name] = new
+					opts.script_rewrite_input_edits[
+						(ti, ref, child_input_name)
+					] = copy.deepcopy(new)
+					for dead_id in dead:
+						blocks.pop(dead_id, None)
+					_script_record_removed(opts, ti, dead)
+					graph.refresh_after_mutation(
+						changed={ref},
+						removed=set(dead),
+					)
+					child_changed = True
+					removed.update(dead)
+
+				if child_changed:
+					return value, True, removed
+
 		return value, False, set()
-	if _scratch_numeric_tag(value[0]) == 3:
+
+	if tag == 3:
 		changed = False
 		removed = set()
 		for i in (1, 2):
 			if i >= len(value) or not isinstance(value[i], list):
 				continue
-			new, c, dead = _script_replace_known_reads(
-				value[i], env, blocks, owner_id, ti, opts, graph, allow_literal=True
+			new, c, dead = _replace_known_reads(
+				value[i],
+				env,
+				blocks,
+				owner_id,
+				ti,
+				opts,
+				graph,
+				allow_literal=True,
+				visiting=visiting,
 			)
 			if c:
 				if i == 1 and _is_bare_literal_input(new):
@@ -11695,6 +11815,7 @@ def _script_replace_known_reads(
 				changed = True
 			removed |= dead
 		return value, changed, removed
+
 	return value, False, set()
 
 
@@ -11816,7 +11937,7 @@ _CFG_SCHEDULER_YIELD_OPCODES = frozenset(
 )
 
 
-def _build_script_cfg(target):
+def _build_cfg(target):
 	blocks = target.get("blocks") or {}
 	roots = _cfg_statement_roots(blocks)
 	successors = {bid: set() for bid in roots}
@@ -12042,18 +12163,18 @@ def _cfg_transfer_constants(block, env):
 		return out
 	op = block.get("opcode", "")
 	if op == "data_setvariableto":
-		vid = _script_var_id(block)
+		vid = _get_var_id(block)
 		lit = _script_literal_payload((block.get("inputs") or {}).get("VALUE"))
 		if vid and lit is not None:
 			out[vid] = lit
 		elif vid:
 			out.pop(vid, None)
 	elif op == "data_changevariableby":
-		vid = _script_var_id(block)
+		vid = _get_var_id(block)
 		if vid:
 			out.pop(vid, None)
 	elif op == "control_for_each":
-		vid = _script_var_id(block)
+		vid = _get_var_id(block)
 		if vid:
 			out.pop(vid, None)
 	if _cfg_is_hard_constant_barrier(block):
@@ -12127,7 +12248,7 @@ def _cfg_propagate_root_constants(
 			continue
 		env = in_env.get(bid, {})
 		for input_name, raw in list((block.get("inputs") or {}).items()):
-			new, changed, dead = _script_replace_known_reads(
+			new, changed, dead = _replace_known_reads(
 				raw,
 				env,
 				blocks,
@@ -12160,7 +12281,7 @@ def constant_propagation(project, stats, opts):
 		if not blocks:
 			continue
 		roots, nodes_by_root, successors, predecessors, scheduler_edges = (
-			_build_script_cfg(target)
+			_build_cfg(target)
 		)
 		graph = _ScratchGraphIndex(target)
 		for root in roots:
@@ -12316,11 +12437,16 @@ def _compact_data_entry_equal(original, minified):
 
 def fold_constant_expressions(project, stats, opts):
 	targets = project.get("targets", [])
-	opts.folded_constant_expression_link_edits = {}
-	opts.folded_constant_expression_inputs = {}
-	opts.folded_constant_expression_opcode_edits = {}
-	opts.folded_constant_expression_blocks = [set() for _ in targets]
-	opts.folded_constant_expression_new_blocks = [set() for _ in targets]
+	if getattr(opts, "folded_constant_expression_link_edits", None) is None:
+		opts.folded_constant_expression_link_edits = {}
+	if getattr(opts, "folded_constant_expression_inputs", None) is None:
+		opts.folded_constant_expression_inputs = {}
+	if getattr(opts, "folded_constant_expression_opcode_edits", None) is None:
+		opts.folded_constant_expression_opcode_edits = {}
+	if getattr(opts, "folded_constant_expression_blocks", None) is None or len(opts.folded_constant_expression_blocks) != len(targets):
+		opts.folded_constant_expression_blocks = [set() for _ in targets]
+	if getattr(opts, "folded_constant_expression_new_blocks", None) is None or len(opts.folded_constant_expression_new_blocks) != len(targets):
+		opts.folded_constant_expression_new_blocks = [set() for _ in targets]
 	folded = 0
 
 	for ti, target in enumerate(targets):
@@ -12647,6 +12773,7 @@ def fold_constant_expressions(project, stats, opts):
 				break
 
 	stats["constant_expressions_folded"] += folded
+	return folded
 
 
 def prompt_for_constant_variables(project, candidates) -> dict:
@@ -13322,9 +13449,16 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		remove_constant_variable_setters(
 			project, opts.folded_constant_variable_setters, stats, opts
 		)
-	if opts.constant_propagation:
-		stage("Constant propagation")
-		constant_propagation(project, stats, opts)
+	if opts.constant_propagation or opts.fold_constant_expressions:
+		stage("Propagate constants & fold expressions")
+		while True:
+			round_changes = 0
+			if opts.constant_propagation:
+				round_changes += constant_propagation(project, stats, opts)
+			if opts.fold_constant_expressions:
+				round_changes += fold_constant_expressions(project, stats, opts)
+			if round_changes == 0:
+				break
 	if (
 		opts.branch_swapping
 		or opts.branch_factoring
