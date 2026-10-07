@@ -363,8 +363,8 @@ def _reference_name_slots(project):
 		tag = node[0]
 		if isinstance(tag, JsonNumber):
 			tag = {
-				(False, "12", 0): PRIMITIVE_VARIABLE,
-				(False, "13", 0): PRIMITIVE_LIST,
+				(False, str(PRIMITIVE_VARIABLE), 0): PRIMITIVE_VARIABLE,
+				(False, str(PRIMITIVE_LIST), 0): PRIMITIVE_LIST,
 			}.get(_number_components(tag))
 		if type(tag) in (int, float) and tag in (PRIMITIVE_VARIABLE, PRIMITIVE_LIST):
 			yield path + (1,), node, 1, node[2], (
@@ -392,7 +392,7 @@ def _reference_name_slots(project):
 					for index in (
 						(1, 2)
 						if tag == INPUT_DIFF_BLOCK_SHADOW
-						else (1,) if tag in (INPUT_SAME_BLOCK_SHADOW, 2) else ()
+						else (1,) if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW) else ()
 					):
 						if len(desc) > index:
 							yield from primitive(
@@ -656,7 +656,7 @@ def _terminal_link_ids(project):
 				or block["opcode"] not in _DATA_PRUNING_OPCODES
 			):
 				return {}
-	primitive_tags = {_number_components(str(i)): i for i in range(4, 14)}
+	primitive_tags = {_number_components(str(i)): i for i in range(PRIMITIVE_NUMBER, PRIMITIVE_LIST + 1)}
 	result = {}
 	for ti, target in enumerate(project["targets"]):
 		blocks, memo = target.get("blocks", {}), {}
@@ -670,7 +670,7 @@ def _terminal_link_ids(project):
 				if not isinstance(desc, list) or not desc:
 					return None
 				tag = _input_tag(desc[0])
-				if tag not in (INPUT_SAME_BLOCK_SHADOW, 2, INPUT_DIFF_BLOCK_SHADOW) or len(desc) != (
+				if tag not in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW) or len(desc) != (
 					3 if tag == INPUT_DIFF_BLOCK_SHADOW else 2
 				):
 					return None
@@ -683,7 +683,7 @@ def _terminal_link_ids(project):
 							if isinstance(value[0], JsonNumber)
 							else value[0] if type(value[0]) in (int, float) else None
 						)
-						if kind not in range(4, 14) or len(value) != (
+						if kind not in range(PRIMITIVE_NUMBER, PRIMITIVE_LIST + 1) or len(value) != (
 							3 if kind >= PRIMITIVE_BROADCAST else 2
 						):
 							return None
@@ -752,7 +752,7 @@ def _terminal_link_ids(project):
 					isinstance(desc, list)
 					and desc[1] == bid
 					and (
-						(len(desc) == 2 and _input_tag(desc[0]) in (INPUT_SAME_BLOCK_SHADOW, 2))
+						(len(desc) == 2 and _input_tag(desc[0]) in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW))
 						or (
 							len(desc) == 3
 							and _input_tag(desc[0]) == INPUT_DIFF_BLOCK_SHADOW
@@ -818,12 +818,12 @@ _COVERED_INPUT_OPCODES = _SYNC_REPORTERS | frozenset(
 
 
 def _covered_shadow_slots(project):
-	token_kinds = {_number_components(str(value)): value for value in range(4, 14)}
+	token_kinds = {_number_components(str(value)): value for value in range(PRIMITIVE_NUMBER, PRIMITIVE_LIST + 1)}
 
 	def kind(value):
 		if isinstance(value, JsonNumber):
 			return token_kinds.get(_number_components(value))
-		return value if type(value) in (int, float) and value in range(4, 14) else None
+		return value if type(value) in (int, float) and value in range(PRIMITIVE_NUMBER, PRIMITIVE_LIST + 1) else None
 
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks", {})
@@ -904,7 +904,7 @@ def _restore_covered_shadows(original, result):
 			if (
 				isinstance(after, list)
 				and len(after) == 2
-				and _input_tag(after[0]) == 2
+				and _input_tag(after[0]) == INPUT_BLOCK_NO_SHADOW
 			):
 				inputs[name] = [before[0], after[1], before[2]]
 		except (KeyError, IndexError, TypeError):
@@ -1292,7 +1292,7 @@ def _unused_data_ids(project):
 				return {}
 			seen.update(table)
 		scopes.append(seen)
-	primitive_kinds = {_number_components(str(tag)): tag for tag in range(4, 14)}
+	primitive_kinds = {_number_components(str(tag)): tag for tag in range(PRIMITIVE_NUMBER, PRIMITIVE_LIST + 1)}
 
 	def mark(ti, kind, name, ident):
 		if type(ident) is str:
@@ -1588,7 +1588,7 @@ def _procedure_display_plans(target):
 		if (
 			not isinstance(desc, list)
 			or len(desc) != 2
-			or _input_tag(desc[0]) != 1
+			or _input_tag(desc[0]) != INPUT_SAME_BLOCK_SHADOW
 			or desc[1] != bid
 		):
 			continue
@@ -1635,7 +1635,7 @@ def _procedure_display_plans(target):
 			if (
 				not isinstance(desc, list)
 				or len(desc) != 2
-				or _input_tag(desc[0]) != 1
+				or _input_tag(desc[0]) != INPUT_SAME_BLOCK_SHADOW
 				or type(desc[1]) is not str
 			):
 				break
@@ -1717,7 +1717,7 @@ def _rebuild_procedure_displays(project):
 				blocks[prototype].pop("shadow")
 				blocks[definition] = dict(blocks[definition])
 				blocks[definition]["inputs"] = {
-					"custom_block": [JsonNumber("2"), prototype]
+					"custom_block": [JsonNumber(str(INPUT_BLOCK_NO_SHADOW)), prototype]
 				}
 				for child in children:
 					del blocks[child]
@@ -1970,7 +1970,7 @@ def compact_representation(
 	if strip_covered_shadows:
 		for ti, bid, name, desc in _covered_shadow_slots(project):
 			project["targets"][ti]["blocks"][bid]["inputs"][name] = [
-				JsonNumber("2"),
+				JsonNumber(str(INPUT_BLOCK_NO_SHADOW)),
 				desc[1],
 			]
 	if compact_procedure_symbols:
@@ -2246,12 +2246,12 @@ def _input_tag(value):
 			int(components[1])
 			if not components[0]
 			and components[2] == 0
-			and components[1] in ("1", "2", "3")
+			and components[1] in (str(INPUT_SAME_BLOCK_SHADOW), str(INPUT_BLOCK_NO_SHADOW), str(INPUT_DIFF_BLOCK_SHADOW))
 			else None
 		)
 	return (
 		value
-		if type(value) in (int, float) and value in (INPUT_SAME_BLOCK_SHADOW, 2, INPUT_DIFF_BLOCK_SHADOW)
+		if type(value) in (int, float) and value in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 		else None
 	)
 
@@ -2271,8 +2271,8 @@ def _block_slots(target):
 			tag = _input_tag(desc[0])
 			positions = (
 				(1,)
-				if tag in (INPUT_SAME_BLOCK_SHADOW, 2)
-				else (INPUT_SAME_BLOCK_SHADOW, 2) if tag == INPUT_DIFF_BLOCK_SHADOW else ()
+				if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW)
+				else (1, 2) if tag == INPUT_DIFF_BLOCK_SHADOW else ()
 			)
 			for position in positions:
 				if (
@@ -3226,7 +3226,7 @@ def _mapped_block_id(value, block_ids):
 def _replace_input_block_ids(value, block_ids):
 	for node in _iter_scratch_input_nodes(value):
 		tag = node[0]
-		if tag in (INPUT_SAME_BLOCK_SHADOW, 2) and len(node) > 1:
+		if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW) and len(node) > 1:
 			node[1] = _mapped_block_id(node[1], block_ids)
 		elif tag == INPUT_DIFF_BLOCK_SHADOW:
 			if len(node) > 1:
@@ -3961,7 +3961,7 @@ def _iter_scratch_input_nodes(value):
 			continue
 		yield node
 		tag = node[0]
-		if tag in (1, 2):
+		if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 			if len(node) > 1 and isinstance(node[1], list):
 				stack.append(node[1])
 		elif tag == INPUT_DIFF_BLOCK_SHADOW:
@@ -5652,7 +5652,7 @@ def _repair_dangling_block_ref(value, blocks):
 		return value, False
 
 	tag = value[0]
-	if tag in (1, 2):
+	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 		if len(value) <= 1:
 			return value, False
 		ref = value[1]
@@ -5678,7 +5678,7 @@ def _repair_dangling_block_ref(value, blocks):
 					if isinstance(shadow, str) and shadow not in blocks:
 						return None, True
 					# preserve shadow value
-					return [1, shadow], True
+					return [INPUT_SAME_BLOCK_SHADOW, shadow], True
 				return None, True
 
 		if len(value) > 2:
@@ -5722,7 +5722,7 @@ def _iter_input_block_refs(value):
 	if not isinstance(value, list) or not value:
 		return
 	tag = value[0]
-	if tag in (1, 2):
+	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 		if len(value) > 1:
 			ref = value[1]
 			if isinstance(ref, str):
@@ -5924,7 +5924,7 @@ def _sequence_input_parameterizable(value, blocks):
 	refs = list(_sequence_input_refs(value, blocks))
 	if refs:
 		return all(_sequence_reporter_block(blocks.get(ref)) for ref in refs)
-	if value[0] in (1, 2):
+	if value[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 		return len(value) >= 2 and _sequence_inline_parameterizable(value[1])
 	if value[0] == INPUT_DIFF_BLOCK_SHADOW:
 		if len(value) < 2:
@@ -6099,7 +6099,7 @@ def _sequence_replace_direct_ref(value, old_id, new_id):
 		if not isinstance(node, list) or not node:
 			return False
 		tag = node[0]
-		if tag in (1, 2):
+		if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 			if len(node) > 1 and node[1] == old_id:
 				node[1] = new_id
 				return True
@@ -6171,7 +6171,7 @@ def _sequence_clone_input(value, blocks, generated, parent_id):
 			return out
 		tag = out[0]
 		if (
-			tag in (1, 2)
+			tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW)
 			and len(out) > 1
 			and isinstance(out[1], str)
 			and out[1] in blocks
@@ -6404,7 +6404,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				reporter_id = _sequence_make_argument_reporter(
 					generated, proto_id, arg_id, arg_name, shadow=True, blocks=blocks
 				)
-				generated[proto_id]["inputs"][arg_id] = [1, reporter_id]
+				generated[proto_id]["inputs"][arg_id] = [INPUT_SAME_BLOCK_SHADOW, reporter_id]
 
 			body_new_ids = []
 			body_map = {old_id: _sequence_new_id(blocks, generated) for old_id in base}
@@ -6440,7 +6440,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 							shadow = copy.deepcopy(original_value[2])
 							if isinstance(shadow, str) and shadow in blocks:
 								shadow_value = _sequence_clone_input(
-									[1, shadow], blocks, generated, new_id
+									[INPUT_SAME_BLOCK_SHADOW, shadow], blocks, generated, new_id
 								)
 								if (
 									isinstance(shadow_value, list)
@@ -6455,7 +6455,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 								shadow,
 							]
 						else:
-							new_inputs[input_name] = [2, arg_reporter_id]
+							new_inputs[input_name] = [INPUT_BLOCK_NO_SHADOW, arg_reporter_id]
 					else:
 						cloned = _sequence_clone_input(
 							original_value, blocks, generated, new_id
@@ -6476,7 +6476,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				"opcode": "procedures_definition",
 				"next": body_new_ids[0],
 				"parent": None,
-				"inputs": {"custom_block": [1, proto_id]},
+				"inputs": {"custom_block": [INPUT_SAME_BLOCK_SHADOW, proto_id]},
 				"fields": {},
 				"topLevel": True,
 				"x": 5,
@@ -6823,7 +6823,7 @@ def _replace_argument_reporter_refs(value, reporter_ids, replacement):
 		return value, False
 
 	tag = value[0]
-	if tag in (1, 2, INPUT_DIFF_BLOCK_SHADOW):
+	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
 		primary = value[1] if len(value) > 1 else None
 		if isinstance(primary, str) and primary in reporter_ids:
 			return copy.deepcopy(replacement), True
@@ -6932,7 +6932,7 @@ def _inline_argument_reporter_refs(value, reporter_ids, replacement):
 	if not isinstance(value, list) or not value:
 		return value, False
 	tag = value[0]
-	if tag in (1, 2, INPUT_DIFF_BLOCK_SHADOW):
+	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
 		positions = (1, 2) if tag == INPUT_DIFF_BLOCK_SHADOW else (1,)
 		for index in positions:
 			if index >= len(value):
@@ -7696,7 +7696,7 @@ def _clear_procedure_definition_shadow(target, proto_id):
 	if len(custom) < 2 or custom[1] != proto_id:
 		return False
 	# [INPUT_DIFF_BLOCK_SHADOW, proto, shadow] -> [2, proto]
-	custom[:] = [2, proto_id]
+	custom[:] = [INPUT_BLOCK_NO_SHADOW, proto_id]
 	return True
 
 
@@ -7746,7 +7746,7 @@ def compact_procedure_prototypes(project, stats, opts):
 				if (
 					isinstance(custom, list)
 					and len(custom) >= 2
-					and custom[0] == 1
+					and custom[0] == INPUT_SAME_BLOCK_SHADOW
 					and custom[1] == proto_id
 				):
 					canonical = custom[:2]
@@ -8142,7 +8142,7 @@ def _canonicalize_procedure(target, info, graph=None, procedure_aliases=None):
 			return value
 		tag = value[0]
 		out = copy.deepcopy(value)
-		if tag in (1, 2):
+		if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 			if len(out) > 1:
 				item = out[1]
 				if isinstance(item, str) and item in labels:
@@ -9048,7 +9048,7 @@ def remove_constant_variable_setters(project, setters, stats, opts):
 					if (
 						isinstance(value, list)
 						and len(value) > 1
-						and value[0] in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+						and value[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 						and value[1] == bid
 					):
 						found = (name, value)
@@ -9058,7 +9058,7 @@ def remove_constant_variable_setters(project, setters, stats, opts):
 					continue
 				name, value = found
 				if nxt is None:
-					new_value = [2, None]  # empty substack
+					new_value = [INPUT_BLOCK_NO_SHADOW, None]  # empty substack
 				else:
 					new_value = copy.deepcopy(value)
 					new_value[1] = nxt
@@ -9249,7 +9249,7 @@ def _folded_literal_input(value):
 	if not (
 		isinstance(value, list)
 		and len(value) > 1
-		and value[0] in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+		and value[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
 	child = value[1]
@@ -9276,7 +9276,7 @@ def _folded_literal_input(value):
 def _constant_expression_from_input(value, blocks, visiting=frozenset()):
 	if not (isinstance(value, list) and len(value) > 1):
 		return None
-	if value[0] in (1, 2, INPUT_DIFF_BLOCK_SHADOW):
+	if value[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
 		child = value[1]
 	else:
 		return None
@@ -9575,7 +9575,7 @@ def _variable_reporter_id(value, blocks):
 			return value[2]
 		return None
 
-	if tag not in (1, 2, INPUT_DIFF_BLOCK_SHADOW) or len(value) <= 1:
+	if tag not in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW) or len(value) <= 1:
 		return None
 
 	primary = value[1]
@@ -9728,7 +9728,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				else:
 					number = int(number) if float(number).is_integer() else number
 
-				new_value = [1, [PRIMITIVE_NUMBER, number]]
+				new_value = [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_NUMBER, number]]
 				removed = {rhs_id} | left_to_remove
 				set_block["opcode"] = "data_changevariableby"
 				opts.simplified_block_opcode_edits[(ti, set_id)] = (
@@ -9750,7 +9750,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 				continue
 
 			# set x to (x - a) -> change x by (0 - a)
-			new_left = [1, [PRIMITIVE_NUMBER, 0]]
+			new_left = [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_NUMBER, 0]]
 			rhs_inputs["NUM1"] = new_left
 			opts.simplified_block_input_edits[(ti, rhs_id, "NUM1")] = copy.deepcopy(
 				new_left
@@ -9823,7 +9823,7 @@ def _simplify_boolean_identity_input(
 	if not (
 		isinstance(value, list)
 		and len(value) > 1
-		and value[0] in (2, INPUT_DIFF_BLOCK_SHADOW)
+		and value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
 	block_id = value[1]
@@ -9915,7 +9915,7 @@ def _direct_input_block_refs(value, blocks):
 	if not isinstance(value, list) or not value:
 		return ()
 	refs = []
-	if value[0] in (2, INPUT_DIFF_BLOCK_SHADOW) and len(value) > 1:
+	if value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW) and len(value) > 1:
 		ref = value[1]
 		if isinstance(ref, str) and ref in blocks:
 			refs.append(ref)
@@ -9972,11 +9972,11 @@ def _constant_to_scratch_input(constant, blocks, parent_id):
 		number = (
 			int(value) if isinstance(value, float) and value.is_integer() else value
 		)
-		return [1, [PRIMITIVE_NUMBER, number]], set()
+		return [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_NUMBER, number]], set()
 	if kind == "string":
-		return [1, [PRIMITIVE_TEXT, value]], set()
+		return [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_TEXT, value]], set()
 	if kind == "bool":
-		return [1, [PRIMITIVE_TEXT, "true" if value else "false"]], set()
+		return [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_TEXT, "true" if value else "false"]], set()
 	return None, set()
 
 
@@ -9997,7 +9997,7 @@ def _demorgan_boolean_input(
 	if not (
 		isinstance(value, list)
 		and len(value) > 1
-		and value[0] in (2, INPUT_DIFF_BLOCK_SHADOW)
+		and value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
 
@@ -10025,7 +10025,7 @@ def _demorgan_boolean_input(
 		if not (
 			isinstance(raw, list)
 			and len(raw) > 1
-			and raw[0] in (2, INPUT_DIFF_BLOCK_SHADOW)
+			and raw[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 			and isinstance(raw[1], str)
 		):
 			return None
@@ -10089,8 +10089,8 @@ def _demorgan_boolean_input(
 		if root in (logic_id, left_not_id, right_not_id, owner_id):
 			return None
 
-	new_owner_input = [2, left_not_id]
-	new_outer_input = [2, logic_id]
+	new_owner_input = [INPUT_BLOCK_NO_SHADOW, left_not_id]
+	new_outer_input = [INPUT_BLOCK_NO_SHADOW, logic_id]
 
 	return {
 		"logic_id": logic_id,
@@ -10207,7 +10207,7 @@ def _simplify_double_boolean_negation(
 	if not (
 		isinstance(value, list)
 		and len(value) > 1
-		and value[0] in (2, INPUT_DIFF_BLOCK_SHADOW)
+		and value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
 	outer_id = value[1]
@@ -10220,7 +10220,7 @@ def _simplify_double_boolean_negation(
 	if not (
 		isinstance(inner_raw, list)
 		and len(inner_raw) > 1
-		and inner_raw[0] in (2, INPUT_DIFF_BLOCK_SHADOW)
+		and inner_raw[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
 	inner_id = inner_raw[1]
@@ -10253,7 +10253,7 @@ def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 	if not (
 		isinstance(value, list)
 		and len(value) > 1
-		and value[0] in (2, INPUT_DIFF_BLOCK_SHADOW)
+		and value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
 	block_id = value[1]
@@ -10297,11 +10297,11 @@ def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 		if left_num == 1 and _value_is_definitely_numeric(right_raw, blocks):
 			preserve, dead_side = right_raw, left
 		elif left_num == 0 and _value_is_definitely_finite_numeric(right_raw, blocks):
-			preserve, dead_side = [1, [PRIMITIVE_NUMBER, 0]], value
+			preserve, dead_side = [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_NUMBER, 0]], value
 		elif right_num == 1 and _value_is_definitely_numeric(left_raw, blocks):
 			preserve, dead_side = left_raw, right
 		elif right_num == 0 and _value_is_definitely_finite_numeric(left_raw, blocks):
-			preserve, dead_side = [1, [PRIMITIVE_NUMBER, 0]], value
+			preserve, dead_side = [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_NUMBER, 0]], value
 	elif op == "operator_divide":
 		if right_num == 1 and _value_is_definitely_numeric(left_raw, blocks):
 			preserve, dead_side = left_raw, right
@@ -10311,7 +10311,7 @@ def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 			and _value_is_definitely_numeric(left_raw, blocks)
 			and left_num is not None
 		):
-			preserve, dead_side = [1, [PRIMITIVE_NUMBER, left_num % right_num]], right
+			preserve, dead_side = [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_NUMBER, left_num % right_num]], right
 
 	if preserve is None:
 		return None
@@ -10340,7 +10340,7 @@ def _replace_owner_block_ref(parent_block, old_id, new_id):
 		if not isinstance(value, list) or not value:
 			continue
 		if (
-			value[0] in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+			value[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 			and len(value) > 1
 			and value[1] == old_id
 		):
@@ -10353,7 +10353,7 @@ def _control_substack(value, blocks):
 	if not isinstance(value, list) or not value:
 		return None
 	tag = _input_tag(value[0])
-	if tag not in (1, 2, INPUT_DIFF_BLOCK_SHADOW) or len(value) <= 1:
+	if tag not in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW) or len(value) <= 1:
 		return None
 	ref = value[1]
 	return ref if isinstance(ref, str) and ref in blocks else None
@@ -10404,7 +10404,7 @@ def _control_owner_edge(blocks, control_id):
 		if (
 			isinstance(value, list)
 			and len(value) > 1
-			and value[0] in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+			and value[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 			and value[1] == control_id
 		):
 			return parent_id, "input", name
@@ -10427,7 +10427,7 @@ def _control_input_replacement(owner, edge_kind, edge_name, old_id, new_id):
 	if (
 		not isinstance(value, list)
 		or len(value) <= 1
-		or value[0] not in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+		or value[0] not in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 		or value[1] != old_id
 	):
 		return None
@@ -10768,7 +10768,7 @@ def _script_input_root(value, blocks):
 	if (
 		not isinstance(value, list)
 		or len(value) <= 1
-		or value[0] not in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+		or value[0] not in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
 	ref = value[1]
@@ -10846,7 +10846,7 @@ def _script_literal_from_input(value):
 	if not (
 		isinstance(value, list)
 		and len(value) == 2
-		and _scratch_numeric_tag(value[0]) == 1
+		and _scratch_numeric_tag(value[0]) == INPUT_SAME_BLOCK_SHADOW
 	):
 		return None
 	literal = value[1]
@@ -11250,7 +11250,7 @@ def _branch_factor_set_substack(inputs, name, root):
 	if (
 		not isinstance(value, list)
 		or len(value) < 2
-		or value[0] not in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+		or value[0] not in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
 	new = copy.deepcopy(value)
@@ -11625,7 +11625,7 @@ def simplify_script_structures(project, stats, opts):
 						inputs["CONDITION"] = copy.deepcopy(
 							plan["condition"]
 							if plan["mode"] == "unwrap"
-							else [2, plan["new_id"]]
+							else [INPUT_BLOCK_NO_SHADOW, plan["new_id"]]
 						)
 						inputs["SUBSTACK"] = plan["else_raw"]
 						inputs.pop("SUBSTACK2", None)
@@ -11711,10 +11711,10 @@ def simplify_script_structures(project, stats, opts):
 										(ti, ref, "parent")
 									] = new_id
 						blocks[new_id] = plan["new_block"]
-						outer.setdefault("inputs", {})["CONDITION"] = [2, new_id]
+						outer.setdefault("inputs", {})["CONDITION"] = [INPUT_BLOCK_NO_SHADOW, new_id]
 						outer["inputs"]["SUBSTACK"] = plan["body_raw"]
 						opts.script_rewrite_input_edits[(ti, bid, "CONDITION")] = [
-							2,
+							INPUT_BLOCK_NO_SHADOW,
 							new_id,
 						]
 						opts.script_rewrite_input_edits[(ti, bid, "SUBSTACK")] = (
@@ -11891,12 +11891,12 @@ def _replace_known_reads(
 		if not allow_literal:
 			return value, False, set()
 		entry = env[value[2]]
-		return [1, copy.deepcopy(entry)], True, set()
+		return [INPUT_SAME_BLOCK_SHADOW, copy.deepcopy(entry)], True, set()
 
 	tag = _scratch_numeric_tag(value[0])
 
 	if (
-		tag in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+		tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 		and len(value) > 1
 		and isinstance(value[1], str)
 	):
@@ -11910,7 +11910,7 @@ def _replace_known_reads(
 					value, blocks, owner_id, graph.incoming, graph=graph
 				)
 				if owned == {ref}:
-					return [1, copy.deepcopy(env[vid])], True, {ref}
+					return [INPUT_SAME_BLOCK_SHADOW, copy.deepcopy(env[vid])], True, {ref}
 
 		if (
 			isinstance(child, dict)
@@ -12643,7 +12643,7 @@ def fold_constant_expressions(project, stats, opts):
 			if (
 				isinstance(input_val, list)
 				and len(input_val) > 1
-				and input_val[0] in (2, INPUT_DIFF_BLOCK_SHADOW)
+				and input_val[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 				and isinstance(input_val[1], str)
 				and isinstance(blocks.get(input_val[1]), dict)
 				and str(blocks[input_val[1]].get("opcode", "")).startswith("operator_")
@@ -12668,10 +12668,10 @@ def fold_constant_expressions(project, stats, opts):
 				if not (
 					isinstance(input_val, list)
 					and len(input_val) > 1
-					and input_val[0] in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+					and input_val[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 				):
 					continue
-				if input_val[0] in (2, INPUT_DIFF_BLOCK_SHADOW):
+				if input_val[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
 					root_id = input_val[1]
 					root = blocks.get(root_id) if isinstance(root_id, str) else None
 					if not isinstance(root, dict) or not str(
@@ -14073,7 +14073,7 @@ def _restore_block_data_broadcast_ids(project, opts):
 			):
 				value[2] = broadcast_rev.get(value[2], value[2])
 				return
-			if value and value[0] in (1, 2, INPUT_DIFF_BLOCK_SHADOW):
+			if value and value[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
 				positions = (1, 2) if value[0] == INPUT_DIFF_BLOCK_SHADOW else (1,)
 				for index in positions:
 					if index >= len(value):
@@ -14393,7 +14393,7 @@ def _input_has_dangling_block_ref(value, blocks):
 	if not isinstance(value, list) or not value:
 		return False
 	tag = value[0]
-	if tag in (1, 2):
+	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 		if len(value) > 1 and isinstance(value[1], str):
 			return value[1] not in blocks
 		if len(value) > 1 and isinstance(value[1], (list, dict)):
@@ -14498,8 +14498,8 @@ def _check_inputs_match(
 		and isinstance(mi, list)
 		and len(oi) == len(mi) == 2
 		and oi[1] == mi[1]
-		and _input_tag(oi[0]) in (1, 2)
-		and _input_tag(mi[0]) in (1, 2)
+		and _input_tag(oi[0]) in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW)
+		and _input_tag(mi[0]) in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW)
 	):
 		return True
 	if not (isinstance(oi, list) and isinstance(mi, list) and len(oi) == len(mi)):
@@ -14512,7 +14512,7 @@ def _check_inputs_match(
 		return oi[1] == mi[1] or bool(
 			getattr(opts, "strip_reference_names", False) and mi[1] == ""
 		)
-	if oi[0] in (1, 2):
+	if oi[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 		if len(oi) > 1 and len(mi) > 1:
 			if (
 				isinstance(oi[1], list)
@@ -14907,12 +14907,12 @@ def _check_blocks(
 					and len(oi) == len(mi) == 2
 					and oi[1] == mi[1]
 					and (
-						_input_tag(oi[0]) in (1, 2)
-						or (type(oi[0]) is str and oi[0] in ("1", "2"))
+						_input_tag(oi[0]) in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW)
+						or (type(oi[0]) is str and oi[0] in (str(INPUT_SAME_BLOCK_SHADOW), str(INPUT_BLOCK_NO_SHADOW)))
 					)
 					and (
-						_input_tag(mi[0]) in (1, 2)
-						or (type(mi[0]) is str and mi[0] in ("1", "2"))
+						_input_tag(mi[0]) in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW)
+						or (type(mi[0]) is str and mi[0] in (str(INPUT_SAME_BLOCK_SHADOW), str(INPUT_BLOCK_NO_SHADOW)))
 					)
 				):
 					continue
