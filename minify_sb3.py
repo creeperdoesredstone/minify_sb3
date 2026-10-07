@@ -14,12 +14,12 @@ import uuid
 import zipfile
 import zlib
 
-from collections import Counter, deque
+from collections import Counter, deque, defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from itertools import permutations, product
-from types import SimpleNamespace
+from types import SimpleNamespace, NoneType
 from typing import Any, NoReturn
 
 
@@ -1079,99 +1079,130 @@ def _restore_procedure_symbols(original, result, *, copy_result=True, opts=None)
 	):
 		if _procedure_symbol_info(left) is None:
 			continue
-		forward, reverse = [{}, {}, {}], [{}, {}, {}]
 
-		def pair(index, old, new):
-			if (
-				type(old) is not str
-				or type(new) is not str
-				or new in _RESERVED_PROCEDURE_SYMBOLS
-			):
-				raise ValueError("invalid procedure symbol")
-			if (old in forward[index] and forward[index][old] != new) or (
-				new in reverse[index] and reverse[index][new] != old
-			):
-				raise ValueError("procedure symbol correspondence is not bijective")
-			if (
-				index == 2
-				and (
-					old.lower() in _SPECIAL_ARGUMENT_NAMES
-					or new.lower() in _SPECIAL_ARGUMENT_NAMES
-				)
-				and new != old
-			):
-				raise ValueError("special argument reporter name changed")
-			forward[index][old], reverse[index][new] = new, old
-
-		pairs = []
-		for bid, block in (left.get("blocks") or {}).items():
-			if not isinstance(block, dict):
-				continue
-			other = (right.get("blocks") or {}).get(bid)
-			if not isinstance(other, dict):
-				continue
-			op = block.get("opcode")
-			if op in ("procedures_prototype", "procedures_call"):
-				a, b = block["mutation"], other.get("mutation", {})
-				expected = mut_edits.get((ti, bid))
-				if isinstance(expected, dict):
-					a = dict(expected)
-				if (ti, bid) in spec_calls:
-					a = dict(a)
-					a["proccode"] = spec_calls[(ti, bid)]
-				if arg_renames or proc_forward:
-					a = dict(a)
-					current_code = proc_forward.get((ti, a["proccode"]), a["proccode"])
-					if arg_renames and isinstance(a.get("argumentids"), str):
-						a["argumentids"] = json.dumps(
-							renamed_ids(ti, current_code, json.loads(a["argumentids"])),
-							separators=(",", ":"),
-							ensure_ascii=False,
-						)
-					a["proccode"] = current_code
-				pair(0, a["proccode"], b.get("proccode"))
-				if re.findall(r"%[snb]", a["proccode"]) != re.findall(
-					r"%[snb]", b["proccode"]
+		# Build and apply the correspondence one target at a time.  A later
+		# transformed target can legitimately have no bijective procedure-symbol
+		# correspondence (for example after procedure merging), and that must
+		# not prevent earlier independent targets from being restored.  Nothing
+		# in a target is mutated until the correspondence pass below succeeds.
+		try:
+			forward, reverse = [{}, {}, {}], [{}, {}, {}]
+	
+			def pair(index, old, new):
+				if (
+					type(old) is not str
+					or type(new) is not str
+					or new in _RESERVED_PROCEDURE_SYMBOLS
 				):
-					raise ValueError("procedure placeholder types changed")
-				for key, index in (("argumentids", 1), ("argumentnames", 2)):
-					if key not in a:
-						continue
-					x, y = json.loads(a[key]), json.loads(b.get(key))
-					if not isinstance(y, list) or len(x) != len(y):
-						raise ValueError("procedure argument count changed")
-					for old, new in zip(x, y):
-						pair(index, old, new)
-				pairs.append((block, other, a, bid))
-			elif op in ("argument_reporter_string_number", "argument_reporter_boolean"):
-				pair(2, block["fields"]["VALUE"][0], other["fields"]["VALUE"][0])
-		for block, other, a, bid in pairs:
-			b = other["mutation"]
-			b["proccode"] = reverse[0][b["proccode"]]
-			for key in ("argumentids", "argumentnames"):
-				if key in a:
-					b[key] = a[key]
-			if "inputs" in other:
-				removed = removed_in.get((ti, bid)) or ()
-				expected_inputs = [
-					arg_renames.get((ti, a["proccode"], key), key)
-					for key in block.get("inputs", {})
-					if key not in removed
-				]
-				if list(other["inputs"]) != [
-					forward[1][key] for key in expected_inputs
-				]:
-					raise ValueError("procedure input keys or evaluation order changed")
-				other["inputs"] = {
-					reverse[1][key]: value for key, value in other["inputs"].items()
-				}
-		for block in (right.get("blocks") or {}).values():
-			if isinstance(block, dict) and block.get("opcode") in (
-				"argument_reporter_string_number",
-				"argument_reporter_boolean",
-			):
-				value = block["fields"]["VALUE"]
-				value[0] = reverse[2].get(value[0], value[0])
+					raise ValueError("invalid procedure symbol")
+				if (old in forward[index] and forward[index][old] != new) or (
+					new in reverse[index] and reverse[index][new] != old
+				):
+					raise ValueError("procedure symbol correspondence is not bijective")
+				if (
+					index == 2
+					and (
+						old.lower() in _SPECIAL_ARGUMENT_NAMES
+						or new.lower() in _SPECIAL_ARGUMENT_NAMES
+					)
+					and new != old
+				):
+					raise ValueError("special argument reporter name changed")
+				forward[index][old], reverse[index][new] = new, old
+	
+			pairs = []
+			for bid, block in (left.get("blocks") or {}).items():
+				if not isinstance(block, dict):
+					continue
+				other = (right.get("blocks") or {}).get(bid)
+				if not isinstance(other, dict):
+					continue
+				op = block.get("opcode")
+				if op in ("procedures_prototype", "procedures_call"):
+					a, b = block["mutation"], other.get("mutation", {})
+					expected = mut_edits.get((ti, bid))
+					if isinstance(expected, dict):
+						a = dict(expected)
+					if (ti, bid) in spec_calls:
+						a = dict(a)
+						a["proccode"] = spec_calls[(ti, bid)]
+					arg_proc = a.get("proccode")
+					compare = a
+					if arg_renames or proc_forward:
+						compare = dict(a)
+						current_code = proc_forward.get((ti, arg_proc), arg_proc)
+						if arg_renames and isinstance(compare.get("argumentids"), str):
+							compare["argumentids"] = json.dumps(
+								renamed_ids(ti, arg_proc, json.loads(compare["argumentids"])),
+								separators=(",", ":"),
+								ensure_ascii=False,
+							)
+						compare["proccode"] = current_code
+					pair(0, compare["proccode"], b.get("proccode"))
+					if re.findall(r"%[snb]", compare["proccode"]) != re.findall(
+						r"%[snb]", b["proccode"]
+					):
+						raise ValueError("procedure placeholder types changed")
+					arg_id_forward = {}
+					arg_id_restore = {}
+					for key, index in (("argumentids", 1), ("argumentnames", 2)):
+						if key not in compare:
+							continue
+						x, y = json.loads(compare[key]), json.loads(b.get(key))
+						if not isinstance(y, list) or len(x) != len(y):
+							raise ValueError("procedure argument count changed")
+						if index == 1:
+							# Argument IDs are local to a procedure.  Track their
+							# correspondence per procedure instead of using the global
+							# symbol bijection used for argument names.
+							if any(type(old) is not str or type(new) is not str for old, new in zip(x, y)):
+								raise ValueError("invalid procedure argument ID")
+							arg_id_forward = dict(zip(x, y))
+							original_ids = json.loads(a["argumentids"])
+							arg_id_restore = dict(zip(y, original_ids))
+						else:
+							for old, new in zip(x, y):
+								pair(index, old, new)
+					pairs.append((block, other, a, bid, arg_proc, arg_id_forward, arg_id_restore))
+				elif op in ("argument_reporter_string_number", "argument_reporter_boolean"):
+					pair(2, block["fields"]["VALUE"][0], other["fields"]["VALUE"][0])
+			for block, other, a, bid, arg_proc, arg_id_forward, arg_id_restore in pairs:
+				b = other["mutation"]
+				b["proccode"] = reverse[0][b["proccode"]]
+				for key in ("argumentids", "argumentnames"):
+					if key in a:
+						b[key] = a[key]
+				if "inputs" in other:
+					removed = removed_in.get((ti, bid)) or ()
+					expected_inputs = [
+						key
+						for key in block.get("inputs", {})
+						if key not in removed
+					]
+					expected_result_inputs = [
+						arg_id_forward.get(
+							arg_renames.get((ti, arg_proc, key), key),
+							arg_id_forward.get(key, key),
+						)
+						for key in expected_inputs
+					]
+					if list(other["inputs"]) != expected_result_inputs:
+						raise ValueError("procedure input keys or evaluation order changed")
+					reverse_input_ids = arg_id_restore
+					other["inputs"] = {
+						reverse_input_ids.get(key, key): value
+						for key, value in other["inputs"].items()
+					}
+			for block in (right.get("blocks") or {}).values():
+				if isinstance(block, dict) and block.get("opcode") in (
+					"argument_reporter_string_number",
+					"argument_reporter_boolean",
+				):
+					value = block["fields"]["VALUE"]
+					value[0] = reverse[2].get(value[0], value[0])
+		except (ValueError, KeyError, TypeError, IndexError):
+			continue
+
 	return result
 
 
@@ -5713,7 +5744,7 @@ def _is_known_orphan_argument_reporter(block, blocks):
 	return (
 		block.get("opcode", "").startswith("argument_reporter_")
 		and block.get("shadow") is True
-		and isinstance(block.get("parent"), (type(None), str))
+		and isinstance(block.get("parent"), (NoneType, str))
 		and (block.get("parent") is None or block.get("parent") not in blocks)
 	)
 
@@ -5902,7 +5933,7 @@ def _sequence_input_refs(value, blocks):
 			yield ref
 
 
-def _sequence_inline_parameterizable(item):
+def _sequence_inline_parameterizable(item) -> bool:
 	if item is None:
 		return True
 	if not isinstance(item, list):
@@ -5914,11 +5945,11 @@ def _sequence_inline_parameterizable(item):
 		PRIMITIVE_VARIABLE,
 		PRIMITIVE_LIST,
 	):
-		return all(isinstance(x, (str, int, float, bool, type(None))) for x in item[1:])
+		return all(isinstance(x, (str, int, float, bool, NoneType)) for x in item[1:])
 	return False
 
 
-def _sequence_input_parameterizable(value, blocks):
+def _sequence_input_parameterizable(value, blocks) -> bool:
 	if not isinstance(value, list) or not value:
 		return False
 	refs = list(_sequence_input_refs(value, blocks))
@@ -5938,32 +5969,36 @@ def _sequence_input_parameterizable(value, blocks):
 	return False
 
 
-def _sequence_has_unsafe_nested_inputs(block, blocks):
+def _sequence_has_unsafe_nested_inputs(block, blocks) -> bool:
 	for value in (block.get("inputs") or {}).values():
 		for ref in _sequence_input_refs(value, blocks):
 			if not _sequence_reporter_block(blocks.get(ref)):
 				return True
 	return False
 
-
-def _sequence_block_signature(block, blocks):
+def _sequence_block_signature(
+	block: Any,
+	blocks: Any
+) -> (tuple[str, str, str | None, tuple] | None):
 	if not isinstance(block, dict):
 		return None
 	op = block.get("opcode")
 	if not isinstance(op, str) or not op:
 		return None
-	if op.startswith(("event_", "procedures_")):
+	if op.startswith(("event_", "procedures_", "argument_reporter_")):
 		return None
 	if op in {"control_stop", "control_delete_this_clone"}:
 		return None
 	if _sequence_has_unsafe_nested_inputs(block, blocks):
 		return None
+
 	fields = dumps_compact(block.get("fields") or {})
 	mutation = (
 		dumps_compact(block.get("mutation"))
 		if block.get("mutation") is not None
 		else None
 	)
+
 	inputs_sig = []
 	for name in sorted((block.get("inputs") or {}).keys()):
 		value = block["inputs"][name]
@@ -5976,7 +6011,7 @@ def _sequence_block_signature(block, blocks):
 	return (op, fields, mutation, tuple(inputs_sig))
 
 
-def _sequence_signature(sequence, blocks):
+def _sequence_signature(sequence, blocks) -> tuple | None:
 	parts = []
 	for bid in sequence:
 		sig = _sequence_block_signature(blocks.get(bid), blocks)
@@ -5986,7 +6021,7 @@ def _sequence_signature(sequence, blocks):
 	return tuple(parts)
 
 
-def _collect_linear_sequence_runs(blocks):
+def _collect_linear_sequence_runs(blocks) -> list[list[str]]:
 	incoming_next = set()
 	for block in blocks.values():
 		if isinstance(block, dict):
@@ -6057,16 +6092,18 @@ def _sequence_compare(base, other, blocks):
 
 
 def _sequence_collect_closure(sequence, blocks, graph=None):
-	if graph is None:
-		graph = _ScratchGraphIndex({"blocks": blocks})
 	closure = set(sequence)
 	stack = list(sequence)
 	while stack:
 		bid = stack.pop()
-		for ref in graph.edges.get(bid, ()):
-			if ref not in closure:
-				closure.add(ref)
-				stack.append(ref)
+		block = blocks.get(bid)
+		if not isinstance(block, dict):
+			continue
+		for value in (block.get("inputs") or {}).values():
+			for ref in _iter_input_block_refs(value):
+				if ref in blocks and ref not in closure:
+					closure.add(ref)
+					stack.append(ref)
 	return closure
 
 
@@ -6085,6 +6122,10 @@ def _sequence_has_external_owner(closure, sequence, blocks, comments, graph=None
 				continue
 			if child_id == root and owner_id == root_parent:
 				continue
+			if child_id == sequence[-1]:
+				last = blocks.get(child_id)
+				if isinstance(last, dict) and last.get("next") == owner_id:
+					continue
 			return True
 	for comment in comments.values():
 		if isinstance(comment, dict) and comment.get("blockId") in closure:
@@ -6239,6 +6280,505 @@ def _sequence_make_call_input(value, blocks, generated, parent_id):
 	return _sequence_clone_input(value, blocks, generated, parent_id)
 
 
+
+SEQUENCE_MAX_WINDOW = 256
+
+
+def _sequence_warp_context(blocks, block_id, cache=None):
+	if cache is None:
+		cache = {}
+	if block_id in cache:
+		return cache[block_id]
+
+	path = []
+	seen = set()
+	current = block_id
+	result = False
+	while isinstance(current, str) and current in blocks and current not in seen:
+		if current in cache:
+			result = cache[current]
+			break
+		seen.add(current)
+		path.append(current)
+		block = blocks.get(current)
+		if not isinstance(block, dict):
+			break
+		parent = block.get("parent")
+		if not isinstance(parent, str) or parent not in blocks:
+			break
+		parent_block = blocks[parent]
+		if not isinstance(parent_block, dict):
+			break
+		if parent_block.get("opcode") == "procedures_definition":
+			custom = (parent_block.get("inputs") or {}).get("custom_block")
+			if isinstance(custom, list) and len(custom) > 1:
+				prototype = blocks.get(custom[1])
+				if isinstance(prototype, dict):
+					result = _procedure_warp_enabled(
+						(prototype.get("mutation") or {}).get("warp")
+					)
+			break
+		current = parent
+
+	for item in path:
+		cache[item] = result
+	return result
+
+
+def _collect_similar_sequence_candidates(runs, blocks, threshold):
+	threshold = max(1, int(threshold))
+	segments = []
+
+	for run in runs:
+		if len(run) < threshold:
+			continue
+		ids = []
+		sigs = []
+		for bid in run:
+			block = blocks.get(bid)
+			if not isinstance(block, dict) or "comment" in block:
+				if len(ids) >= threshold:
+					segments.append((ids, sigs))
+				ids, sigs = [], []
+				continue
+			sig = _sequence_block_signature(block, blocks)
+			if sig is None:
+				if len(ids) >= threshold:
+					segments.append((ids, sigs))
+				ids, sigs = [], []
+				continue
+			ids.append(bid)
+			sigs.append(sig)
+		if len(ids) >= threshold:
+			segments.append((ids, sigs))
+
+	anchors = {}
+	for ids, sigs in segments:
+		for pos in range(len(ids) - threshold + 1):
+			key = tuple(sigs[pos:pos + threshold])
+			anchors.setdefault(key, []).append((ids, sigs, pos))
+
+	candidates = {}
+
+	def add_candidate(group, length):
+		if len(group) < 2 or length < threshold:
+			return
+		selected = []
+		occupied = set()
+		for ids, _sigs, pos in group:
+			seq = tuple(ids[pos:pos + length])
+			if len(seq) != length:
+				continue
+			seq_set = set(seq)
+			if seq_set & occupied:
+				continue
+			selected.append(seq)
+			occupied.update(seq_set)
+		if len(selected) < 2:
+			return
+		key = tuple(sorted(selected))
+		candidates[key] = [list(seq) for seq in selected]
+
+	for occurrences in anchors.values():
+		if len(occurrences) < 2:
+			continue
+
+		frontier = [(occurrences, threshold)]
+		while frontier:
+			group, length = frontier.pop()
+			if len(group) < 2:
+				continue
+
+			add_candidate(group, length)
+
+			if length >= SEQUENCE_MAX_WINDOW:
+				continue
+
+			next_groups = {}
+			for ids, sigs, pos in group:
+				next_index = pos + length
+				if next_index < len(ids):
+					next_groups.setdefault(sigs[next_index], []).append(
+						(ids, sigs, pos)
+					)
+
+			for subgroup in next_groups.values():
+				if len(subgroup) >= 2:
+					frontier.append((subgroup, length + 1))
+
+	return [
+		group
+		for _key, group in sorted(
+			candidates.items(),
+			key=lambda item: (
+				-(len(item[1][0]) * len(item[1])),
+				-len(item[1][0]),
+				-len(item[1]),
+			),
+		)
+	]
+
+
+def _sequence_prepare_candidate(sequences, blocks, comments, graph, threshold):
+	if len(sequences) < 2 or any(len(seq) < threshold for seq in sequences):
+		return None
+	if any(not isinstance(bid, str) or bid not in blocks for seq in sequences for bid in seq):
+		return None
+
+	base = sequences[0]
+	if any(_sequence_compare(base, seq, blocks) is None for seq in sequences[1:]):
+		return None
+
+	closures = {}
+	for seq in sequences:
+		closure = _sequence_collect_closure(seq, blocks, graph=graph)
+		closures[tuple(seq)] = closure
+		if not closure or _sequence_has_external_owner(
+			closure, seq, blocks, comments, graph=graph
+		):
+			return None
+
+	closure_values = list(closures.values())
+	if any(
+		closure_values[i] & closure_values[j]
+		for i in range(len(closure_values))
+		for j in range(i + 1, len(closure_values))
+	):
+		return None
+
+	param_slots = []
+	for index, block_id in enumerate(base):
+		base_block = blocks.get(block_id)
+		if not isinstance(base_block, dict):
+			return None
+		for input_name, base_value in (base_block.get("inputs") or {}).items():
+			values = [
+				(blocks[seq[index]].get("inputs") or {}).get(input_name)
+				for seq in sequences
+			]
+			if len({dumps_compact(v) for v in values}) <= 1:
+				continue
+			if _is_boolean_slot(base_block, input_name) or not all(
+				_sequence_input_parameterizable(v, blocks) for v in values
+			):
+				return None
+			param_slots.append((index, input_name, values))
+
+	param_vectors = {}
+	for _index, _input_name, values in param_slots:
+		vector = tuple(dumps_compact(v) for v in values)
+		param_vectors.setdefault(vector, len(param_vectors))
+	parameter_count = len(param_vectors)
+	if parameter_count > SEQUENCE_MAX_PARAMETERS:
+		return None
+
+	return base, closures, param_slots, parameter_count
+
+def _sequence_estimate_group_savings(
+	sequences, closures, param_slots, parameter_count, blocks, graph
+):
+	if len(sequences) < 2 or not sequences:
+		return None
+
+	base = sequences[0]
+	base_closure = closures.get(tuple(base))
+	if not base_closure:
+		return None
+
+	fake_id = "0"
+	fake_def = "1"
+	fake_proto = "2"
+	fake_arg_ids = [str(3 + i) for i in range(parameter_count)]
+	fake_proc = "group0" + (" " + " ".join("%s" for _ in range(parameter_count)) if parameter_count else "")
+
+	seq_index = {bid: i for i, bid in enumerate(base)}
+	body_fake_ids = {bid: _short_id(20 + i) for i, bid in enumerate(base_closure)}
+	for i, bid in enumerate(base):
+		body_fake_ids[bid] = f"{20 + i:020d}"
+	body_reporter_ids = [_short_id(128 + i) for i in range(parameter_count)]
+	proto_reporter_ids = [_short_id(160 + i) for i in range(parameter_count)]
+
+	def entry_cost(bid, block):
+		return len(_quote(bid).encode("utf-8", "backslashreplace")) + 1 + _json_len(block)
+
+	removed_cost = 0
+	removed_count = 0
+	for closure in closures.values():
+		for bid in closure:
+			block = blocks.get(bid)
+			if isinstance(block, dict):
+				removed_cost += entry_cost(bid, block)
+				removed_count += 1
+
+	def normalized_input(value):
+		value = copy.deepcopy(value)
+		if not isinstance(value, list) or not value:
+			return value
+		tag = value[0]
+		positions = (1, 2) if tag == INPUT_DIFF_BLOCK_SHADOW else (1,)
+		if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
+			for i in positions:
+				if len(value) <= i:
+					continue
+				item = value[i]
+				if isinstance(item, str) and item in body_fake_ids:
+					value[i] = body_fake_ids[item]
+				elif isinstance(item, list):
+					value[i] = normalized_input(item)
+				elif isinstance(item, dict):
+					value[i] = copy.deepcopy(item)
+			return value
+		for i in range(1, len(value)):
+			if isinstance(value[i], list):
+				value[i] = normalized_input(value[i])
+		return value
+
+	generated = {}
+	param_vectors = {}
+	parameter_slot_map = {}
+	for index, input_name, values in param_slots:
+		vector = tuple(dumps_compact(v) for v in values)
+		if vector not in param_vectors:
+			param_vectors[vector] = len(param_vectors)
+		parameter_slot_map[(index, input_name)] = param_vectors[vector]
+	param_values_by_slot = {}
+	for index, input_name, values in param_slots:
+		slot = parameter_slot_map[(index, input_name)]
+		param_values_by_slot.setdefault(slot, values)
+
+	for old_id in base_closure:
+		block = blocks.get(old_id)
+		if not isinstance(block, dict):
+			continue
+		probe = copy.deepcopy(block)
+		probe.pop("topLevel", None)
+		probe.pop("x", None)
+		probe.pop("y", None)
+
+		if old_id in seq_index:
+			idx = seq_index[old_id]
+			probe["parent"] = fake_def if idx == 0 else body_fake_ids.get(base[idx - 1])
+			original_next = block.get("next")
+			probe["next"] = body_fake_ids.get(original_next)
+		else:
+			original_parent = block.get("parent")
+			probe["parent"] = body_fake_ids.get(original_parent, fake_id)
+			original_next = block.get("next")
+			probe["next"] = body_fake_ids.get(original_next)
+
+		new_inputs = {}
+		for input_name, value in (block.get("inputs") or {}).items():
+			idx = seq_index.get(old_id)
+			slot = parameter_slot_map.get((idx, input_name))
+			if slot is None:
+				new_inputs[input_name] = normalized_input(value)
+				continue
+			reporter_id = body_reporter_ids[slot]
+			if isinstance(value, list) and value and value[0] == INPUT_DIFF_BLOCK_SHADOW and len(value) > 2:
+				shadow = copy.deepcopy(value[2])
+				if isinstance(shadow, str) and shadow in body_fake_ids:
+					shadow = body_fake_ids[shadow]
+				elif isinstance(shadow, list):
+					shadow = normalized_input(shadow)
+				new_inputs[input_name] = [INPUT_DIFF_BLOCK_SHADOW, reporter_id, shadow]
+			else:
+				new_inputs[input_name] = [INPUT_BLOCK_NO_SHADOW, reporter_id]
+		probe["inputs"] = new_inputs
+		generated[old_id] = probe
+
+	argument_names = [f"p{i}" for i in range(parameter_count)]
+	argument_defaults = []
+	for slot in range(parameter_count):
+		values = param_values_by_slot[slot]
+		argument_defaults.append(_sequence_default_value(values[0], blocks))
+	prototype = {
+		"opcode": "procedures_prototype",
+		"next": None,
+		"parent": fake_def,
+		"inputs": {},
+		"fields": {},
+		"shadow": False,
+		"mutation": {
+			"tagName": "mutation",
+			"children": [],
+			"proccode": fake_proc,
+			"argumentids": json.dumps(fake_arg_ids, separators=(",", ":")),
+			"argumentnames": json.dumps(argument_names, separators=(",", ":")),
+			"argumentdefaults": json.dumps(argument_defaults, separators=(",", ":")),
+			"warp": False,
+		},
+	}
+	definition = {
+		"opcode": "procedures_definition",
+		"next": fake_id,
+		"parent": None,
+		"inputs": {"custom_block": [INPUT_SAME_BLOCK_SHADOW, fake_proto]},
+		"fields": {},
+		"topLevel": True,
+		"x": 5,
+		"y": 5,
+	}
+	generated_cost = entry_cost(fake_proto, prototype) + entry_cost(fake_def, definition)
+	for key, probe in generated.items():
+		generated_cost += entry_cost(body_fake_ids[key], probe)
+
+	fake_counter = 300
+
+	def fresh_fake_id():
+		nonlocal fake_counter
+		value = _short_id(fake_counter)
+		fake_counter += 1
+		return value
+
+	def normalize_call_input(value, parent_id):
+		memo = {}
+		cloned_entries = []
+
+		def clone_block(old_id, parent):
+			if old_id in memo:
+				new_id = memo[old_id]
+				for index, (existing_id, block) in enumerate(cloned_entries):
+					if existing_id == new_id:
+						block["parent"] = parent
+						cloned_entries[index] = (existing_id, block)
+						break
+				return new_id
+			old = blocks.get(old_id)
+			if not isinstance(old, dict) or old.get("next") is not None:
+				raise ValueError
+			new_id = fresh_fake_id()
+			memo[old_id] = new_id
+			new = copy.deepcopy(old)
+			new["parent"] = parent
+			new.pop("topLevel", None)
+			new.pop("x", None)
+			new.pop("y", None)
+			new["next"] = None
+			cloned_entries.append((new_id, new))
+			for name, child in list((new.get("inputs") or {}).items()):
+				new["inputs"][name] = clone_value(child, new_id)
+			return new_id
+
+		def clone_value(item, parent):
+			out = copy.deepcopy(item)
+			if not isinstance(out, list) or not out:
+				return out
+			tag = out[0]
+			if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW) and len(out) > 1:
+				if isinstance(out[1], str) and out[1] in blocks:
+					out[1] = clone_block(out[1], parent)
+				elif isinstance(out[1], list):
+					out[1] = clone_value(out[1], parent)
+			elif tag == INPUT_DIFF_BLOCK_SHADOW:
+				for index in (1, 2):
+					if len(out) <= index:
+						continue
+					item2 = out[index]
+					if isinstance(item2, str) and item2 in blocks:
+						out[index] = clone_block(item2, parent)
+					elif isinstance(item2, list):
+						out[index] = clone_value(item2, parent)
+			return out
+
+		return clone_value(value, parent_id), cloned_entries
+
+	root_set = {seq[0] for seq in sequences}
+	for seq_index_in_group, seq in enumerate(sequences):
+		root = seq[0]
+		root_block = blocks.get(root)
+		if not isinstance(root_block, dict):
+			return None
+		continuation = blocks.get(seq[-1], {}).get("next") if isinstance(blocks.get(seq[-1]), dict) else None
+		internal_continuation = continuation if continuation in root_set else None
+		call = {
+			"opcode": "procedures_call",
+			"next": fake_id if internal_continuation is not None else continuation,
+			"parent": root_block.get("parent"),
+			"inputs": {},
+			"fields": {},
+			"mutation": {
+				"tagName": "mutation",
+				"children": [],
+				"proccode": fake_proc,
+				"argumentids": json.dumps(fake_arg_ids, separators=(",", ":")),
+				"warp": False,
+			},
+		}
+		internal_parent = None
+		for previous_seq in sequences:
+			if previous_seq is not seq and previous_seq[-1] == root:
+				internal_parent = fake_id
+				break
+		if internal_parent is not None:
+			call["parent"] = internal_parent
+		if root_block.get("topLevel") is True or root_block.get("parent") is None:
+			call["topLevel"] = True
+			call["x"] = root_block.get("x", 5)
+			call["y"] = root_block.get("y", 5)
+		for _index, _input_name, values in param_slots:
+			slot = parameter_slot_map[(_index, _input_name)]
+			value = values[seq_index_in_group]
+			try:
+				normalized_value, cloned_entries = normalize_call_input(value, fake_id)
+			except ValueError:
+				return None
+			call["inputs"][fake_arg_ids[slot]] = normalized_value
+			for cloned_id, cloned_block in cloned_entries:
+				generated_cost += entry_cost(cloned_id, cloned_block)
+		generated_cost += entry_cost(fake_id, call)
+
+	for seq in sequences:
+		root = seq[0]
+		root_block = blocks.get(root)
+		if not isinstance(root_block, dict):
+			return None
+		parent_id = root_block.get("parent")
+		internal_parent = any(
+			other is not seq and other[-1] == root for other in sequences
+		)
+		if isinstance(parent_id, str) and parent_id in blocks and not internal_parent:
+			parent_block = blocks.get(parent_id)
+			if isinstance(parent_block, dict):
+				preview = copy.deepcopy(parent_block)
+				if preview.get("next") == root:
+					preview["next"] = fake_id
+				else:
+					changed = False
+					for name, value in (preview.get("inputs") or {}).items():
+						new_value = _sequence_replace_direct_ref(value, root, fake_id)
+						if new_value is not None:
+							preview["inputs"][name] = new_value
+							changed = True
+							break
+					if not changed:
+							continue
+				generated_cost += _json_len(preview) - _json_len(parent_block)
+
+		continuation_id = blocks.get(seq[-1], {}).get("next") if isinstance(blocks.get(seq[-1]), dict) else None
+		if isinstance(continuation_id, str) and continuation_id in blocks and continuation_id not in root_set:
+			continuation_block = blocks.get(continuation_id)
+			if isinstance(continuation_block, dict):
+				preview = copy.deepcopy(continuation_block)
+				preview["parent"] = fake_id
+				generated_cost += _json_len(preview) - _json_len(continuation_block)
+
+	generated_cost += len(sequences) - removed_count
+	return removed_cost - generated_cost
+
+
+
+def _sequence_projected_json_size(target, *, rename_block_ids=False, rename_argument_ids=False):
+	projected = copy.deepcopy(target)
+	dummy_stats = defaultdict(int)
+	if rename_argument_ids:
+		rename_argument_ids_fn = globals()["rename_argument_ids"]
+		rename_argument_ids_fn(projected, dummy_stats)
+	if rename_block_ids:
+		rename_block_ids_fn = globals()["rename_block_ids"]
+		rename_block_ids_fn(projected, dummy_stats)
+	return _json_len(projected)
+
+
 def group_similar_sequences(project, stats, threshold=3, opts=None):
 	threshold = max(1, int(threshold))
 	for ti, target in enumerate(project.get("targets", [])):
@@ -6246,21 +6786,36 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 		comments = target.get("comments") or {}
 		graph = _ScratchGraphIndex(target)
 		runs = _collect_linear_sequence_runs(blocks)
-		buckets = {}
-		for sequence in runs:
-			if len(sequence) < threshold:
-				continue
-			if any(
-				not isinstance(blocks.get(bid), dict) or "comment" in blocks[bid]
-				for bid in sequence
-			):
-				continue
-			sig = _sequence_signature(sequence, blocks)
-			if sig is not None:
-				buckets.setdefault(sig, []).append(sequence)
-
-		if not buckets:
+		candidate_groups = _collect_similar_sequence_candidates(
+			runs, blocks, threshold
+		)
+		if not candidate_groups:
 			continue
+
+		scored_candidates = []
+		for sequences in candidate_groups:
+			prepared = _sequence_prepare_candidate(
+				sequences, blocks, comments, graph, threshold
+			)
+			if prepared is None:
+				continue
+			base, closures, param_slots, parameter_count = prepared
+			estimated_savings = _sequence_estimate_group_savings(
+				sequences,
+				closures,
+				param_slots,
+				parameter_count,
+				blocks,
+				graph,
+			)
+			if estimated_savings is None or estimated_savings <= 0:
+				if opts is not None:
+					opts.grouped_sequence_rejected_size += 1
+				stats["sequence_groups_rejected_size"] += 1
+				continue
+			scored_candidates.append((estimated_savings, sequences))
+
+		scored_candidates.sort(key=lambda item: -item[0])
 
 		proc_counter = 0
 		existing_procs = {
@@ -6271,61 +6826,20 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			and isinstance(_procedure_key(block), str)
 		}
 
-		for sequences in sorted(
-			buckets.values(), key=lambda group: (-len(group), -len(group[0]))
-		):
+		for _estimated_savings, candidate_sequences in scored_candidates:
 			sequences = [
 				seq
-				for seq in sequences
+				for seq in candidate_sequences
 				if all(bid in blocks for bid in seq) and len(seq) >= threshold
 			]
 			if len(sequences) < 2:
 				continue
-			base = sequences[0]
-			if any(
-				_sequence_compare(base, seq, blocks) is None for seq in sequences[1:]
-			):
+			prepared = _sequence_prepare_candidate(
+				sequences, blocks, comments, graph, threshold
+			)
+			if prepared is None:
 				continue
-
-			closures = {
-				tuple(seq): _sequence_collect_closure(seq, blocks, graph=graph)
-				for seq in sequences
-			}
-			if any(
-				_sequence_has_external_owner(
-					closure, seq, blocks, comments, graph=graph
-				)
-				for seq, closure in ((seq, closures[tuple(seq)]) for seq in sequences)
-			):
-				continue
-			all_closure_ids = list(closures.values())
-			if any(
-				all_closure_ids[i] & all_closure_ids[j]
-				for i in range(len(all_closure_ids))
-				for j in range(i + 1, len(all_closure_ids))
-			):
-				continue
-
-			param_slots = []
-			for index, block_id in enumerate(base):
-				base_block = blocks[block_id]
-				for input_name, base_value in (base_block.get("inputs") or {}).items():
-					values = [
-						(blocks[seq[index]].get("inputs") or {}).get(input_name)
-						for seq in sequences
-					]
-					if len({dumps_compact(v) for v in values}) <= 1:
-						continue
-					if _is_boolean_slot(base_block, input_name) or not all(
-						_sequence_input_parameterizable(v, blocks) for v in values
-					):
-						param_slots = None
-						break
-					param_slots.append((index, input_name, values))
-				if param_slots is None:
-					break
-			if param_slots is None:
-				continue
+			base, closures, param_slots, parameter_count = prepared
 
 			param_vectors = {}
 			param_for_slot = {}
@@ -6334,9 +6848,6 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				if vector not in param_vectors:
 					param_vectors[vector] = len(param_vectors)
 				param_for_slot[(index, input_name)] = param_vectors[vector]
-			parameter_count = len(param_vectors)
-			if parameter_count > SEQUENCE_MAX_PARAMETERS:
-				continue
 
 			proc_counter_start = proc_counter
 			while True:
@@ -6400,11 +6911,6 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 					"warp": False,
 				},
 			}
-			for arg_id, arg_name in zip(argument_ids, argument_names):
-				reporter_id = _sequence_make_argument_reporter(
-					generated, proto_id, arg_id, arg_name, shadow=True, blocks=blocks
-				)
-				generated[proto_id]["inputs"][arg_id] = [INPUT_SAME_BLOCK_SHADOW, reporter_id]
 
 			body_new_ids = []
 			body_map = {old_id: _sequence_new_id(blocks, generated) for old_id in base}
@@ -6418,9 +6924,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				old.pop("x", None)
 				old.pop("y", None)
 				new_inputs = {}
-				for input_name, original_value in (
-					old_original.get("inputs") or {}
-				).items():
+				for input_name, original_value in (old_original.get("inputs") or {}).items():
 					param_index = param_for_slot.get((idx, input_name))
 					if param_index is not None:
 						arg_reporter_id = _sequence_make_argument_reporter(
@@ -6442,10 +6946,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 								shadow_value = _sequence_clone_input(
 									[INPUT_SAME_BLOCK_SHADOW, shadow], blocks, generated, new_id
 								)
-								if (
-									isinstance(shadow_value, list)
-									and len(shadow_value) == 2
-								):
+								if isinstance(shadow_value, list) and len(shadow_value) == 2:
 									shadow = shadow_value[1]
 								else:
 									continue
@@ -6484,15 +6985,15 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			}
 
 			construction_ok = True
+			call_ids = {seq[0]: _sequence_new_id(blocks, generated) for seq in sequences}
+			root_to_sequence = {seq[0]: seq for seq in sequences}
 			for seq in sequences:
 				root = seq[0]
 				root_block = blocks[root]
-				call_id = _sequence_new_id(blocks, generated)
+				call_id = call_ids[root]
 				call_inputs = {}
 				for idx, old_id in enumerate(seq):
-					for input_name, value in (
-						blocks[old_id].get("inputs") or {}
-					).items():
+					for input_name, value in (blocks[old_id].get("inputs") or {}).items():
 						param_index = param_for_slot.get((idx, input_name))
 						if param_index is None:
 							continue
@@ -6508,10 +7009,27 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				if not construction_ok:
 					break
 
+				continuation_id = blocks[seq[-1]].get("next")
+				internal_continuation = (
+					call_ids.get(continuation_id)
+					if isinstance(continuation_id, str)
+					else None
+				)
+				call_next = (
+					internal_continuation
+					if internal_continuation is not None
+					else continuation_id if isinstance(continuation_id, str) else None
+				)
+				internal_parent = None
+				for previous_seq in sequences:
+					if previous_seq[-1] == root and previous_seq is not seq:
+						internal_parent = call_ids[previous_seq[0]]
+						break
+				call_parent = internal_parent if internal_parent is not None else root_block.get("parent")
 				call = {
 					"opcode": "procedures_call",
-					"next": None,
-					"parent": root_block.get("parent"),
+					"next": call_next,
+					"parent": call_parent,
 					"inputs": call_inputs,
 					"fields": {},
 					"mutation": {
@@ -6522,16 +7040,30 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 						"warp": False,
 					},
 				}
-				if (
-					root_block.get("topLevel") is True
-					or root_block.get("parent") is None
-				):
+				if root_block.get("topLevel") is True or root_block.get("parent") is None:
 					call["topLevel"] = True
 					call["x"] = root_block.get("x", 5)
 					call["y"] = root_block.get("y", 5)
 				generated[call_id] = call
 
-				parent_id = root_block.get("parent")
+				if (
+					isinstance(continuation_id, str)
+					and continuation_id in blocks
+					and internal_continuation is None
+				):
+					continuation = blocks.get(continuation_id)
+					if (
+						not isinstance(continuation, dict)
+						or continuation.get("parent") != seq[-1]
+						or graph.parents.get(continuation_id, set()) - {seq[-1]}
+					):
+						construction_ok = False
+						break
+					preview = copy.deepcopy(continuation)
+					preview["parent"] = call_id
+					owner_previews[continuation_id] = preview
+
+				parent_id = None if internal_parent is not None else root_block.get("parent")
 				if isinstance(parent_id, str) and parent_id in blocks:
 					parent_block = owner_previews.get(parent_id, blocks[parent_id])
 					if not isinstance(parent_block, dict):
@@ -6544,27 +7076,14 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 						link_changes.append((parent_id, preview, root, call_id))
 					else:
 						found = False
-						for input_name, input_value in (
-							parent_block.get("inputs") or {}
-						).items():
-							replaced = _sequence_replace_direct_ref(
-								input_value, root, call_id
-							)
+						for input_name, input_value in (parent_block.get("inputs") or {}).items():
+							replaced = _sequence_replace_direct_ref(input_value, root, call_id)
 							if replaced is None:
 								continue
 							preview = copy.deepcopy(parent_block)
 							preview["inputs"][input_name] = replaced
 							owner_previews[parent_id] = preview
-							input_changes.append(
-								(
-									parent_id,
-									input_name,
-									preview,
-									replaced,
-									root,
-									call_id,
-								)
-							)
+							input_changes.append((parent_id, input_name, preview, replaced, root, call_id))
 							found = True
 							break
 						if not found:
@@ -6576,7 +7095,6 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			for seq in sequences:
 				removed.update(closures[tuple(seq)])
 
-			old_target_bytes = _json_len(target)
 			candidate_blocks = dict(blocks)
 			for owner_id, preview in owner_previews.items():
 				candidate_blocks[owner_id] = preview
@@ -6586,7 +7104,23 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				candidate_blocks.pop(old_id, None)
 			candidate_target = copy.copy(target)
 			candidate_target["blocks"] = candidate_blocks
-			new_target_bytes = _json_len(candidate_target)
+			if opts is not None and (
+				getattr(opts, "rename_block_ids", False)
+				or getattr(opts, "rename_argument_ids", False)
+			):
+				old_target_bytes = _sequence_projected_json_size(
+					target,
+					rename_block_ids=getattr(opts, "rename_block_ids", False),
+					rename_argument_ids=getattr(opts, "rename_argument_ids", False),
+				)
+				new_target_bytes = _sequence_projected_json_size(
+					candidate_target,
+					rename_block_ids=getattr(opts, "rename_block_ids", False),
+					rename_argument_ids=getattr(opts, "rename_argument_ids", False),
+				)
+			else:
+				old_target_bytes = _json_len(target)
+				new_target_bytes = _json_len(candidate_target)
 			byte_delta = old_target_bytes - new_target_bytes
 
 			if byte_delta <= 0:
@@ -6611,17 +7145,8 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				opts.grouped_sequence_new_blocks[ti].update(generated)
 				for owner_id, _preview, _old, new_value in link_changes:
 					opts.grouped_sequence_link_edits[(ti, owner_id, "next")] = new_value
-				for (
-					owner_id,
-					input_name,
-					_preview,
-					new_value,
-					_old,
-					_call,
-				) in input_changes:
-					opts.grouped_sequence_input_edits[(ti, owner_id, input_name)] = (
-						copy.deepcopy(new_value)
-					)
+				for owner_id, input_name, _preview, new_value, _old, _call in input_changes:
+					opts.grouped_sequence_input_edits[(ti, owner_id, input_name)] = copy.deepcopy(new_value)
 			stats["sequence_groups_created"] += 1
 			stats["sequences_grouped"] += len(sequences)
 			stats["sequence_procedures_created"] += 1
@@ -7206,10 +7731,17 @@ def specialize_procedures(project, stats, opts):
 				qualifying = [
 					(signature, members)
 					for signature, members in groups.items()
-					if len(members) >= min_calls and len(members) == len(calls)
+					if len(members) >= min_calls and signature
 				]
 				if not qualifying:
 					continue
+				qualifying.sort(
+					key=lambda item: (
+						-(len(item[1]) * max(1, len(item[0]))),
+						-len(item[1]),
+						-len(item[0]),
+					)
+				)
 
 				body_size = len(body_info["closure"])
 				if body_size > 192:
@@ -7296,7 +7828,7 @@ def specialize_procedures(project, stats, opts):
 						)
 						call_delta += after_call - before_call
 
-					estimated_delta = clone_cost + call_delta - original_cost
+					estimated_delta = clone_cost + call_delta
 					if estimated_delta >= 0:
 						continue
 
@@ -7313,15 +7845,7 @@ def specialize_procedures(project, stats, opts):
 					)
 
 					blocks.update(clones)
-					for old_id in info["closure"]:
-						blocks.pop(old_id, None)
-					opts.specialized_procedure_removed_blocks[ti].update(
-						info["closure"]
-					)
 					stats["procedure_specialization_blocks_added"] += len(clones)
-					stats["procedure_specialization_blocks_removed"] += len(
-						info["closure"]
-					)
 					stats[
 						"procedure_specialization_argument_reporters_removed"
 					] += removed_reporter_count
@@ -13667,9 +14191,6 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.simplify_blocks:
 		stage("Simplify setter RHS blocks")
 		_simplify_setter_rhs_blocks(project, stats, opts)
-	if opts.group_similar_sequences:
-		stage("Group similar sequences")
-		group_similar_sequences(project, stats, opts.sequence_threshold, opts)
 	if opts.optimize_procedure_arguments:
 		stage("Optimize procedure arguments")
 		optimize_procedure_arguments(project, stats, opts)
@@ -13708,6 +14229,9 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			if ti >= len(opts.unused_procedure_removed_blocks):
 				opts.unused_procedure_removed_blocks.append(set())
 			opts.unused_procedure_removed_blocks[ti].update(removed_ids)
+	if opts.group_similar_sequences:
+		stage("Group similar sequences")
+		group_similar_sequences(project, stats, opts.sequence_threshold, opts)
 	if opts.remove_unused_variables or opts.remove_unused_lists:
 		stage("Remove unused variables/lists")
 		remove_unused_data(
