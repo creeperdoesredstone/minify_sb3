@@ -20,7 +20,7 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from itertools import permutations, product
 from types import SimpleNamespace
-from typing import Any, Never
+from typing import Any, NoReturn
 
 
 class JsonNumber(str):
@@ -30,7 +30,7 @@ class JsonNumber(str):
 		return self
 
 
-def _unique_object(pairs):
+def _unique_object(pairs) -> dict:
 	result = {}
 	for key, value in pairs:
 		if key in result:
@@ -39,11 +39,11 @@ def _unique_object(pairs):
 	return result
 
 
-def _invalid_constant(value):
+def _invalid_constant(value) -> NoReturn:
 	raise ValueError(f"non-finite JSON number: {value}")
 
 
-def loads_exact(data):
+def loads_exact(data) -> dict:
 	if isinstance(data, (bytes, bytearray)):
 		data = data.decode("utf-8-sig")
 	return json.loads(
@@ -103,7 +103,7 @@ def _number_components(token: str) -> tuple[bool, str, int]:
 
 
 @lru_cache(maxsize=8192)
-def _shortest_number_representation(token):
+def _shortest_number_representation(token) -> str:
 	sign, coefficient, exponent = _number_components(token)
 	prefix = "-" if sign else ""
 	if coefficient == "0":
@@ -145,11 +145,11 @@ def _shortest_number_representation(token):
 
 
 @lru_cache(maxsize=65536)
-def _quote(value):
+def _quote(value) -> str:
 	return json.dumps(value, ensure_ascii=False)
 
 
-def _encode_parts(value, short_numbers) -> list[str] | Never:
+def _encode_parts(value, short_numbers) -> list[str] | NoReturn:
 	parts = []
 
 	def emit(item: Any):
@@ -187,13 +187,13 @@ def _encode_parts(value, short_numbers) -> list[str] | Never:
 	return parts
 
 
-def dumps_exact(project, short_numbers=False):
+def dumps_exact(project, short_numbers=False) -> str:
 	return "".join(_encode_parts(project, short_numbers)).encode(
 		"utf-8", "backslashreplace"
 	)
 
 
-def dumps_exact_layout(project, order, short_numbers=False):
+def dumps_exact_layout(project, order, short_numbers=False) -> bytes:
 	parts = []
 	quote = _quote
 	short = _shortest_number_representation
@@ -392,7 +392,7 @@ def _reference_name_slots(project):
 					for index in (
 						(1, 2)
 						if tag == INPUT_DIFF_BLOCK_SHADOW
-						else (1,) if tag in (1, 2) else ()
+						else (1,) if tag in (INPUT_SAME_BLOCK_SHADOW, 2) else ()
 					):
 						if len(desc) > index:
 							yield from primitive(
@@ -670,7 +670,7 @@ def _terminal_link_ids(project):
 				if not isinstance(desc, list) or not desc:
 					return None
 				tag = _input_tag(desc[0])
-				if tag not in (1, 2, INPUT_DIFF_BLOCK_SHADOW) or len(desc) != (
+				if tag not in (INPUT_SAME_BLOCK_SHADOW, 2, INPUT_DIFF_BLOCK_SHADOW) or len(desc) != (
 					3 if tag == INPUT_DIFF_BLOCK_SHADOW else 2
 				):
 					return None
@@ -752,7 +752,7 @@ def _terminal_link_ids(project):
 					isinstance(desc, list)
 					and desc[1] == bid
 					and (
-						(len(desc) == 2 and _input_tag(desc[0]) in (1, 2))
+						(len(desc) == 2 and _input_tag(desc[0]) in (INPUT_SAME_BLOCK_SHADOW, 2))
 						or (
 							len(desc) == 3
 							and _input_tag(desc[0]) == INPUT_DIFF_BLOCK_SHADOW
@@ -2251,7 +2251,7 @@ def _input_tag(value):
 		)
 	return (
 		value
-		if type(value) in (int, float) and value in (1, 2, INPUT_DIFF_BLOCK_SHADOW)
+		if type(value) in (int, float) and value in (INPUT_SAME_BLOCK_SHADOW, 2, INPUT_DIFF_BLOCK_SHADOW)
 		else None
 	)
 
@@ -2271,8 +2271,8 @@ def _block_slots(target):
 			tag = _input_tag(desc[0])
 			positions = (
 				(1,)
-				if tag in (1, 2)
-				else (1, 2) if tag == INPUT_DIFF_BLOCK_SHADOW else ()
+				if tag in (INPUT_SAME_BLOCK_SHADOW, 2)
+				else (INPUT_SAME_BLOCK_SHADOW, 2) if tag == INPUT_DIFF_BLOCK_SHADOW else ()
 			)
 			for position in positions:
 				if (
@@ -3226,7 +3226,7 @@ def _mapped_block_id(value, block_ids):
 def _replace_input_block_ids(value, block_ids):
 	for node in _iter_scratch_input_nodes(value):
 		tag = node[0]
-		if tag in (1, 2) and len(node) > 1:
+		if tag in (INPUT_SAME_BLOCK_SHADOW, 2) and len(node) > 1:
 			node[1] = _mapped_block_id(node[1], block_ids)
 		elif tag == INPUT_DIFF_BLOCK_SHADOW:
 			if len(node) > 1:
@@ -3491,7 +3491,7 @@ def _is_bare_literal_input(value):
 	if not (isinstance(value, list) and len(value) > 1):
 		return False
 	tag = _scratch_numeric_tag(value[0])
-	if tag in (1, INPUT_DIFF_BLOCK_SHADOW):
+	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
 		return isinstance(value[1], list)
 	return False
 
