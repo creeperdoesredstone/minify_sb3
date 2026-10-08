@@ -338,5 +338,6 @@ groups = {
 		"--control-flow",
 		"--data-optimization",
 		"--compression",
+        "--relabel-block-ids"
 	),
 }
