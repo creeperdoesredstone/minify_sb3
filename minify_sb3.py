@@ -64,6 +64,7 @@ def _copy_json(value, memo=None):
 
 	if memo is None:
 		memo = {}
+
 	if kind not in (dict, list):
 		return copy.deepcopy(value, memo)
 
@@ -321,12 +322,15 @@ def _reference_name_slots(project) -> Generator:
 	def primitive(node, path):
 		if not isinstance(node, list) or len(node) < 3:
 			return
+		
 		tag = node[0]
+
 		if isinstance(tag, JsonNumber):
 			tag = {
 				(False, str(PRIMITIVE_VARIABLE), 0): PRIMITIVE_VARIABLE,
 				(False, str(PRIMITIVE_LIST), 0): PRIMITIVE_LIST,
 			}.get(_number_components(tag))
+
 		if type(tag) in (int, float) and tag in CONTAINER_TAGS:
 			yield path + (1,), node, 1, node[2], (
 				"variables" if tag == PRIMITIVE_VARIABLE else "lists"
@@ -346,10 +350,13 @@ def _reference_name_slots(project) -> Generator:
 						and len(value) == 2
 					):
 						yield path + ("fields", field, 0), value, 0, value[1], kind
+						
 				for key, desc in (block.get("inputs") or {}).items():
 					if not isinstance(desc, list) or not desc:
 						continue
+
 					tag = _input_tag(desc[0])
+
 					for index in (
 						(1, 2)
 						if tag == INPUT_DIFF_BLOCK_SHADOW
