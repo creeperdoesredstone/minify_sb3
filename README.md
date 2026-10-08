@@ -29,6 +29,7 @@ The script is designed around Scratch 3's serialized project format and preserve
 - **Python 3.10 or newer.**
 - **`minify_flags.py`** must be importable by the script. The CLI uses it for flag groups, toggles, and valued options.
 - **`ffmpeg` with `libmp3lame`** is needed for `--convert-wav-to-mp3` and for `--all-flags`, which enables that conversion.
+You can download FFMPEG [here](https://ffmpeg.org/).
 - **The Python `zopfli` package** is needed when Zopfli is explicitly requested (`--zopfli`, `--zopfli-assets`) or when using the all-lossless/safe group. Install it with:
   ```bash
   python -m pip install zopfli
@@ -312,20 +313,16 @@ These flags change names, not IDs.
 | --- | --- |
 | `--fold-constant-variables` | Interactively replace eligible write-once variable reporters with their initial literals. |
 | `--fold-constant-expressions` | Fold supported constant Scratch reporter expressions. |
-| `--script-constant-propagation` | Propagate constants through modeled scripts. |
-| `--propagate-script-constants` | Alias for script constant propagation. |
-| `--constant-propagation` | Alias for script constant propagation. |
+| `--constant-propagation` | Propagate constants. |
+| `--cp` | Alias for constant propagation. |
 | `--branch-swapping` | Rewrite eligible conditional branches to reduce serialized size. |
-| `--swap-branches` | Alias for branch swapping. |
-| `--branch-swap` | Alias for branch swapping. |
+| `--bs` | Alias for branch swapping. |
 | `--trivial-loops` | Simplify supported trivial boolean loops. |
-| `--simplify-trivial-loops` | Alias for trivial-loop simplification. |
+| `--tl` | Alias for trivial-loop simplification. |
 | `--nested-conditionals` | Simplify/merge supported nested conditionals. |
-| `--merge-nested-conditionals` | Alias for nested-conditional simplification. |
-| `--merge-nested-ifs` | Alias for nested-conditional simplification. |
+| `--nc` | Alias for nested-conditional simplification. |
 | `--associative-constants` | Merge/reassociate supported constant arithmetic expressions. |
-| `--merge-associative-constants` | Alias. |
-| `--reassociate-constants` | Alias. |
+| `--ac` | Alias for reassociating constant arithmetic expressions. |
 | `--simplify-boolean-control` | Simplify constant boolean control flow. |
 | `--simplify-blocks` | Simplify supported setter RHS block patterns. |
 
@@ -334,23 +331,14 @@ These flags change names, not IDs.
 | Flag | Effect |
 | --- | --- |
 | `--optimize-procedure-arguments` | Remove/fold unnecessary custom-procedure arguments. |
-| `--optimize-custom-procedure-arguments` | Alias. |
-| `--drop-procedure-arguments` | Alias. |
-| `--remove-unused-procedure-arguments` | Alias. |
-| `--remove-unused-custom-procedure-arguments` | Alias. |
-| `--fold-constant-procedure-arguments` | Alias. |
-| `--fold-constant-custom-procedure-arguments` | Alias. |
+| `--opa` | Alias. |
 | `--merge-duplicate-procedures` | Merge equivalent custom procedures. |
-| `--merge-duplicate-custom-procedures` | Alias. |
-| `--merge-duplicate-custom-blocks` | Alias. |
-| `--deduplicate-procedures` | Alias. |
+| `--mdp` | Alias. |
 | `--inline-single-use-procedures` | Inline safe single-use procedures. |
-| `--inline-single-use-custom-procedures` | Alias. |
-| `--procedure-inlining` | Alias. |
+| `--isup` | Alias. |
 | `--procedure-inline-passes=N` | Maximum inlining passes. Default: `8`. |
 | `--specialize-procedures` | Specialize eligible custom procedures. |
-| `--specialize-custom-procedures` | Alias. |
-| `--procedure-specialization` | Alias. |
+| `--sp` | Alias. |
 | `--procedure-specialization-passes=N` | Specialization passes. Default: `4`. |
 | `--procedure-specialization-min-calls=N` | Minimum call count for specialization. Default: `2`. |
 
@@ -370,13 +358,11 @@ Sequence grouping is not automatically enabled by `--all-optimizations`.
 | Flag | Effect |
 | --- | --- |
 | `--strip-reference-names` | Strip supported redundant reference names. |
-| `--drop-reference-names` | Alias. |
-| `--empty-reference-names` | Alias. |
+| `--srn` | Alias. |
 | `--compact-data-literals` | Compact numeric data literals. |
-| `--numeric-data-literals` | Alias. |
-| `--convert-numeric-data` | Alias. |
+| `--cdl` | Alias. |
 | `--remove-unused-extensions` | Remove extensions that are no longer referenced. |
-| `--unused-extensions` | Alias. |
+| `--rue` | Alias. |
 
 ### Asset handling
 
