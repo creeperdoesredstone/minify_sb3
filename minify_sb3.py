@@ -15776,13 +15776,18 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			project, opts.folded_constant_variable_setters, stats, opts
 		)
 	if opts.constant_propagation or opts.fold_constant_expressions:
-		stage("Propagate constants & fold expressions")
+		stage("Propagate, fold & merge associative constants")
 		while True:
 			round_changes = 0
 			if opts.constant_propagation:
 				round_changes += constant_propagation(project, stats, opts)
+			
 			if opts.fold_constant_expressions:
 				round_changes += fold_constant_expressions(project, stats, opts)
+
+			if opts.associative_constant_merging:
+				round_changes += merge_associative_constants(project, stats, opts)
+			
 			if round_changes == 0:
 				break
 	if (
@@ -15793,9 +15798,6 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	):
 		stage("Rewrite script control structures")
 		simplify_script_structures(project, stats, opts)
-	if opts.associative_constant_merging:
-		stage("Merge associative constants")
-		merge_associative_constants(project, stats, opts)
 	if opts.specialize_procedures:
 		stage("Specialize custom procedures")
 		specialize_procedures(project, stats, opts)
