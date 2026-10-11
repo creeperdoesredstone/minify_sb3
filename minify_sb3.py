@@ -423,7 +423,7 @@ def _restore_reference_names(original, result, *, copy_result=True):
 			if type(other[path[-1]]) is str and other[path[-1]] == "":
 				other[path[-1]] = container[index]
 		except (KeyError, IndexError, TypeError):
-			pass
+			...
 
 	return result
 
@@ -951,7 +951,7 @@ def _restore_covered_shadows(original: dict[str, Any], result: dict[str, Any]) -
 			):
 				inputs[name] = [before[0], after[1], before[2]]
 		except (KeyError, IndexError, TypeError):
-			pass
+			...
 
 	return result
 
@@ -9373,7 +9373,7 @@ def compact_procedure_prototypes(project, stats, opts):
 				proto["inputs"] = {}
 				opts.procedure_prototype_compaction_input_edits[(ti, proto_id)] = {}
 			elif "inputs" not in proto:
-				pass
+				...
 			else:
 				proto["inputs"] = {}
 
@@ -13794,59 +13794,104 @@ def simplify_script_structures(project, stats, opts) -> int:
 	)
 
 
+OPERATOR_INPUTS = {
+	"default": "STRING",
+	"operator_add": "NUM",
+	"operator_mul": "NUM",
+	"operator_join": "STRING",
+	"operator_and": "OPERAND",
+	"operator_or": "OPERAND",
+}
+
+
 def plan_associations(blocks, outer_id, graph, commented):
 	outer = blocks.get(outer_id)
 	if not isinstance(outer, dict) or outer.get("next") is not None:
 		return None
+	
 	op = outer.get("opcode")
-	if op not in ("operator_add", "operator_join"):
+
+	if op not in OPERATOR_INPUTS.keys():
 		return None
-	left_name, right_name = (
-		("NUM1", "NUM2") if op == "operator_add" else ("STRING1", "STRING2")
-	)
+	
+	left_name = OPERATOR_INPUTS[op] + "1"
+	right_name = OPERATOR_INPUTS[op] + "2"
 	outer_left = (outer.get("inputs") or {}).get(left_name)
 	outer_right = (outer.get("inputs") or {}).get(right_name)
 	inner_id = _script_input_root(outer_left, blocks)
 	inner = blocks.get(inner_id) if inner_id else None
+
 	if (
 		not isinstance(inner, dict)
 		or inner.get("opcode") != op
 		or inner.get("next") is not None
 	):
 		return None
+	
 	inner_inputs = inner.get("inputs") or {}
 	inner_left = inner_inputs.get(left_name)
 	inner_right = inner_inputs.get(right_name)
 	c1 = _constant_expression_from_input(inner_right, blocks)
 	c2 = _constant_expression_from_input(outer_right, blocks)
+
 	if inner_left is None or c1 is None or c2 is None:
 		return None
+	
 	owned = _exclusive_input_block_subtree_fast(
 		outer_left, blocks, outer_id, graph.incoming, graph=graph
 	)
+	
 	if owned is None:
 		return None
+	
 	survivor_owned = _exclusive_input_block_subtree_fast(
 		inner_left, blocks, inner_id, graph.incoming, graph=graph
 	)
+	
 	if survivor_owned is None or inner_id not in owned or not survivor_owned <= owned:
 		return None
+	
 	removed = owned - survivor_owned
+	
 	if removed & commented:
 		return None
+
+	# fold
 	if op == "operator_join":
 		combined = _constant(
-			"string", _constant_to_string(c1[0]) + _constant_to_string(c2[0])
+			"string",
+			_constant_to_string(c1[0]) + _constant_to_string(c2[0]),
 		)
-	else:
+
+	elif op in ("operator_add", "operator_multiply"):
 		a = _constant_to_number(c1[0])
 		b = _constant_to_number(c2[0])
-		if a is None or b is None or not math.isfinite(a) or not math.isfinite(b):
+
+		if a is None or b is None:
 			return None
-		combined = _constant("number", a + b)
+
+		if not math.isfinite(a) or not math.isfinite(b):
+			return None
+
+		value = a + b if op == "operator_add" else a * b
+
+		if not math.isfinite(value):
+			return None
+
+		combined = _constant("number", value)
+
+	elif op in ("operator_and", "operator_or"):
+		a = _constant_to_bool(c1[0])
+		b = _constant_to_bool(c2[0])
+
+		value = a and b if op == "operator_and" else a or b
+		combined = _constant("bool", value)
+	
 	new_const, _ = _constant_to_scratch_input(combined, blocks, outer_id)
+	
 	if new_const is None:
 		return None
+	
 	return {
 		"inner_id": inner_id,
 		"base": copy.deepcopy(inner_left),
@@ -13856,14 +13901,6 @@ def plan_associations(blocks, outer_id, graph, commented):
 
 
 def merge_associative_constants(project, stats, opts: Options):
-	OP_MAP_TYPE = {
-		"default": "STRING",
-		"operator_add": "NUM",
-		"operator_join": "STRING",
-		"operator_and": "INPUT",
-		"operator_or": "INPUT",
-	}
-
 	script_prepare_maps(opts, project.get("targets", []))
 	count: int = 0
 
@@ -13882,8 +13919,8 @@ def merge_associative_constants(project, stats, opts: Options):
 
 				outer = blocks[bid]
 				opcode = outer.get("opcode", "default")
-				name = OP_MAP_TYPE[opcode] + "1"
-				name2 = OP_MAP_TYPE[opcode] + "2"
+				name = OPERATOR_INPUTS[opcode] + "1"
+				name2 = OPERATOR_INPUTS[opcode] + "2"
 
 				for ref in _direct_input_block_refs(plan["base"], blocks):
 					if isinstance(blocks.get(ref), dict):
@@ -14590,7 +14627,7 @@ def _numeric_data_literal(value):
 		if str(iv) == value:
 			return iv
 	except (ValueError, OverflowError):
-		pass
+		...
 	try:
 		fv = float(value)
 	except (ValueError, OverflowError):
@@ -14710,7 +14747,7 @@ def _compact_data_entry_equal(original, minified):
 	return _compact_data_value_equal(original[1], minified[1])
 
 
-def fold_constant_expressions(project, stats, opts: Options):
+def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], opts: Options):
 	targets = project.get("targets", [])
 	if opts.folded_constant_expression_link_edits is None:
 		opts.folded_constant_expression_link_edits = {}
@@ -15213,7 +15250,7 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 		return {(c["ti"], c["id"]): c["literal"] for c in chosen}
 
 
-def remove_empty_fields(project, stats):
+def remove_empty_fields(project: dict[str, Any], stats: dict[str, int]):
 	count = 0
 	for target in project.get("targets", []):
 		for block in target.get("blocks", {}).values():
@@ -15224,7 +15261,7 @@ def remove_empty_fields(project, stats):
 	return count
 
 
-def remove_empty_inputs(project, stats):
+def remove_empty_inputs(project: dict[str, Any], stats: dict[str, int]):
 	count = 0
 	for target in project.get("targets", []):
 		for block in target.get("blocks", {}).values():
@@ -15354,7 +15391,7 @@ def compact_numeric_inputs(project, stats):
 									count += 1
 									continue
 							except ValueError:
-								pass
+								...
 							try:
 								fv = float(v)
 								if (
@@ -15368,7 +15405,7 @@ def compact_numeric_inputs(project, stats):
 									item[1] = fv
 									count += 1
 							except ValueError:
-								pass
+								...
 	stats["numeric_inputs_compacted"] += count
 	return count
 
@@ -16453,7 +16490,7 @@ def _input_val_eq(vo, vm, opts):
 				if Decimal(str(vo)) == Decimal(str(vm)):
 					return True
 			except InvalidOperation:
-				pass
+				...
 
 	if opts.compact_numeric_inputs:
 		if (
@@ -16810,7 +16847,7 @@ def _check_mutation_match(
 				if _cached_json_loads(ov) == _cached_json_loads(mv):
 					continue
 			except (TypeError, ValueError):
-				pass
+				...
 		return False
 	return True
 
@@ -18001,7 +18038,7 @@ def _restore_representation_for_verify(original, result, opts):
 				original, result, copy_result=False, opts=opts
 			)
 		except (ValueError, KeyError, TypeError, IndexError):
-			pass
+			...
 
 	if getattr(opts, "compact_reference_names", False):
 		result = _restore_reference_names(original, result, copy_result=False)
@@ -18010,7 +18047,7 @@ def _restore_representation_for_verify(original, result, opts):
 		try:
 			result = _restore_unused_data(original, result)
 		except (ValueError, KeyError, TypeError):
-			pass
+			...
 
 	if getattr(opts, "strip_editor_comments", False) or getattr(
 		opts, "strip_script_positions", False
@@ -18024,7 +18061,7 @@ def _restore_representation_for_verify(original, result, opts):
 				getattr(opts, "strip_script_positions", False),
 			)
 		except (ValueError, KeyError, TypeError):
-			pass
+			...
 
 	terminal = (
 		_terminal_link_ids(original)
@@ -18038,6 +18075,7 @@ def _restore_representation_for_verify(original, result, opts):
 	):
 		left_blocks = left_target.get("blocks") or {}
 		right_blocks = right_target.get("blocks") or {}
+		
 		for bid, left in left_blocks.items():
 			right = right_blocks.get(bid)
 			if not isinstance(left, dict) or not isinstance(right, dict):
@@ -18068,6 +18106,7 @@ def _restore_representation_for_verify(original, result, opts):
 					right["next"] = None
 				left_fields = left.get("fields") or {}
 				right_fields = right.get("fields")
+				
 				if isinstance(right_fields, dict):
 					for name, value in left_fields.items():
 						if (
@@ -18089,10 +18128,12 @@ def _restore_representation_for_verify(original, result, opts):
 				right_costumes, list
 			):
 				continue
+			
 			for left, right in zip(left_costumes, right_costumes):
 				if not isinstance(left, dict) or not isinstance(right, dict):
 					continue
 				canonical = _canonical_costume_filename(left)
+				
 				if (
 					canonical is not None
 					and left.get("md5ext") == canonical
@@ -18107,10 +18148,13 @@ def verify(original_path, minified_path, opts):
 	with zipfile.ZipFile(original_path) as a, zipfile.ZipFile(minified_path) as b:
 		for zf, zpath in ((a, original_path), (b, minified_path)):
 			names, err = _zip_entry_names(zf)
+
 			if err:
 				return False, f"archive '{zpath}': {err}"
+			
 			if "project.json" not in names:
 				return False, f"archive '{zpath}' has no project.json"
+			
 		orig_assets = {name for name in a.namelist() if name != "project.json"}
 		mini_assets = {name for name in b.namelist() if name != "project.json"}
 		original_asset_cache = {}
@@ -18119,6 +18163,7 @@ def verify(original_path, minified_path, opts):
 		expected_assets = {
 			_final_asset_name(conversions.get(name, name), opts) for name in orig_assets
 		}
+
 		if mini_assets != expected_assets:
 			diff_missing = sorted(expected_assets - mini_assets)
 			diff_extra = sorted(mini_assets - expected_assets)
@@ -18126,13 +18171,16 @@ def verify(original_path, minified_path, opts):
 				False,
 				f"zip archive entries differ. Missing: {diff_missing[:10]}, unexpected extra: {diff_extra[:10]}",
 			)
+		
 		for name in orig_assets:
 			if name in conversions:
 				new_name = _final_asset_name(conversions[name], opts)
 				new_bytes = minified_asset_cache.get(new_name)
+
 				if new_bytes is None:
 					new_bytes = b.read(new_name)
 					minified_asset_cache[new_name] = new_bytes
+				
 				if hashlib.md5(new_bytes).hexdigest() != new_name.rsplit(".", 1)[0]:
 					return (
 						False,
@@ -18141,13 +18189,17 @@ def verify(original_path, minified_path, opts):
 			else:
 				final_name = _final_asset_name(name, opts)
 				original_bytes = original_asset_cache.get(name)
+
 				if original_bytes is None:
 					original_bytes = a.read(name)
 					original_asset_cache[name] = original_bytes
+
 				minified_bytes = minified_asset_cache.get(final_name)
+
 				if minified_bytes is None:
 					minified_bytes = b.read(final_name)
 					minified_asset_cache[final_name] = minified_bytes
+
 				if final_name != name:
 					if original_bytes != minified_bytes:
 						return (
@@ -18165,28 +18217,36 @@ def verify(original_path, minified_path, opts):
 			mini_raw_project = json.loads(b.read("project.json"))
 		except (UnicodeDecodeError, json.JSONDecodeError) as exc:
 			return False, f"project.json is not valid UTF-8 JSON: {exc}"
+		
 		if not isinstance(orig_raw, dict) or not isinstance(mini_raw_project, dict):
 			return False, "project.json root must be an object"
+		
 		if not isinstance(orig_raw.get("targets"), list) or not isinstance(
 			mini_raw_project.get("targets"), list
 		):
 			return False, "project.json targets must be arrays"
+		
 		orig_raw, mini_raw_project, representation_block_ids_restored = (
 			_restore_representation_for_verify(orig_raw, mini_raw_project, opts)
 		)
 		orig = _reinflate(orig_raw)
 		mini = _reinflate(mini_raw_project)
 		opts._verify_project = orig
-
 		err = _validate_asset_entries(mini, b, "minified project", minified_asset_cache)
+		
 		if err:
 			return False, err
+		
 		err = _validate_asset_entries(orig, a, "original project")
+		
 		if err:
 			return False, err
+		
 		if opts.rename_block_ids and not representation_block_ids_restored:
 			_restore_block_ids(mini, opts.renamed_block_ids)
+		
 		err = _validate_block_structure(mini, "minified project", orig)
+		
 		if err:
 			return False, err
 
