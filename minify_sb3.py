@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import hashlib
 import json
@@ -322,7 +324,7 @@ def _reference_name_slots(project) -> Generator:
 	def primitive(node, path):
 		if not isinstance(node, list) or len(node) < 3:
 			return
-		
+
 		tag = node[0]
 
 		if isinstance(tag, JsonNumber):
@@ -350,7 +352,7 @@ def _reference_name_slots(project) -> Generator:
 						and len(value) == 2
 					):
 						yield path + ("fields", field, 0), value, 0, value[1], kind
-						
+
 				for key, desc in (block.get("inputs") or {}).items():
 					if not isinstance(desc, list) or not desc:
 						continue
@@ -432,7 +434,7 @@ def _orphan_argument_ids(target):
 	blocks = target.get("blocks") or {}
 	if not isinstance(blocks, dict):
 		return set()
-	
+
 	for block in blocks.values():
 		if not isinstance(block, dict):
 			continue
@@ -442,15 +444,15 @@ def _orphan_argument_ids(target):
 			for key in ("next", "parent")
 		):
 			return set()
-		
+
 		inputs = block.get("inputs", {})
 		if not isinstance(inputs, dict):
 			return set()
-		
+
 		for desc in inputs.values():
 			if not isinstance(desc, list) or not desc or _input_tag(desc[0]) is None:
 				return set()
-			
+
 			for value in desc[1:3] if _input_tag(desc[0]) == 3 else desc[1:2]:
 				if (
 					value is not None
@@ -458,7 +460,7 @@ def _orphan_argument_ids(target):
 					and not isinstance(value, list)
 				):
 					return set()
-				
+
 	referenced = {container[key] for container, key in _block_slots(target)}
 	allowed = {"opcode", "next", "parent", "inputs", "fields", "shadow", "topLevel"}
 	orphans = set()
@@ -523,13 +525,13 @@ def _prune_orphan_arguments(project, result=None):
 
 				if len(other) != len(blocks) - len(orphans):
 					orphans = set()
-			
+
 			target["blocks"] = {
 				bid: block for bid, block in blocks.items() if bid not in orphans
 			}
-		
+
 		pruned["targets"].append(target)
-	
+
 	return pruned
 
 
@@ -636,16 +638,16 @@ _SYNC_TERMINAL_MENUS = frozenset(
 def _terminal_link_ids(project):
 	if not isinstance(project, dict) or not isinstance(project.get("targets"), list):
 		return {}
-	
+
 	if project.get("extensionURLs") or project.get("extensionStorage"):
 		return {}
-	
+
 	extensions = project.get("extensions", [])
 	if not isinstance(extensions, list) or any(
 		value not in ("pen", "music") for value in extensions
 	):
 		return {}
-	
+
 	for target in project["targets"]:
 		if (
 			not isinstance(target, dict)
@@ -653,14 +655,14 @@ def _terminal_link_ids(project):
 			or target.get("extensionStorage")
 		):
 			return {}
-		
+
 		for block in target.get("blocks", {}).values():
 			if isinstance(block, dict) and (
 				type(block.get("opcode")) is not str
 				or block["opcode"] not in _DATA_PRUNING_OPCODES
 			):
 				return {}
-			
+
 	primitive_tags = {
 		_number_components(str(i)): i
 		for i in range(PRIMITIVE_NUMBER, PRIMITIVE_LIST + 1)
@@ -674,17 +676,19 @@ def _terminal_link_ids(project):
 			inputs = block.get("inputs", {})
 			if not isinstance(inputs, dict):
 				return None
-			
+
 			refs = []
 
 			for desc in inputs.values():
 				if not isinstance(desc, list) or not desc:
 					return None
-				
+
 				tag = _input_tag(desc[0])
-				if tag not in INPUT_TAGS or len(desc) != (3 if tag == INPUT_DIFF_BLOCK_SHADOW else 2):
+				if tag not in INPUT_TAGS or len(desc) != (
+					3 if tag == INPUT_DIFF_BLOCK_SHADOW else 2
+				):
 					return None
-				
+
 				for value in desc[1:]:
 					if type(value) is str:
 						refs.append(value)
@@ -700,7 +704,7 @@ def _terminal_link_ids(project):
 							return None
 					else:
 						return None
-					
+
 			return refs
 
 		def synchronous(root):
@@ -856,7 +860,7 @@ def _covered_shadow_slots(project) -> Generator:
 	def kind(value):
 		if isinstance(value, JsonNumber):
 			return token_kinds.get(_number_components(value))
-		
+
 		return (
 			value
 			if type(value) in (int, float)
@@ -939,7 +943,9 @@ def _covered_shadow_slots(project) -> Generator:
 				yield ti, bid, name, desc
 
 
-def _restore_covered_shadows(original: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+def _restore_covered_shadows(
+	original: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
 	for ti, bid, name, before in _covered_shadow_slots(original):
 		try:
 			inputs = result["targets"][ti]["blocks"][bid]["inputs"]
@@ -972,7 +978,7 @@ def _procedure_symbol_info(target: dict[str, Any]) -> list[Counter] | None:
 				or type(mutation.get("proccode")) is not str
 			):
 				return None
-			
+
 			if set(mutation) - {
 				"tagName",
 				"children",
@@ -984,20 +990,20 @@ def _procedure_symbol_info(target: dict[str, Any]) -> list[Counter] | None:
 				"hasnext",
 			}:
 				return None
-			
+
 			if (
 				mutation.get("tagName", "mutation") != "mutation"
 				or mutation.get("children", []) != []
 			):
 				return None
-			
+
 			code = mutation["proccode"]
 			if code in _RESERVED_PROCEDURE_SYMBOLS:
 				return None
-			
+
 			if "%" in re.sub(r"%[snb]", "", code):
 				return None
-			
+
 			counts[0][code] += 1
 			for key, index in (("argumentids", 1), ("argumentnames", 2)):
 				if key not in mutation:
@@ -1013,30 +1019,30 @@ def _procedure_symbol_info(target: dict[str, Any]) -> list[Counter] | None:
 					type(v) is not str for v in values
 				):
 					return None
-				
+
 				if len(values) != len(re.findall(r"%[snb]", code)):
 					return None
-				
+
 				if any(v in _RESERVED_PROCEDURE_SYMBOLS for v in values):
 					return None
-				
+
 				counts[index].update(values)
 			inputs = block.get("inputs", {})
 			if not isinstance(inputs, dict):
 				return None
-			
+
 			if list(inputs) != javascript_keys(inputs):
 				return None
-			
+
 			if set(inputs) - set(json.loads(mutation["argumentids"])):
 				return None
-			
+
 			counts[1].update(inputs.keys())
 		elif op in ("argument_reporter_string_number", "argument_reporter_boolean"):
 			value = (block.get("fields") or {}).get("VALUE")
 			if not isinstance(value, list) or not value or type(value[0]) is not str:
 				return None
-			
+
 			counts[2][value[0]] += 1
 
 	return counts
@@ -1053,6 +1059,7 @@ def _compact_procedure_symbols(project: dict[str, Any], *, copy_result=True):
 
 		maps = []
 		for index, frequencies in enumerate(counts):
+
 			def names():
 				return (
 					name
@@ -1081,7 +1088,7 @@ def _compact_procedure_symbols(project: dict[str, Any], *, copy_result=True):
 				mapping[old] = name
 
 			maps.append(mapping)
-		
+
 		for block in (target.get("blocks") or {}).values():
 			if not isinstance(block, dict):
 				continue
@@ -1098,7 +1105,7 @@ def _compact_procedure_symbols(project: dict[str, Any], *, copy_result=True):
 							ensure_ascii=False,
 							separators=(",", ":"),
 						)
-				
+
 				if "inputs" in block:
 					block["inputs"] = {
 						maps[1][key]: value for key, value in block["inputs"].items()
@@ -1114,11 +1121,11 @@ def _restore_procedure_symbols(
 	result: dict[str, Any],
 	*,
 	copy_result: bool = True,
-	opts: Options|None =None
+	opts: Options | None = None,
 ):
 	if copy_result:
 		result = copy.deepcopy(result)
-	
+
 	mut_edits: dict = getattr(opts, "procedure_argument_mutation_edits", {})
 	removed_in: dict = getattr(opts, "procedure_argument_removed_inputs", {})
 	spec_calls: dict = getattr(opts, "specialized_procedure_call_proccodes", {})
@@ -1149,12 +1156,12 @@ def _restore_procedure_symbols(
 					or new in _RESERVED_PROCEDURE_SYMBOLS
 				):
 					raise ValueError("invalid procedure symbol")
-				
+
 				if (old in forward[index] and forward[index][old] != new) or (
 					new in reverse[index] and reverse[index][new] != old
 				):
 					raise ValueError("procedure symbol correspondence is not bijective")
-				
+
 				if (
 					index == 2
 					and (
@@ -1164,7 +1171,7 @@ def _restore_procedure_symbols(
 					and new != old
 				):
 					raise ValueError("special argument reporter name changed")
-				
+
 				forward[index][old], reverse[index][new] = new, old
 
 			pairs = []
@@ -1209,7 +1216,7 @@ def _restore_procedure_symbols(
 						r"%[snb]", b["proccode"]
 					):
 						raise ValueError("procedure placeholder types changed")
-					
+
 					arg_id_forward = {}
 					arg_id_restore = {}
 
@@ -1220,14 +1227,14 @@ def _restore_procedure_symbols(
 						x, y = json.loads(compare[key]), json.loads(b.get(key))
 						if not isinstance(y, list) or len(x) != len(y):
 							raise ValueError("procedure argument count changed")
-						
+
 						if index == 1:
 							if any(
 								type(old) is not str or type(new) is not str
 								for old, new in zip(x, y)
 							):
 								raise ValueError("invalid procedure argument ID")
-							
+
 							arg_id_forward = dict(zip(x, y))
 							original_ids = json.loads(a["argumentids"])
 							arg_id_restore = dict(zip(y, original_ids))
@@ -1268,7 +1275,7 @@ def _restore_procedure_symbols(
 						raise ValueError(
 							"procedure input keys or evaluation order changed"
 						)
-					
+
 					reverse_input_ids = arg_id_restore
 					other["inputs"] = {
 						reverse_input_ids.get(key, key): value
@@ -1390,13 +1397,13 @@ def _unused_data_ids(project):
 		or any(ext not in ("pen", "music") for ext in extensions)
 	):
 		return {}
-	
+
 	if any(
 		project.get(key)
 		for key in ("extensionURLs", "extensionData", "extensionStorage")
 	):
 		return {}
-	
+
 	stage = stages[0]
 	ids, names = set(), set()
 	scopes = []
@@ -1409,7 +1416,7 @@ def _unused_data_ids(project):
 
 			if not isinstance(table, dict) or seen.intersection(table):
 				return {}
-			
+
 			seen.update(table)
 
 		scopes.append(seen)
@@ -1425,7 +1432,7 @@ def _unused_data_ids(project):
 				if ident in scopes[owner]:
 					ids.add((owner, ident))
 					return
-				
+
 		for owner in (ti, stage):
 			if type(name) is str:
 				names.add((owner, kind, name))
@@ -1433,7 +1440,7 @@ def _unused_data_ids(project):
 	def primitive(ti, value):
 		if not isinstance(value, list) or not value:
 			return False
-		
+
 		tag = value[0]
 
 		if isinstance(tag, JsonNumber):
@@ -1441,7 +1448,7 @@ def _unused_data_ids(project):
 
 		if type(tag) not in (int, float):
 			return False
-		
+
 		if tag in (
 			PRIMITIVE_NUMBER,
 			PRIMITIVE_POSITIVE_NUMBER,
@@ -1452,7 +1459,7 @@ def _unused_data_ids(project):
 			PRIMITIVE_TEXT,
 		):
 			return len(value) == 2
-		
+
 		if (
 			tag not in (PRIMITIVE_BROADCAST, PRIMITIVE_VARIABLE, PRIMITIVE_LIST)
 			or len(value) not in (3, 5)
@@ -1460,7 +1467,7 @@ def _unused_data_ids(project):
 			or type(value[2]) is not str
 		):
 			return False
-		
+
 		mark(
 			ti,
 			{
@@ -1476,16 +1483,16 @@ def _unused_data_ids(project):
 	for ti, target in enumerate(targets):
 		if target.get("extensionStorage"):
 			return {}
-		
+
 		blocks = target.get("blocks", {})
 		if not isinstance(blocks, dict):
 			return {}
-		
+
 		for block in blocks.values():
 			if isinstance(block, list):
 				if not primitive(ti, block):
 					return {}
-				
+
 				continue
 
 			if (
@@ -1493,15 +1500,15 @@ def _unused_data_ids(project):
 				or block.get("opcode") not in _DATA_PRUNING_OPCODES
 			):
 				return {}
-			
+
 			fields, inputs = block.get("fields", {}), block.get("inputs", {})
 
 			if not isinstance(fields, dict) or not isinstance(inputs, dict):
 				return {}
-			
+
 			if fields.keys() & inputs.keys():
 				return {}
-			
+
 			op = block["opcode"]
 			data_field = (
 				"VARIABLE"
@@ -1519,7 +1526,7 @@ def _unused_data_ids(project):
 
 			if data_field and data_field not in fields:
 				return {}
-			
+
 			for field, kind in (
 				("VARIABLE", "variables"),
 				("LIST", "lists"),
@@ -1537,44 +1544,44 @@ def _unused_data_ids(project):
 					or type(value[0]) is not str
 				):
 					return {}
-				
+
 				ident = value[1] if len(value) > 1 else None
 
 				if ident is not None and type(ident) is not str:
 					return {}
-				
+
 				mark(ti, kind, value[0], ident)
-				
+
 			for desc in inputs.values():
 				if not isinstance(desc, list) or not desc:
 					return {}
-				
+
 				tag = _input_tag(desc[0])
 
 				if tag is None or len(desc) != (
 					3 if tag == INPUT_DIFF_BLOCK_SHADOW else 2
 				):
 					return {}
-				
+
 				for value in desc[1:]:
 					if value is None or type(value) is str:
 						continue
 
 					if not primitive(ti, value):
 						return {}
-					
+
 			if block.get("opcode") in ("sensing_of", "sensing_of_property_menu"):
 				prop = fields.get("PROPERTY")
 				if not isinstance(prop, list) or not prop or type(prop[0]) is not str:
 					return {}
-				
+
 				for owner in range(len(targets)):
 					names.add((owner, "variables", prop[0]))
 
 	monitors = project.get("monitors", [])
 	if not isinstance(monitors, list):
 		return {}
-	
+
 	for monitor in monitors:
 		if (
 			not isinstance(monitor, dict)
@@ -1619,7 +1626,9 @@ def _unused_data_ids(project):
 	}
 
 
-def _restore_unused_data(original: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+def _restore_unused_data(
+	original: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
 	eligible = _unused_data_ids(original)
 	for ti, (left, right) in enumerate(
 		zip(original.get("targets", []), result.get("targets", []))
@@ -1639,7 +1648,7 @@ def _restore_unused_data(original: dict[str, Any], result: dict[str, Any]) -> di
 				)
 			if list(after) != [ident for ident in before if ident not in missing]:
 				raise ValueError("retained data declaration order changed")
-			
+
 			right[kind] = {
 				ident: before[ident] if ident in missing else after[ident]
 				for ident in before
@@ -1653,7 +1662,7 @@ def _editor_comment_ids(target: dict[str, Any]) -> frozenset:
 		target.get("comments"), dict
 	):
 		return frozenset()
-	
+
 	return frozenset(
 		cid
 		for cid, comment in target["comments"].items()
@@ -1670,7 +1679,7 @@ def _editor_position_keys(block: Any) -> tuple:
 		or block.get("parent", False) is not None
 	):
 		return ()
-	
+
 	return tuple(
 		key for key in ("x", "y") if type(block.get(key)) in (JsonNumber, int, float)
 	)
@@ -1680,7 +1689,7 @@ def _restore_editor_metadata(
 	original: dict[str, Any],
 	result: dict[str, Any],
 	strip_editor_comments: bool,
-	strip_script_positions: bool
+	strip_script_positions: bool,
 ) -> dict[str, Any]:
 	for left, right in zip(original.get("targets", []), result.get("targets", [])):
 		missing = set()
@@ -1695,7 +1704,7 @@ def _restore_editor_metadata(
 				if missing:
 					if list(after) != [cid for cid in before if cid not in missing]:
 						raise ValueError("retained comment keys or order changed")
-					
+
 					right["comments"] = {
 						cid: before[cid] if cid in missing else after[cid]
 						for cid in before
@@ -1724,7 +1733,7 @@ def _procedure_display_plans(target: dict[str, Any]) -> list:
 	blocks = target.get("blocks", {})
 	if not isinstance(blocks, dict):
 		return []
-	
+
 	candidates = []
 	allowed = {
 		"opcode",
@@ -1879,7 +1888,7 @@ def _procedure_display_plans(target: dict[str, Any]) -> list:
 
 	if not candidates:
 		return []
-	
+
 	try:
 		references, direct = Counter(), Counter()
 		for container, key in _block_slots(target):
@@ -1898,29 +1907,29 @@ def _procedure_display_plans(target: dict[str, Any]) -> list:
 def _rebuild_procedure_displays(project):
 	if not isinstance(project, dict) or not isinstance(project.get("targets"), list):
 		return project
-	
+
 	if project.get("extensionURLs") or project.get("extensionStorage"):
 		return project
-	
+
 	extensions = project.get("extensions", [])
 
 	if not isinstance(extensions, list) or any(
 		extension not in ("pen", "music") for extension in extensions
 	):
 		return project
-	
+
 	for target in project.get("targets", []):
 		if not isinstance(target, dict) or not isinstance(
 			target.get("blocks", {}), dict
 		):
 			return project
-		
+
 		if any(
 			isinstance(block, dict) and block.get("opcode") not in _DATA_PRUNING_OPCODES
 			for block in target.get("blocks", {}).values()
 		):
 			return project
-		
+
 	result = dict(project)
 	result["targets"] = []
 
@@ -1990,13 +1999,13 @@ def exact_difference(
 			result = restore_block_labels(original, result, copy_result=False)
 		except (ValueError, KeyError, TypeError) as error:
 			return f"block ID correspondence failed: {error}"
-		
+
 	if compact_procedure_symbols:
 		try:
 			result = _restore_procedure_symbols(original, result, copy_result=False)
 		except (ValueError, KeyError, TypeError, IndexError) as error:
 			return f"procedure symbol correspondence failed: {error}"
-		
+
 	if compact_reference_names:
 		result = _restore_reference_names(original, result, copy_result=False)
 
@@ -2015,7 +2024,7 @@ def exact_difference(
 			)
 		except (ValueError, KeyError, TypeError) as error:
 			return f"editor metadata verification failed: {error}"
-		
+
 	terminal = _terminal_link_ids(original) if compact_terminal_links else {}
 	stack = [((), original, result)]
 
@@ -2026,11 +2035,11 @@ def exact_difference(
 		path, left, right = stack.pop()
 		if type(left) is not type(right):
 			return mismatch("JSON value type changed")
-		
+
 		if isinstance(left, JsonNumber):
 			if _number_components(left) != _number_components(right):
 				return mismatch("exact numeric value changed")
-			
+
 		elif isinstance(left, dict):
 			block_record = is_record_order_irrelevant(path)
 
@@ -2069,7 +2078,7 @@ def exact_difference(
 							and right["fields"].get(name) == value[:1]
 						):
 							right["fields"][name] = value
-			
+
 			if (
 				compact_costume_references
 				and len(path) == 4
@@ -2105,15 +2114,15 @@ def exact_difference(
 
 			if set(left) != set(right):
 				return mismatch("object keys changed")
-			
+
 			if not block_record and list(left) != list(right):
 				return mismatch("collection order changed")
-			
+
 			stack.extend((path + (key,), left[key], right[key]) for key in left)
 		elif isinstance(left, list):
 			if len(left) != len(right):
 				return mismatch("array length changed")
-			
+
 			stack.extend(
 				(path + (index,), a, b) for index, (a, b) in enumerate(zip(left, right))
 			)
@@ -2150,7 +2159,7 @@ def _layout(project, order):
 		result["targets"] = [
 			_ordered_blocks(target, order) for target in project["targets"]
 		]
-	
+
 	return result
 
 
@@ -2190,25 +2199,25 @@ def _canonical_costume_filename(costume):
 		and fmt
 	):
 		return f"{aid}.{fmt}"
-	
+
 	return None
 
 
 def compact_representation(
 	project: dict[str, Any],
-	compact_defaults: bool =False,
-	compact_costume_references: bool =False,
-	compact_block_flags: bool =False,
-	compact_reference_names: bool =False,
-	prune_orphan_arguments: bool =False,
-	compact_procedure_symbols: bool =False,
-	compact_reporter_defaults: bool =False,
-	strip_covered_shadows: bool =False,
-	strip_editor_comments: bool =False,
-	strip_script_positions: bool =False,
-	prune_unused_data: bool =False,
-	rebuild_procedure_displays: bool =False,
-	compact_terminal_links: bool =False,
+	compact_defaults: bool = False,
+	compact_costume_references: bool = False,
+	compact_block_flags: bool = False,
+	compact_reference_names: bool = False,
+	prune_orphan_arguments: bool = False,
+	compact_procedure_symbols: bool = False,
+	compact_reporter_defaults: bool = False,
+	strip_covered_shadows: bool = False,
+	strip_editor_comments: bool = False,
+	strip_script_positions: bool = False,
+	prune_unused_data: bool = False,
+	rebuild_procedure_displays: bool = False,
+	compact_terminal_links: bool = False,
 ) -> dict[str, Any]:
 	if (
 		compact_procedure_symbols
@@ -2330,7 +2339,7 @@ def compact_representation(
 				if isinstance(costume, dict):
 					removed = set()
 					canonical = _canonical_costume_filename(costume)
-					
+
 					if canonical is not None and costume.get("md5ext") == canonical:
 						removed.add("md5ext")
 					costume = {
@@ -2351,20 +2360,20 @@ def compact_representation(
 
 def minimum_json_size(
 	project: dict[str, Any],
-	compact_defaults: bool =False,
-	compact_costume_references: bool =False,
-	compact_block_flags: bool =False,
-	relabel_block_ids: bool =False,
-	compact_reference_names: bool =False,
-	prune_orphan_arguments: bool =False,
-	compact_procedure_symbols: bool =False,
-	compact_reporter_defaults: bool =False,
-	strip_covered_shadows: bool =False,
-	strip_editor_comments: bool =False,
-	strip_script_positions: bool =False,
-	prune_unused_data: bool =False,
-	rebuild_procedure_displays: bool =False,
-	compact_terminal_links: bool =False,
+	compact_defaults: bool = False,
+	compact_costume_references: bool = False,
+	compact_block_flags: bool = False,
+	relabel_block_ids: bool = False,
+	compact_reference_names: bool = False,
+	prune_orphan_arguments: bool = False,
+	compact_procedure_symbols: bool = False,
+	compact_reporter_defaults: bool = False,
+	strip_covered_shadows: bool = False,
+	strip_editor_comments: bool = False,
+	strip_script_positions: bool = False,
+	prune_unused_data: bool = False,
+	rebuild_procedure_displays: bool = False,
+	compact_terminal_links: bool = False,
 	*,
 	_prepared=None,
 ) -> dict[str, Any]:
@@ -2397,7 +2406,7 @@ def minimum_json_size(
 				),
 			)
 	else:
-		project, identifier_cost = _prepared 
+		project, identifier_cost = _prepared
 	counts = dict(structure=0, keys=0, strings=0, numbers=0, literals=0)
 
 	@lru_cache(maxsize=65536)
@@ -2511,7 +2520,7 @@ def _input_tag(value) -> int | None:
 			and int(components[1]) in INPUT_TAGS
 			else None
 		)
-	
+
 	return value if type(value) in (int, float) and value in INPUT_TAGS else None
 
 
@@ -2608,7 +2617,7 @@ def relabel_blocks(project, *, copy_result=True):
 					raise ValueError(
 						"verified block relabeling requires string or null next/parent links"
 					)
-				
+
 			for desc in (block.get("inputs") or {}).values():
 				if (
 					not isinstance(desc, list)
@@ -2618,7 +2627,7 @@ def relabel_blocks(project, *, copy_result=True):
 					raise ValueError(
 						"verified block relabeling requires serialized SB3 input descriptors"
 					)
-				
+
 				for position in (
 					(1, 2) if _input_tag(desc[0]) == INPUT_DIFF_BLOCK_SHADOW else (1,)
 				):
@@ -2626,7 +2635,7 @@ def relabel_blocks(project, *, copy_result=True):
 						raise ValueError(
 							"verified block relabeling rejects truncated input descriptors"
 						)
-					
+
 					value = desc[position]
 					if value is not None and (
 						not isinstance(value, (str, list))
@@ -2635,7 +2644,7 @@ def relabel_blocks(project, *, copy_result=True):
 						raise ValueError(
 							"verified block relabeling rejects numeric or opaque input references"
 						)
-					
+
 		for comment in (target.get("comments") or {}).values():
 			if isinstance(comment, dict):
 				value = comment.get("blockId")
@@ -2645,11 +2654,11 @@ def relabel_blocks(project, *, copy_result=True):
 					raise ValueError(
 						"verified block relabeling requires string or null comment block IDs"
 					)
-				
+
 		ids = javascript_keys(blocks)
 		if any(key in blocks for key in ("__proto__", "constructor", "prototype")):
 			raise ValueError("cannot relabel prototype-sensitive block IDs")
-		
+
 		frequencies = {bid: 1 for bid in ids}
 		slots = list(_block_slots(target))
 		reserved = set()
@@ -2668,7 +2677,7 @@ def relabel_blocks(project, *, copy_result=True):
 			raise ValueError(
 				"block ID minimum certificate supports names of at most 3 payload bytes"
 			)
-		
+
 		maps[ti] = mapping
 		for container, key in slots:
 			container[key] = mapping.get(container[key], container[key])
@@ -2690,7 +2699,7 @@ def relabel_blocks(project, *, copy_result=True):
 def restore_block_labels(original, result, *, copy_result=True):
 	if len(original.get("targets", [])) != len(result.get("targets", [])):
 		raise ValueError("target count changed")
-	
+
 	if copy_result:
 		result = copy.deepcopy(result)
 
@@ -2700,11 +2709,11 @@ def restore_block_labels(original, result, *, copy_result=True):
 
 		if "blocks" not in left or "blocks" not in right:
 			raise ValueError("block table presence changed")
-		
+
 		a, b = left.get("blocks", {}), right.get("blocks", {})
 		if len(a) != len(b):
 			raise ValueError("block count changed")
-		
+
 		if javascript_keys(a) != javascript_keys(b) and any(
 			not bid
 			or _index_key(bid)
@@ -2723,7 +2732,7 @@ def restore_block_labels(original, result, *, copy_result=True):
 			raise ValueError(
 				"output block IDs violate editor XML or property-order contracts"
 			)
-		
+
 		inverse = dict(zip(javascript_keys(b), javascript_keys(a)))
 
 		for container, key in _block_slots(right):
@@ -2890,7 +2899,7 @@ def _specialized_layout(project, orders, level, grouping):
 		shape = frozenset(block)
 		if grouping == "shape":
 			return shape
-		
+
 		key = (shape, block.get("opcode"))
 		return (ti, key) if grouping == "target-opcode" else key
 
@@ -2979,7 +2988,7 @@ def get_zopfli(required=False):
 				"Zopfli is unavailable; install it with: python -m pip install zopfli"
 			) from None
 		return None
-	
+
 	return zopfli.zlib.compress
 
 
@@ -3229,7 +3238,7 @@ def optimize_project_json(
 		raise ValueError(
 			f"JSON encoding verification failed: {difference or 'DEFLATE mismatch'}"
 		)
-	
+
 	removed = sum(
 		len(a.get("blocks", {})) - len(b.get("blocks", {}))
 		for a, b in zip(project.get("targets", []), result.get("targets", []))
@@ -3334,7 +3343,7 @@ def read_compressed_entry(archive, info):
 	header = archive.fp.read(30)
 	if len(header) != 30 or header[:4] != b"PK\x03\x04":
 		raise ValueError(f"invalid ZIP local header: {info.filename!r}")
-	
+
 	offset = int.from_bytes(header[26:28], "little") + int.from_bytes(
 		header[28:30], "little"
 	)
@@ -3343,7 +3352,7 @@ def read_compressed_entry(archive, info):
 
 	if len(compressed) != info.compress_size:
 		raise ValueError(f"truncated ZIP entry: {info.filename!r}")
-	
+
 	return compressed
 
 
@@ -3380,7 +3389,7 @@ def optimize_asset(data, level=9, original=None, use_zopfli=False, iterations=15
 
 	if (zlib.decompress(best, -15) if method == 8 else best) != data:
 		raise ValueError("lossless asset compression verification failed")
-	
+
 	return method, best
 
 
@@ -3401,11 +3410,11 @@ class ProgressBar:
 	def _render(self, force=False):
 		if not self.enabled:
 			return
-		
+
 		now = time.monotonic()
 		if not force and now - self.last_render < 0.10:
 			return
-		
+
 		self.last_render = now
 		fraction = min(1.0, self.completed / self.total)
 		filled = int(self.width * fraction)
@@ -3480,9 +3489,8 @@ def _progress_stage_count(opts: Options) -> int:
 	count += opts.merge_duplicate_procedures
 	count += opts.specialize_procedures
 	count += opts.inline_single_use_procedures
-	count += (
-		opts.remove_unused_procedures
-		and (opts.optimize_procedure_arguments or opts.merge_duplicate_procedures)
+	count += opts.remove_unused_procedures and (
+		opts.optimize_procedure_arguments or opts.merge_duplicate_procedures
 	)
 	count += opts.remove_unused_variables or opts.remove_unused_lists
 	count += True
@@ -3767,12 +3775,12 @@ def minify_blocks(project):
 def _round_num(v):
 	if not isinstance(v, (int, float)):
 		return v
-	
+
 	if isinstance(v, float):
 		if v != v or v in (float("inf"), float("-inf")):  # NaN / inf: leave untouched
 			return v
 		return int(round(v))
-	
+
 	return v
 
 
@@ -3832,7 +3840,7 @@ _BOOLEAN_INPUTS = {
 def _boolean_input_names(block):
 	if not isinstance(block, dict):
 		return frozenset()
-	
+
 	op = block.get("opcode")
 	names = set(_BOOLEAN_INPUTS.get(op, ()))
 
@@ -3866,7 +3874,7 @@ def _scratch_numeric_tag(value):
 			return int(value)
 		except (TypeError, ValueError, OverflowError):
 			return None
-		
+
 	if type(value) is int:
 		return value
 	return None
@@ -3875,11 +3883,11 @@ def _scratch_numeric_tag(value):
 def _is_bare_literal_input(value):
 	if not (isinstance(value, list) and len(value) > 1):
 		return False
-	
+
 	tag = _scratch_numeric_tag(value[0])
 	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
 		return isinstance(value[1], list)
-	
+
 	return False
 
 
@@ -4135,22 +4143,22 @@ def describe_list_usage(use) -> tuple[str, bool]:
 		if use["replace"] and not use["add"]:
 			text += ", looks like a fixed-size array"
 		bits.append(text)
-	
+
 	if reads:
 		bits.append(
 			f"read by {reads} block{'s' if reads != 1 else ''}"
 			+ ("" if writes else ", never modified")
 		)
-	
+
 	if use["shown"] or use["showhide"]:
 		bits.append("shown on stage" if use["shown"] else "show/hide blocks")
-	
+
 	if not bits and use["other"]:
 		bits.append("referenced by other blocks")
-	
+
 	if not bits:
 		return "not referenced by any block", False
-	
+
 	return "; ".join(bits), True
 
 
@@ -4190,7 +4198,7 @@ def find_large_lists(
 					"risky": risky,
 				}
 			)
-	
+
 	found.sort(key=lambda c: (-c["bytes"], c["scope"], c["name"]))
 	return found
 
@@ -4212,15 +4220,15 @@ def parse_selection(text: str, n: int) -> set[str]:
 			if "range" in str(e):
 				raise
 			raise ValueError(f"didn't understand '{tok}'") from None
-	
+
 	if not chosen:
 		raise ValueError("no list numbers given")
-	
+
 	invalid_list_nums = sorted(i for i in chosen if not 1 <= i <= n)
-	
+
 	if invalid_list_nums:
 		raise ValueError(f"no such list number(s): {invalid_list_nums} (valid: 1-{n})")
-	
+
 	return chosen
 
 
@@ -4423,7 +4431,7 @@ def get_data_refs(project: dict[str, Any], var_owners=None, list_owners=None):
 	def add_named_refs(ti, kind, name, refs, desc):
 		if not isinstance(name, str):
 			return
-		
+
 		for owner in {ti, stage_index}:
 			for ident in named_ids.get((owner, kind, name), ()):
 				refs.setdefault((owner, ident), []).append(desc)
@@ -4433,7 +4441,7 @@ def get_data_refs(project: dict[str, Any], var_owners=None, list_owners=None):
 
 		if not isinstance(i, str):
 			return
-		
+
 		target_ids = targets[ti].get("variables", {})
 
 		if i in target_ids:
@@ -4450,7 +4458,7 @@ def get_data_refs(project: dict[str, Any], var_owners=None, list_owners=None):
 
 		if not isinstance(i, str):
 			return
-		
+
 		target_ids = targets[ti].get("lists", {})
 
 		if i in target_ids:
@@ -4622,9 +4630,7 @@ def rename_variable_list_ids(
 		set(targets[stage_index].get("lists", {})) if stage_index is not None else set()
 	)
 
-	var_refs, list_refs, _ = (
-		get_data_refs(project) if frequency_order else ({}, {}, {})
-	)
+	var_refs, list_refs, _ = get_data_refs(project) if frequency_order else ({}, {}, {})
 
 	var_map = {}
 	list_map = {}
@@ -4642,7 +4648,7 @@ def rename_variable_list_ids(
 				stage_ids,
 				key=lambda vid: (-len(var_refs.get((stage_index, vid), [])), vid),
 			)
-		
+
 		stage_new_ids = (
 			_rename_id_map(stage_ids, existing_ids=allocated_ids) if stage_ids else {}
 		)
@@ -4715,19 +4721,19 @@ def rename_variable_list_ids(
 	def resolve_var_owner(ti, i):
 		if i in original_var_ids[ti]:
 			return ti
-		
+
 		if stage_index is not None and i in stage_var_ids:
 			return stage_index
-		
+
 		return None
 
 	def resolve_list_owner(ti, i):
 		if i in original_list_ids[ti]:
 			return ti
-		
+
 		if stage_index is not None and i in stage_list_ids:
 			return stage_index
-		
+
 		return None
 
 	def rewrite_var(ti, i):
@@ -4824,13 +4830,13 @@ def _replace_broadcast_ids_in_value(value, mapping):
 			node[2] = mapping[node[2]]
 
 
-def _collect_broadcast_references(project: dict[str, Any])-> dict[str, Any]:
+def _collect_broadcast_references(project: dict[str, Any]) -> dict[str, Any]:
 	refs = {}
 
-	def add(bid: str, name: str|None = None, desc: str|None = None):
+	def add(bid: str, name: str | None = None, desc: str | None = None):
 		if not isinstance(bid, str) or not bid:
 			return
-		
+
 		entry = refs.setdefault(bid, {"names": set(), "refs": []})
 		if isinstance(name, str) and name:
 			entry["names"].add(name)
@@ -4886,7 +4892,7 @@ def _repair_dangling_broadcast_refs(project, stats):
 
 	if stage_index is None:
 		return set(), {}
-	
+
 	stage = targets[stage_index]
 	broadcasts = stage.setdefault("broadcasts", {})
 	defined = _all_broadcast_ids(project)
@@ -4962,7 +4968,7 @@ def rename_broadcast_ids(project, stats, existing_ids=(), frequency_order=False)
 def _collect_broadcast_ids_in_value(value, ids):
 	if not isinstance(value, list) or not value:
 		return
-	
+
 	if len(value) > 2 and value[0] == PRIMITIVE_BROADCAST and isinstance(value[2], str):
 		ids.add(value[2])
 	else:
@@ -4973,18 +4979,18 @@ def _collect_broadcast_ids_in_value(value, ids):
 def parse_argument_ids(mut):
 	if not isinstance(mut, dict):
 		return None
-	
+
 	raw = mut.get("argumentids")
 	if not isinstance(raw, str):
 		return None
-	
+
 	try:
 		value = json.loads(raw)
 	except (TypeError, ValueError):
 		return None
 	if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
 		return None
-	
+
 	return value
 
 
@@ -5292,7 +5298,7 @@ def rename_identifiers(
 					"procedures_call",
 				):
 					continue
-				
+
 				mutation = block.get("mutation")
 				proccode = (
 					mutation.get("proccode") if isinstance(mutation, dict) else None
@@ -5400,7 +5406,7 @@ def rename_identifiers(
 
 		if stage_index is not None and id in targets[stage_index].get(value_type, {}):
 			return (stage_index, id)
-		
+
 		return None
 
 	def variable_owner(ti, variable_id) -> tuple | None:
@@ -5426,7 +5432,7 @@ def rename_identifiers(
 					value[1] = variable_new_names[owner]
 					changed += 1
 				return
-			
+
 			if (
 				len(value) > 2
 				and value[0] == PRIMITIVE_LIST
@@ -5437,7 +5443,7 @@ def rename_identifiers(
 					value[1] = list_new_names[owner]
 					changed += 1
 				return
-			
+
 			if (
 				len(value) > 2
 				and value[0] == PRIMITIVE_BROADCAST
@@ -5447,7 +5453,7 @@ def rename_identifiers(
 					value[1] = broadcast_new_names[value[2]]
 					changed += 1
 				return
-			
+
 			for child in value:
 				if isinstance(child, (list, dict)):
 					rename_nested_names(ti, child)
@@ -5645,14 +5651,14 @@ def rename_identifiers(
 def _target_index_for_object_name(targets, object_name, stage_index):
 	if not isinstance(object_name, str):
 		return None
-	
+
 	if object_name == "_stage_":
 		return stage_index
-	
+
 	for target_index, target in enumerate(targets):
 		if target.get("name") == object_name:
 			return target_index
-		
+
 	return None
 
 
@@ -5750,7 +5756,7 @@ def _resolve_renamed_property_name(
 		for (oti, vid), oname in variable_names.items():
 			if oti == owner_ti and oname == old_name:
 				return variable_new_names.get((oti, vid))
-			
+
 		for (oti, lid), oname in list_names.items():
 			if oti == owner_ti and oname == old_name:
 				return list_new_names.get((oti, lid))
@@ -5776,23 +5782,23 @@ def _restore_identifier_names(project, renamed_names):
 	def restore_variable_owner(ti, variable_id):
 		if variable_id in (targets[ti].get("variables") or {}):
 			return (ti, variable_id)
-		
+
 		if stage_index is not None and variable_id in (
 			targets[stage_index].get("variables") or {}
 		):
 			return (stage_index, variable_id)
-		
+
 		return None
 
 	def restore_list_owner(ti, list_id):
 		if list_id in (targets[ti].get("lists") or {}):
 			return (ti, list_id)
-		
+
 		if stage_index is not None and list_id in (
 			targets[stage_index].get("lists") or {}
 		):
 			return (stage_index, list_id)
-		
+
 		return None
 
 	def restore_nested_names(ti, value):
@@ -5806,7 +5812,7 @@ def _restore_identifier_names(project, renamed_names):
 				if owner in variable_names:
 					value[1] = variable_names[owner]
 				return
-			
+
 			if (
 				len(value) > 2
 				and value[0] == PRIMITIVE_LIST
@@ -5816,7 +5822,7 @@ def _restore_identifier_names(project, renamed_names):
 				if owner in list_names:
 					value[1] = list_names[owner]
 				return
-			
+
 			if (
 				len(value) > 2
 				and value[0] == PRIMITIVE_BROADCAST
@@ -5824,7 +5830,7 @@ def _restore_identifier_names(project, renamed_names):
 			):
 				value[1] = broadcast_names[value[2]]
 				return
-			
+
 			for child in value:
 				if isinstance(child, (list, dict)):
 					restore_nested_names(ti, child)
@@ -5995,10 +6001,10 @@ def _resolve_original_property_name(
 
 		if key in variable_name_rev:
 			return variable_name_rev[key]
-		
+
 		if key in list_name_rev:
 			return list_name_rev[key]
-		
+
 	return None
 
 
@@ -6057,7 +6063,7 @@ def remove_unused_broadcasts(project, stats):
 def _is_hat(block):
 	if not isinstance(block, dict):
 		return False
-	
+
 	op = block.get("opcode", "")
 	return (
 		op.endswith("_whenflagclicked")
@@ -6203,26 +6209,26 @@ def _repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 		if len(value) <= 1:
 			return value, False
-		
+
 		ref = value[1]
 
 		if isinstance(ref, str):
 			if ref in blocks:
 				return value, False
-			
+
 			return None, True
-		
+
 		if isinstance(ref, (list, dict)):
 			fixed, changed = _repair_dangling_block_ref(ref, blocks)
 
 			if fixed is None:
 				return None, True
-			
+
 			if changed:
 				value[1] = fixed
 
 			return value, changed
-		
+
 		return value, False
 
 	if tag == INPUT_DIFF_BLOCK_SHADOW:
@@ -6234,10 +6240,10 @@ def _repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 
 					if isinstance(shadow, str) and shadow not in blocks:
 						return None, True
-					
+
 					# preserve shadow value
 					return [INPUT_SAME_BLOCK_SHADOW, shadow], True
-				
+
 				return None, True
 
 		if len(value) > 2:
@@ -6249,7 +6255,7 @@ def _repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 
 				if fixed is None:
 					return [value[0], value[1]], True
-				
+
 				if shadow_changed:
 					value[2] = fixed
 					changed = True
@@ -6276,7 +6282,7 @@ def _repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 def _is_known_orphan_argument_reporter(block, blocks) -> bool:
 	if not isinstance(block, dict):
 		return False
-	
+
 	return (
 		block.get("opcode", "").startswith("argument_reporter_")
 		and block.get("shadow") is True
@@ -6288,7 +6294,7 @@ def _is_known_orphan_argument_reporter(block, blocks) -> bool:
 def _iter_input_block_refs(value):
 	if not isinstance(value, list) or not value:
 		return
-	
+
 	tag = value[0]
 	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 		if len(value) > 1:
@@ -6310,7 +6316,9 @@ def _iter_input_block_refs(value):
 			yield from _iter_input_block_refs(item)
 
 
-def _repair_dangling_block_refs(target: dict[str, Any], preserve_comments: bool = False, preserve_refs=()):
+def _repair_dangling_block_refs(
+	target: dict[str, Any], preserve_comments: bool = False, preserve_refs=()
+):
 	blocks = target.get("blocks", {})
 	available = blocks.keys() | set(preserve_refs)
 	fixed = 0
@@ -6406,7 +6414,7 @@ def _repair_dangling_block_refs(target: dict[str, Any], preserve_comments: bool 
 
 def remove_unreachable_blocks(project, stats, stat_key="unreachable_blocks_removed"):
 	removed = 0
-	
+
 	for target in project.get("targets", []):
 		blocks = target.get("blocks", {})
 		roots = {
@@ -6453,20 +6461,20 @@ SEQUENCE_MAX_PARAMETERS = 8
 def _sequence_reporter_block(block) -> bool:
 	if not isinstance(block, dict):
 		return False
-	
+
 	op = block.get("opcode")
 	if not isinstance(op, str) or not op or block.get("next") is not None:
 		return False
-	
+
 	if op.startswith(("event_", "procedures_", "control_")):
 		return False
-	
+
 	if op.startswith(("operator_", "argument_reporter_")):
 		return True
-	
+
 	if op.startswith("sensing_"):
 		return op not in {"sensing_askandwait"}
-	
+
 	return op in {
 		"data_variable",
 		"data_itemoflist",
@@ -6491,35 +6499,35 @@ def _sequence_input_refs(value, blocks):
 def _sequence_inline_parameterizable(item) -> bool:
 	if item is None:
 		return True
-	
+
 	if not isinstance(item, list):
 		return False
-	
+
 	if len(item) == 2 and item[0] in NUMERIC_TAGS + (PRIMITIVE_TEXT,):
 		return True
-	
+
 	if len(item) >= 3 and item[0] in (
 		PRIMITIVE_BROADCAST,
 		PRIMITIVE_VARIABLE,
 		PRIMITIVE_LIST,
 	):
 		return all(isinstance(x, (str, int, float, bool, NoneType)) for x in item[1:])
-	
+
 	return False
 
 
 def _sequence_input_parameterizable(value, blocks) -> bool:
 	if not isinstance(value, list) or not value:
 		return False
-	
+
 	refs = list(_sequence_input_refs(value, blocks))
 
 	if refs:
 		return all(_sequence_reporter_block(blocks.get(ref)) for ref in refs)
-	
+
 	if value[0] in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 		return len(value) >= 2 and _sequence_inline_parameterizable(value[1])
-	
+
 	if value[0] == INPUT_DIFF_BLOCK_SHADOW:
 		if len(value) < 2:
 			return False
@@ -6529,7 +6537,7 @@ def _sequence_input_parameterizable(value, blocks) -> bool:
 			or (isinstance(item, str) and item in blocks)
 			for item in value[1:]
 		)
-	
+
 	return False
 
 
@@ -6538,7 +6546,7 @@ def _sequence_has_unsafe_nested_inputs(block, blocks) -> bool:
 		for ref in _sequence_input_refs(value, blocks):
 			if not _sequence_reporter_block(blocks.get(ref)):
 				return True
-			
+
 	return False
 
 
@@ -6547,17 +6555,17 @@ def _sequence_block_signature(
 ) -> tuple[str, str, str | None, tuple] | None:
 	if not isinstance(block, dict):
 		return None
-	
+
 	op = block.get("opcode")
 	if not isinstance(op, str) or not op:
 		return None
-	
+
 	if op.startswith(("event_", "procedures_", "argument_reporter_")):
 		return None
-	
+
 	if op in {"control_stop", "control_delete_this_clone"}:
 		return None
-	
+
 	if _sequence_has_unsafe_nested_inputs(block, blocks):
 		return None
 
@@ -6632,10 +6640,12 @@ def _collect_linear_sequence_runs(blocks) -> list[list[str]]:
 	return runs
 
 
-def _sequence_compare(base, other, blocks: dict[str, Any]) -> list[tuple[int, str]] | None:
+def _sequence_compare(
+	base, other, blocks: dict[str, Any]
+) -> list[tuple[int, str]] | None:
 	if len(base) != len(other):
 		return None
-	
+
 	diff_positions = []
 
 	for a_id, b_id in zip(base, other):
@@ -6643,22 +6653,22 @@ def _sequence_compare(base, other, blocks: dict[str, Any]) -> list[tuple[int, st
 		b = blocks.get(b_id)
 		if not isinstance(a, dict) or not isinstance(b, dict):
 			return None
-		
+
 		if a.get("opcode") != b.get("opcode"):
 			return None
-		
+
 		if (a.get("fields") or {}) != (b.get("fields") or {}):
 			return None
-		
+
 		if a.get("mutation") != b.get("mutation"):
 			return None
-		
+
 		a_inputs = a.get("inputs") or {}
 		b_inputs = b.get("inputs") or {}
 
 		if set(a_inputs) != set(b_inputs):
 			return None
-		
+
 		for name in a_inputs:
 			a_value, b_value = a_inputs[name], b_inputs[name]
 			if a_value == b_value:
@@ -6669,7 +6679,7 @@ def _sequence_compare(base, other, blocks: dict[str, Any]) -> list[tuple[int, st
 				and _sequence_input_parameterizable(b_value, blocks)
 			):
 				return None
-			
+
 			diff_positions.append((base.index(a_id), name))
 
 	return diff_positions
@@ -6720,11 +6730,11 @@ def _sequence_has_external_owner(closure, sequence, blocks, comments, graph=None
 					continue
 
 			return True
-		
+
 	for comment in comments.values():
 		if isinstance(comment, dict) and comment.get("blockId") in closure:
 			return True
-		
+
 	return False
 
 
@@ -6734,22 +6744,22 @@ def _sequence_replace_direct_ref(value, old_id, new_id):
 	def replace(node) -> bool:
 		if not isinstance(node, list) or not node:
 			return False
-		
+
 		tag = node[0]
 		if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
 			if len(node) > 1 and node[1] == old_id:
 				node[1] = new_id
 				return True
-			
+
 			return False
-		
+
 		if tag == INPUT_DIFF_BLOCK_SHADOW:
 			# [3, primary, shadow] may reference either block directly
 			for i in (1, 2):
 				if len(node) > i and node[i] == old_id:
 					node[i] = new_id
 					return True
-				
+
 			for i in (1, 2):
 				if (
 					len(node) > i
@@ -6757,20 +6767,20 @@ def _sequence_replace_direct_ref(value, old_id, new_id):
 					and replace(node[i])
 				):
 					return True
-				
+
 			return False
-		
+
 		for i in range(1, len(node)):
 			child = node[i]
 
 			if isinstance(child, (list, dict)) and replace(child):
 				return True
-			
+
 		return False
 
 	if not replace(value):
 		return None
-	
+
 	return value
 
 
@@ -6791,11 +6801,11 @@ def _sequence_clone_input(value, blocks, generated, parent_id):
 			new_id = memo[old_id]
 			generated[new_id]["parent"] = parent
 			return new_id
-		
+
 		old = blocks.get(old_id)
 		if not isinstance(old, dict):
 			return old_id
-		
+
 		new_id = _sequence_new_id(blocks, generated)
 		memo[old_id] = new_id
 		new = copy.deepcopy(old)
@@ -6806,7 +6816,7 @@ def _sequence_clone_input(value, blocks, generated, parent_id):
 
 		if new.get("next") is not None:
 			return None
-		
+
 		new["next"] = None
 		generated[new_id] = new
 
@@ -6821,7 +6831,7 @@ def _sequence_clone_input(value, blocks, generated, parent_id):
 		out = copy.deepcopy(v)
 		if not isinstance(out, list) or not out:
 			return out
-		
+
 		tag = out[0]
 
 		if (
@@ -6833,7 +6843,7 @@ def _sequence_clone_input(value, blocks, generated, parent_id):
 			new_ref = clone_block(out[1], parent)
 			if new_ref is None:
 				return None
-			
+
 			out[1] = new_ref
 
 		elif tag == INPUT_DIFF_BLOCK_SHADOW:
@@ -6845,13 +6855,13 @@ def _sequence_clone_input(value, blocks, generated, parent_id):
 					new_ref = clone_block(out[i], parent)
 					if new_ref is None:
 						return None
-					
+
 					out[i] = new_ref
 				elif isinstance(out[i], (list, dict)):
 					out[i] = clone_value(out[i], parent)
 					if out[i] is None:
 						return None
-					
+
 		return out
 
 	return clone_value(value, parent_id)
@@ -6860,19 +6870,19 @@ def _sequence_clone_input(value, blocks, generated, parent_id):
 def _sequence_default_value(value, blocks) -> str:
 	if not isinstance(value, list) or not value:
 		return ""
-	
+
 	child = value[1] if len(value) > 1 else None
 	if isinstance(child, list):
 		if len(child) == 2 and child[0] in NUMERIC_TAGS + (PRIMITIVE_TEXT,):
 			return str(child[1]) if child[1] is not None else ""
-		
+
 		if len(child) >= 3 and child[0] in (
 			PRIMITIVE_BROADCAST,
 			PRIMITIVE_VARIABLE,
 			PRIMITIVE_LIST,
 		):
 			return str(child[1]) if child[1] is not None else ""
-		
+
 	return ""
 
 
@@ -7007,7 +7017,7 @@ def _collect_similar_sequence_candidates(runs, blocks, threshold):
 	def add_candidate(group, length):
 		if len(group) < 2 or length < threshold:
 			return
-		
+
 		selected = []
 		occupied = set()
 
@@ -7025,7 +7035,7 @@ def _collect_similar_sequence_candidates(runs, blocks, threshold):
 
 		if len(selected) < 2:
 			return
-		
+
 		key = tuple(sorted(selected))
 		candidates[key] = [list(seq) for seq in selected]
 
@@ -7072,14 +7082,14 @@ def _collect_similar_sequence_candidates(runs, blocks, threshold):
 def _sequence_prepare_candidate(sequences, blocks, comments, graph, threshold):
 	if len(sequences) < 2 or any(len(seq) < threshold for seq in sequences):
 		return None
-	
+
 	if any(
 		not isinstance(bid, str) or bid not in blocks
 		for seq in sequences
 		for bid in seq
 	):
 		return None
-	
+
 	base = sequences[0]
 	if any(_sequence_compare(base, seq, blocks) is None for seq in sequences[1:]):
 		return None
@@ -7107,7 +7117,7 @@ def _sequence_prepare_candidate(sequences, blocks, comments, graph, threshold):
 		base_block = blocks.get(block_id)
 		if not isinstance(base_block, dict):
 			return None
-		
+
 		for input_name, base_value in (base_block.get("inputs") or {}).items():
 			values = [
 				(blocks[seq[index]].get("inputs") or {}).get(input_name)
@@ -7121,7 +7131,7 @@ def _sequence_prepare_candidate(sequences, blocks, comments, graph, threshold):
 				_sequence_input_parameterizable(v, blocks) for v in values
 			):
 				return None
-			
+
 			param_slots.append((index, input_name, values))
 
 	param_vectors = {}
@@ -7185,7 +7195,7 @@ def _sequence_estimate_group_savings(
 
 		if not isinstance(value, list) or not value:
 			return value
-		
+
 		tag = value[0]
 		positions = (1, 2) if tag == INPUT_DIFF_BLOCK_SHADOW else (1,)
 		if tag in INPUT_TAGS:
@@ -7344,7 +7354,7 @@ def _sequence_estimate_group_savings(
 
 			if not isinstance(old, dict) or old.get("next") is not None:
 				raise ValueError
-			
+
 			new_id = fresh_fake_id()
 			memo[old_id] = new_id
 			new = copy.deepcopy(old)
@@ -7364,7 +7374,7 @@ def _sequence_estimate_group_savings(
 			out = copy.deepcopy(item)
 			if not isinstance(out, list) or not out:
 				return out
-			
+
 			tag = out[0]
 
 			if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW) and len(out) > 1:
@@ -7442,7 +7452,7 @@ def _sequence_estimate_group_savings(
 
 		if not isinstance(root_block, dict):
 			return None
-		
+
 		parent_id = root_block.get("parent")
 		internal_parent = any(
 			other is not seq and other[-1] == root for other in sequences
@@ -7501,7 +7511,7 @@ def _sequence_projected_json_size(
 	if rename_argument_ids:
 		rename_argument_ids_fn = globals()["rename_argument_ids"]
 		rename_argument_ids_fn(projected, dummy_stats)
-		
+
 	if rename_block_ids:
 		rename_block_ids_fn = globals()["rename_block_ids"]
 		rename_block_ids_fn(projected, dummy_stats)
@@ -7959,7 +7969,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 
 				for owner_id, _preview, _old, new_value in link_changes:
 					opts.grouped_sequence_link_edits[(ti, owner_id, "next")] = new_value
-					
+
 				for (
 					owner_id,
 					input_name,
@@ -7992,23 +8002,23 @@ _PROCEDURE_EFFECTFUL_ARGUMENT_OPCODES = {
 }
 
 
-def _procedure_argument_kinds(proccode, count):
+def get_argument_kinds(proccode, count):
 	if not isinstance(proccode, str):
 		return None
-	
+
 	kinds = [token for token in proccode.split(" ") if token in ("%s", "%b")]
 	return kinds if len(kinds) == count else None
 
 
-def _remove_procedure_placeholder(proccode, argument_index):
+def remove_procedure_placeholder(proccode, argument_index):
 	if not isinstance(proccode, str):
 		return None
-	
+
 	matches = list(re.finditer(r"(?<!\S)(%s|%b)(?!\S)", proccode))
 
 	if argument_index < 0 or argument_index >= len(matches):
 		return None
-	
+
 	start, end = matches[argument_index].span()
 
 	if start > 0 and proccode[start - 1] == " ":
@@ -8026,7 +8036,7 @@ def _procedure_definition_closure(target, definition_id, graph=None):
 
 	if definition_id not in blocks or not isinstance(blocks.get(definition_id), dict):
 		return set()
-	
+
 	closure = set()
 	stack = [definition_id]
 
@@ -8043,7 +8053,7 @@ def _procedure_definition_closure(target, definition_id, graph=None):
 
 		closure.add(bid)
 		stack.extend(graph.edges.get(bid, ()))
-	
+
 	# definition closure must be owned by its definition
 	for bid in closure:
 		for parent in graph.parents.get(bid, set()):
@@ -8052,7 +8062,7 @@ def _procedure_definition_closure(target, definition_id, graph=None):
 					continue
 			elif parent not in closure:
 				return None
-	
+
 	# definition must be a top-level root or parentless
 	def_block = blocks[definition_id]
 	if def_block.get("parent") is not None:
@@ -8108,7 +8118,7 @@ def _procedure_infos(target):
 				"mutation": mut,
 			}
 		)
-	
+
 	return by_proc, graph
 
 
@@ -8121,13 +8131,13 @@ def _procedure_body_argument_uses(info, blocks):
 			arg_names = json.loads(raw_names)
 		except (TypeError, ValueError):
 			arg_names = []
-	
+
 	if not isinstance(arg_names, list) or len(arg_names) != len(info["argument_ids"]):
 		return None
-	
+
 	if len(set(x for x in arg_names if isinstance(x, str))) != len(arg_names):
 		return None
-	
+
 	name_to_index = {
 		name: i for i, name in enumerate(arg_names) if isinstance(name, str)
 	}
@@ -8161,15 +8171,17 @@ def _procedure_body_argument_uses(info, blocks):
 		idx = name_to_index[name]
 		used.add(idx)
 		reporter_ids.setdefault(idx, set()).add(bid)
-	
+
 	return used, reporter_ids, arg_names
 
 
-def _procedure_input_is_discardable(value, blocks: dict[str, Any], graph: ProjectGraph) -> bool:
+def _procedure_input_is_discardable(
+	value, blocks: dict[str, Any], graph: ProjectGraph
+) -> bool:
 	roots = _input_block_ids(value, blocks)
 	if not roots:
 		return True
-	
+
 	seen = set()
 	stack = list(roots)
 
@@ -8193,7 +8205,7 @@ def _procedure_input_is_discardable(value, blocks: dict[str, Any], graph: Projec
 		if isinstance(op, str):
 			if op.startswith(("event_", "control_")):
 				return False
-			
+
 			if op.startswith(("looks_", "sound_", "motion_", "data_")) and op not in {
 				"data_variable",
 				"data_itemoflist",
@@ -8210,13 +8222,15 @@ def _procedure_input_is_discardable(value, blocks: dict[str, Any], graph: Projec
 				"sound_volume",
 			}:
 				return False
-		
+
 		stack.extend(graph.edges.get(bid, ()))
-	
+
 	return True
 
 
-def _replace_argument_reporter_refs(value, reporter_ids, replacement) -> tuple[Any|list, bool]:
+def _replace_argument_reporter_refs(
+	value, reporter_ids, replacement
+) -> tuple[Any | list, bool]:
 	if not isinstance(value, list) or not value:
 		return value, False
 
@@ -8225,7 +8239,7 @@ def _replace_argument_reporter_refs(value, reporter_ids, replacement) -> tuple[A
 		primary = value[1] if len(value) > 1 else None
 		if isinstance(primary, str) and primary in reporter_ids:
 			return copy.deepcopy(replacement), True
-		
+
 		if isinstance(primary, list):
 			value[1], changed = _replace_argument_reporter_refs(
 				primary, reporter_ids, replacement
@@ -8233,21 +8247,21 @@ def _replace_argument_reporter_refs(value, reporter_ids, replacement) -> tuple[A
 
 			if changed:
 				return value, True
-			
+
 		if tag == INPUT_DIFF_BLOCK_SHADOW and len(value) > 2:
 			shadow = value[2]
 
 			if isinstance(shadow, str) and shadow in reporter_ids:
 				value[2] = copy.deepcopy(replacement)
 				return value, True
-			
+
 			if isinstance(shadow, list):
 				value[2], changed = _replace_argument_reporter_refs(
 					shadow, reporter_ids, replacement
 				)
 				if changed:
 					return value, True
-				
+
 		return value, False
 
 	for index in range(1, len(value)):
@@ -8258,7 +8272,7 @@ def _replace_argument_reporter_refs(value, reporter_ids, replacement) -> tuple[A
 
 			if changed:
 				return value, True
-			
+
 	return value, False
 
 
@@ -8335,14 +8349,16 @@ def _procedure_recursive_set(by_proc):
 
 			seen.add(current)
 			stack.extend(call_graph.get(current, ()))
-	
+
 	return recursive
 
 
-def _inline_argument_reporter_refs(value, reporter_ids, replacement) -> tuple[Any, bool]:
+def _inline_argument_reporter_refs(
+	value, reporter_ids, replacement
+) -> tuple[Any, bool]:
 	if not isinstance(value, list) or not value:
 		return value, False
-	
+
 	tag = value[0]
 
 	if tag in INPUT_TAGS:
@@ -8356,7 +8372,7 @@ def _inline_argument_reporter_refs(value, reporter_ids, replacement) -> tuple[An
 
 			if isinstance(item, str) and item in reporter_ids:
 				return copy.deepcopy(replacement), True
-			
+
 			if isinstance(item, (list, dict)):
 				new_item, changed = _inline_argument_reporter_refs(
 					item, reporter_ids, replacement
@@ -8367,11 +8383,11 @@ def _inline_argument_reporter_refs(value, reporter_ids, replacement) -> tuple[An
 
 					if index == 1 and _is_bare_literal_input(new_item):
 						return new_item, True
-					
+
 					return value, True
-				
+
 		return value, False
-	
+
 	for index in range(1, len(value)):
 		item = value[index]
 
@@ -8383,14 +8399,14 @@ def _inline_argument_reporter_refs(value, reporter_ids, replacement) -> tuple[An
 			if changed:
 				value[index] = new_item
 				return value, True
-			
+
 	return value, False
 
 
 def _specialized_proccode(proccode, serial):
 	if not isinstance(proccode, str):
 		return None
-	
+
 	percent_index = proccode.find("%")
 
 	if percent_index >= 0:
@@ -8399,19 +8415,24 @@ def _specialized_proccode(proccode, serial):
 		while suffix_start > 0 and proccode[suffix_start - 1].isspace():
 			suffix_start -= 1
 		return f"{prefix} !s{serial}{proccode[suffix_start:]}"
-	
+
 	return f"{proccode} !s{serial}"
 
 
 def _clone_procedure_closure(
-	target: dict[str, Any], info, specialized_proccode, constant_replacements, stats, opts
+	target: dict[str, Any],
+	info,
+	specialized_proccode,
+	constant_replacements,
+	stats,
+	opts,
 ):
 	blocks = target.get("blocks") or {}
 	closure = set(info["closure"])
 
 	if not closure:
 		return None
-	
+
 	graph = ProjectGraph(target)
 	comments = target.get("comments") or {}
 
@@ -8426,7 +8447,7 @@ def _clone_procedure_closure(
 
 		if not isinstance(block, dict):
 			return None
-		
+
 		nxt = block.get("next")
 		parent = block.get("parent")
 
@@ -8435,7 +8456,7 @@ def _clone_procedure_closure(
 
 		if isinstance(parent, str) and parent not in closure:
 			return None
-		
+
 		for raw in (block.get("inputs") or {}).values():
 			if any(ref not in closure for ref in _iter_input_block_refs(raw)):
 				return None
@@ -8444,12 +8465,12 @@ def _clone_procedure_closure(
 	new_ids = {}
 
 	for old_id in old_ids:
-		new_id = new_id()
+		new_bid = new_id()
 
-		while new_id in blocks or new_id in new_ids.values():
-			new_id = new_id()
+		while new_bid in blocks or new_bid in new_ids.values():
+			new_bid = new_id()
 
-		new_ids[old_id] = new_id
+		new_ids[old_id] = new_bid
 
 	clones = {}
 
@@ -8484,7 +8505,7 @@ def _clone_procedure_closure(
 
 	if not isinstance(prototype_mutation, dict):
 		return None
-	
+
 	prototype_mutation["proccode"] = specialized_proccode
 
 	body_info = dict(info)
@@ -8534,7 +8555,7 @@ def _clone_procedure_closure(
 
 				if changed:
 					block.setdefault("inputs", {})[name] = new_raw
-		
+
 		still_referenced = False
 		for block_id, block in clones.items():
 			if not isinstance(block, dict):
@@ -8547,10 +8568,10 @@ def _clone_procedure_closure(
 			):
 				still_referenced = True
 				break
-		
+
 		if still_referenced:
 			return None
-		
+
 		for reporter_id in cloned_reporters:
 			clones.pop(reporter_id, None)
 
@@ -8564,7 +8585,7 @@ def _clone_procedure_closure(
 			ref = block.get(key)
 			if isinstance(ref, str) and ref not in clones and ref not in (None,):
 				return None
-			
+
 		for raw in (block.get("inputs") or {}).values():
 			refs = set(_iter_input_block_refs(raw))
 			if any(ref not in clones for ref in refs):
@@ -8649,9 +8670,7 @@ def specialize_procedures(project, stats, opts):
 				body_info["closure"] = (
 					set(info["closure"]) - prototype_owned - {info["definition_id"]}
 				)
-				used, _, _ = _procedure_body_argument_uses(
-					body_info, blocks
-				)
+				used, _, _ = _procedure_body_argument_uses(body_info, blocks)
 
 				if used is None or not used:
 					continue
@@ -8679,13 +8698,13 @@ def specialize_procedures(project, stats, opts):
 							continue
 
 						signature_items.append((idx, literal[0], literal[1]))
-						replacement, _ = _constant_to_scratch_input(
+						replacement, _ = constant_to_input(
 							literal, blocks, None
 						)
 
 						if replacement is not None:
 							replacement_constants[idx] = replacement
-							
+
 					if not signature_items:
 						continue
 
@@ -8743,7 +8762,7 @@ def specialize_procedures(project, stats, opts):
 
 					if cloned is None:
 						continue
-					
+
 					(
 						clones,
 						id_map,
@@ -8755,13 +8774,13 @@ def specialize_procedures(project, stats, opts):
 					def estimated_variant_block(block_id, block):
 						if not isinstance(block, dict):
 							return block
-						
+
 						if not getattr(opts, "rename_procedure_names", False):
 							return block
-						
+
 						if block_id != new_prototype_id:
 							return block
-						
+
 						probe = copy.deepcopy(block)
 						mutation = probe.get("mutation")
 
@@ -8881,7 +8900,7 @@ def specialize_procedures(project, stats, opts):
 
 		if not changed_this_pass:
 			break
-		
+
 		completed_passes += 1
 
 	stats["procedure_specialized"] += total_variants
@@ -9103,7 +9122,7 @@ def inline_single_use_procedures(project, stats, opts):
 							can_inline = False
 							break
 
-						replacement, _ = _constant_to_scratch_input(
+						replacement, _ = constant_to_input(
 							literal, blocks, None
 						)
 
@@ -9261,12 +9280,12 @@ def _clear_procedure_definition_shadow(target, proto_id):
 
 	if not isinstance(proto, dict):
 		return False
-	
+
 	parent = blocks.get(proto.get("parent"))
 
 	if not isinstance(parent, dict):
 		return False
-	
+
 	inputs = parent.get("inputs") or {}
 	custom = inputs.get("custom_block")
 
@@ -9276,10 +9295,10 @@ def _clear_procedure_definition_shadow(target, proto_id):
 		or _scratch_numeric_tag(custom[0]) != INPUT_DIFF_BLOCK_SHADOW
 	):
 		return False
-	
+
 	if len(custom) < 2 or custom[1] != proto_id:
 		return False
-	
+
 	custom[:] = [INPUT_BLOCK_NO_SHADOW, proto_id]
 	return True
 
@@ -9289,7 +9308,7 @@ def clear_procedure_definition_shadows(project, stats, opts):
 
 	for target in project.get("targets", []):
 		blocks = target.get("blocks") or {}
-		
+
 		for proto_id, proto in list(blocks.items()):
 			if (
 				not isinstance(proto, dict)
@@ -9415,7 +9434,7 @@ def optimize_procedure_arguments(project, stats, opts):
 
 			base_ids = infos[0]["argument_ids"]
 			base_mut = infos[0]["mutation"]
-			kinds = _procedure_argument_kinds(proc, len(base_ids))
+			kinds = get_argument_kinds(proc, len(base_ids))
 
 			if kinds is None:
 				continue
@@ -9578,7 +9597,7 @@ def optimize_procedure_arguments(project, stats, opts):
 				new_proc = proc
 
 				for idx in sorted(removed_set, reverse=True):
-					new_proc = _remove_procedure_placeholder(new_proc, idx)
+					new_proc = remove_procedure_placeholder(new_proc, idx)
 
 					if new_proc is None:
 						break
@@ -9613,7 +9632,7 @@ def optimize_procedure_arguments(project, stats, opts):
 					if not reporters:
 						continue
 
-					replacement, _ = _constant_to_scratch_input(literal, blocks, None)
+					replacement, _ = constant_to_input(literal, blocks, None)
 
 					if replacement is None:
 						continue
@@ -9664,7 +9683,7 @@ def optimize_procedure_arguments(project, stats, opts):
 				new_proc = proc
 
 				for idx in sorted(removed_set, reverse=True):
-					new_proc = _remove_procedure_placeholder(new_proc, idx)
+					new_proc = remove_procedure_placeholder(new_proc, idx)
 
 					if new_proc is None:
 						break
@@ -9792,21 +9811,21 @@ def _canonicalize_procedure(target, info, graph=None, procedure_aliases=None):
 	def canonical_proc_reference(proccode):
 		if not isinstance(proccode, str):
 			return proccode
-		
+
 		alias = procedure_aliases.get(proccode, proccode)
 		return "@SELF" if alias == self_proc else f"@PROC:{alias}"
 
 	def canonical_proccode_signature(proccode, argument_count):
 		if not isinstance(proccode, str):
 			return None
-		
+
 		kinds = tuple(re.findall(r"(?<!\S)(%s|%b)(?!\S)", proccode))
 		return kinds if len(kinds) == argument_count else None
 
 	def canonical_input(value, arg_id_map=None):
 		if not isinstance(value, list) or not value:
 			return value
-		
+
 		tag = value[0]
 		out = copy.deepcopy(value)
 
@@ -9837,7 +9856,7 @@ def _canonicalize_procedure(target, info, graph=None, procedure_aliases=None):
 
 		if not isinstance(mut, dict):
 			return None
-		
+
 		out = {}
 		argids = parse_argument_ids(mut)
 
@@ -9934,7 +9953,7 @@ def _procedure_merge_safe(target, info, graph, commented):
 
 	if closure & commented:
 		return False
-	
+
 	return not any(
 		any(parent not in closure for parent in graph.parents.get(bid, set()))
 		for bid in closure
@@ -9951,7 +9970,7 @@ def _rewrite_procedure_call_to_canonical(call, canonical_proc, canonical_ids):
 		or len(old_ids) != len(canonical_ids)
 	):
 		return False
-	
+
 	inputs = call.get("inputs") or {}
 	new_inputs = {}
 
@@ -10230,26 +10249,26 @@ def normalize_numbers(project, stats, epsilon):
 
 		if isinstance(v, bool):
 			return v
-		
+
 		if isinstance(v, float):
 			if math.isnan(v) or math.isinf(v):
 				return v
-			
+
 			if v.is_integer() and not (v == 0 and str(v).startswith("-")):
 				changed += 1
 				return int(v)
-			
+
 			if round(v) != 0 and abs(v - round(v)) < epsilon:
 				changed += 1
 				return round(v)
-				
+
 			return v
 		if isinstance(v, list):
 			return [rec(x) for x in v]
-		
+
 		if isinstance(v, dict):
 			return {k: rec(x) for k, x in v.items()}
-		
+
 		return v
 
 	for i, target in enumerate(project.get("targets", [])):
@@ -10303,10 +10322,10 @@ def _encode_wav_to_mp3(wav_bytes):
 		)
 	except (OSError, subprocess.TimeoutExpired):
 		return None
-	
+
 	if proc.returncode != 0 or not proc.stdout:
 		return None
-	
+
 	return proc.stdout
 
 
@@ -10428,11 +10447,11 @@ def deduplicate_assets(project, assets, stats):
 		buckets.setdefault(key, []).append(name)
 
 	mapping = {}
-	
+
 	for names in buckets.values():
 		if len(names) < 2:
 			continue
-		
+
 		canonical = min(names, key=lambda n: (-referenced.get(n, 0), n))
 		for duplicate in sorted(names):
 			if duplicate != canonical:
@@ -10503,7 +10522,7 @@ def compact_mutation_hasnext(project, stats):
 
 def compact_mutation_metadata(project, stats):
 	count = 0
-	
+
 	for target in project.get("targets", []):
 		for block in target.get("blocks", {}).values():
 			if not isinstance(block, dict):
@@ -10541,44 +10560,44 @@ def _resolve_variable_owner(project, ti, variable_id):
 
 	if not isinstance(variable_id, str):
 		return None
-	
+
 	if 0 <= ti < len(targets) and variable_id in (targets[ti].get("variables") or {}):
 		return (ti, variable_id)
-	
+
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
 	if stage_index is not None and variable_id in (
 		targets[stage_index].get("variables") or {}
 	):
 		return (stage_index, variable_id)
-	
+
 	return None
 
 
 def _variable_literal(value):
 	if isinstance(value, bool):
 		return None
-	
+
 	if isinstance(value, (int, float)):
 		if isinstance(value, float) and not math.isfinite(value):
 			return None
-		
+
 		return [PRIMITIVE_NUMBER, value]
-	
+
 	if isinstance(value, str):
 		return [PRIMITIVE_TEXT, value]
-	
+
 	return None
 
 
 def _is_literal_value(value):
 	if not (isinstance(value, list) and len(value) == 2 and value[0] == 1):
 		return False
-	
+
 	literal = value[1]
 
 	if not isinstance(literal, list) or len(literal) != 2:
 		return False
-	
+
 	tag, raw = literal
 
 	if tag in NUMERIC_TAGS:
@@ -10587,7 +10606,7 @@ def _is_literal_value(value):
 			and isinstance(raw, (str, int, float))
 			and (not isinstance(raw, float) or math.isfinite(raw))
 		)
-	
+
 	return tag == PRIMITIVE_TEXT and isinstance(raw, str)
 
 
@@ -10611,7 +10630,7 @@ def _find_constant_variables(project):
 				for child in value.values():
 					scan_input(child, ti)
 			return
-		
+
 		if (
 			value[0] == PRIMITIVE_VARIABLE
 			and len(value) > 2
@@ -10730,9 +10749,9 @@ def _replace_constant_variable_reporters(value, ti, selected, project, stats) ->
 				)
 
 			return changed
-		
+
 		return 0
-	
+
 	changed = 0
 
 	if value[0] == PRIMITIVE_VARIABLE and len(value) > 2 and isinstance(value[2], str):
@@ -10746,7 +10765,7 @@ def _replace_constant_variable_reporters(value, ti, selected, project, stats) ->
 			stats["constant_variable_reporters"] += 1
 			stats["constant_variable_bytes_saved"] += before - after
 			return 1
-		
+
 	for child in value:
 		if isinstance(child, (list, dict)):
 			changed += _replace_constant_variable_reporters(
@@ -10759,7 +10778,7 @@ def _replace_constant_variable_reporters(value, ti, selected, project, stats) ->
 def fold_constant_variables(project, selected, stats) -> int:
 	if not selected:
 		return 0
-	
+
 	selected_map = {(ti, vid): literal for (ti, vid), literal in selected.items()}
 	changed = 0
 
@@ -10782,7 +10801,7 @@ def fold_constant_variables(project, selected, stats) -> int:
 def _literal_storage_equal(literal, initial) -> bool:
 	if not (isinstance(literal, list) and len(literal) == 2):
 		return False
-	
+
 	tag, raw = literal
 
 	if tag in NUMERIC_TAGS:
@@ -10795,10 +10814,10 @@ def _literal_storage_equal(literal, initial) -> bool:
 			and math.isfinite(float(initial))
 			and float(raw) == float(initial)
 		)
-	
+
 	if tag == PRIMITIVE_TEXT:
 		return isinstance(raw, str) and isinstance(initial, str) and raw == initial
-	
+
 	return False
 
 
@@ -10807,7 +10826,7 @@ def _setter_matches_initial(block, initial) -> bool:
 
 	if not _is_literal_value(value):
 		return False
-	
+
 	return _literal_storage_equal(value[1], initial)
 
 
@@ -10920,10 +10939,10 @@ def remove_constant_variable_setters(project, setters, stats, opts):
 def _to_scratch_number(val) -> float:
 	if isinstance(val, bool):
 		return 1.0 * val
-	
+
 	if isinstance(val, (int, float)):
 		return float(val)
-	
+
 	if isinstance(val, str):
 		text = val.strip()
 		if not text:
@@ -10949,56 +10968,56 @@ def _to_scratch_number(val) -> float:
 					return float(int(digits, base))
 				except (ValueError, OverflowError):
 					return 0.0
-				
+
 		try:
 			num = float(text)
 		except (ValueError, OverflowError, TypeError):
 			return 0.0
-		
+
 		return 0.0 if math.isnan(num) else num
-	
+
 	return 0.0
 
 
 def _to_scratch_bool(val) -> bool:
 	if isinstance(val, bool):
 		return val
-	
+
 	if isinstance(val, str):
 		if val == "" or val == "0" or val.lower() == "false":
 			return False
-		
+
 		return True
-	
+
 	if isinstance(val, (int, float)):
 		return val != 0 and not (isinstance(val, float) and math.isnan(val))
-	
+
 	return bool(val)
 
 
 def _scratch_string(val) -> str:
 	if isinstance(val, bool):
 		return str(val).lower()
-	
+
 	if isinstance(val, str):
 		return val
-	
+
 	if isinstance(val, (int, float)):
 		if isinstance(val, float):
 			if math.isnan(val):
 				return "NaN"
-			
+
 			if math.isinf(val):
 				return "Infinity" if val > 0 else "-Infinity"
-			
+
 			if val == 0:
 				return "0"
-			
+
 			if val.is_integer():
 				return str(int(val))
-			
+
 		return str(val)
-	
+
 	return str(val)
 
 
@@ -11006,28 +11025,28 @@ def _constant(kind, value) -> tuple:
 	return (kind, value)
 
 
-def _constant_to_number(value):
+def constant_to_number(value):
 	if value is None:
 		return None
-	
+
 	kind, raw = value
 
 	if kind == "number":
 		return float(raw)
-	
+
 	if kind == "bool":
 		return 1.0 if raw else 0.0
-	
+
 	if kind == "string":
 		return _to_scratch_number(raw)
-	
+
 	return None
 
 
 def _constant_to_bool(value):
 	if value is None:
 		return None
-	
+
 	kind, raw = value
 	return _to_scratch_bool(raw)
 
@@ -11035,15 +11054,15 @@ def _constant_to_bool(value):
 def _constant_to_string(value):
 	if value is None:
 		return None
-	
+
 	return _scratch_string(value[1])
 
 
 def _scratch_compare(left, right):
 	left_raw = left[1]
 	right_raw = right[1]
-	n1 = _constant_to_number(left)
-	n2 = _constant_to_number(right)
+	n1 = constant_to_number(left)
+	n2 = constant_to_number(right)
 
 	if n1 == 0 and isinstance(left_raw, str) and left_raw.strip() == "":
 		n1 = float("nan")
@@ -11054,22 +11073,22 @@ def _scratch_compare(left, right):
 		s1 = _scratch_string(left).lower()
 		s2 = _scratch_string(right).lower()
 		return (s1 > s2) - (s1 < s2)
-	
+
 	if (math.isinf(n1) or math.isinf(n2)) and n1 == n2:
 		return 0
-	
+
 	return (n1 > n2) - (n1 < n2)
 
 
 def _scratch_mod(a, b):
 	if b == 0:
 		return None
-	
+
 	try:
 		result = math.fmod(a, b)
 	except (ValueError, OverflowError, ZeroDivisionError):
 		return None
-	
+
 	if result / b < 0:
 		result += b
 	return result
@@ -11078,7 +11097,7 @@ def _scratch_mod(a, b):
 def _scratch_round(n):
 	if not math.isfinite(n):
 		return None
-	
+
 	result = math.floor(n + 0.5)
 	return float(result)
 
@@ -11090,26 +11109,26 @@ def _utf16_length(text):
 def _utf16_char_at(text, index):
 	if index < 0:
 		return ""
-	
+
 	data = text.encode("utf-16-le", "surrogatepass")
 	start = index * 2
 
 	if start >= len(data):
 		return ""
-	
+
 	return data[start : start + 2].decode("utf-16-le", "surrogatepass")
 
 
 def _folded_literal_input(value):
 	if not (isinstance(value, list) and len(value) > 1 and value[0] in INPUT_TAGS):
 		return None
-	
+
 	child = value[1]
 
 	if value[0] == INPUT_DIFF_BLOCK_SHADOW and isinstance(child, str):
 		# block reference
 		return None
-	
+
 	if isinstance(child, list) and len(child) == 2:
 		tag, raw = child
 		if (
@@ -11122,17 +11141,17 @@ def _folded_literal_input(value):
 				# Scratch keeps the raw text, so compare/join must see the string
 				return _constant("string", raw)
 			return _constant("number", num)
-		
+
 		if tag == PRIMITIVE_TEXT and isinstance(raw, str):
 			return _constant("string", raw)
-		
+
 	return None
 
 
-def _constant_expression_from_input(value, blocks, visiting=frozenset()):
+def constexpr_from_input(value, blocks, visiting=frozenset()):
 	if not (isinstance(value, list) and len(value) > 1):
 		return None
-	
+
 	if value[0] in INPUT_TAGS:
 		child = value[1]
 	else:
@@ -11141,17 +11160,17 @@ def _constant_expression_from_input(value, blocks, visiting=frozenset()):
 	literal = _folded_literal_input(value)
 	if literal is not None:
 		return literal, set()
-	
+
 	if isinstance(child, str):
 		return _constant_expression_block(child, blocks, visiting)
-	
+
 	return None
 
 
 def _constant_expression_block(block_id, blocks, visiting):
 	if block_id in visiting:
 		return None
-	
+
 	block = blocks.get(block_id)
 	if not isinstance(block, dict):
 		return None
@@ -11164,7 +11183,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 	current_visiting = visiting | {block_id}
 
 	def get_in(name):
-		return _constant_expression_from_input(
+		return constexpr_from_input(
 			inputs.get(name), blocks, current_visiting
 		)
 
@@ -11174,7 +11193,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 			if operand is None:
 				return None
-			
+
 			res = not _constant_to_bool(operand[0])
 			return _constant("bool", res), operand[1] | {block_id}
 		case "operator_and" | "operator_or":
@@ -11182,20 +11201,20 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 			if left is None:
 				return None
-			
+
 			left_bool = _constant_to_bool(left[0])
 
 			if operation == "operator_and" and not left_bool:
 				return _constant("bool", False), left[1] | {block_id}
-			
+
 			if operation == "operator_or" and left_bool:
 				return _constant("bool", True), left[1] | {block_id}
-			
+
 			right = get_in("OPERAND2")
 
 			if right is None:
 				return None
-			
+
 			result = (
 				left_bool and _constant_to_bool(right[0])
 				if operation == "operator_and"
@@ -11225,7 +11244,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 			if left is None or right is None:
 				return None
-			
+
 			return _constant(
 				"string", _constant_to_string(left[0]) + _constant_to_string(right[0])
 			), left[1] | right[1] | {block_id}
@@ -11235,12 +11254,12 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 			if letter is None or string is None:
 				return None
-			
-			n = _constant_to_number(letter[0])
-			
+
+			n = constant_to_number(letter[0])
+
 			if n is None or not math.isfinite(n):
 				return None
-			
+
 			index = math.trunc(n) - 1
 			text = _constant_to_string(string[0])
 			return _constant("string", _utf16_char_at(text, index)), letter[1] | string[
@@ -11251,7 +11270,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 			if operand is None:
 				return None
-			
+
 			text = _constant_to_string(operand[0])
 			return _constant("number", _utf16_length(text)), operand[1] | {block_id}
 		case "operator_contains":
@@ -11260,7 +11279,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 			if left is None or right is None:
 				return None
-			
+
 			return _constant(
 				"bool",
 				_constant_to_string(right[0]).lower()
@@ -11271,29 +11290,29 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 			if operand is None:
 				return None
-			
-			n = _constant_to_number(operand[0])
+
+			n = constant_to_number(operand[0])
 
 			if n is None:
 				return None
-			
+
 			result = _scratch_round(n)
 
 			if result is None:
 				return None
-			
+
 			return _constant("number", result), operand[1] | {block_id}
 		case "operator_mathop":
 			operand = get_in("NUM")
 
 			if operand is None:
 				return None
-			
-			num = _constant_to_number(operand[0])
+
+			num = constant_to_number(operand[0])
 
 			if num is None:
 				return None
-			
+
 			operator_field = (block.get("fields") or {}).get("OPERATOR")
 			op_name = (
 				operator_field[0]
@@ -11305,7 +11324,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 			if op_name is None:
 				return None
-			
+
 			op_name = op_name.lower()
 			try:
 				match op_name:
@@ -11356,10 +11375,10 @@ def _constant_expression_block(block_id, blocks, visiting):
 						return None
 			except (ValueError, OverflowError, ZeroDivisionError):
 				return None
-			
+
 			if not math.isfinite(res):
 				return None
-			
+
 			return _constant("number", res), operand[1] | {block_id}
 
 	# binary operators
@@ -11368,13 +11387,13 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 	if left is None or right is None:
 		return None
-	
-	left_num = _constant_to_number(left[0])
-	right_num = _constant_to_number(right[0])
+
+	left_num = constant_to_number(left[0])
+	right_num = constant_to_number(right[0])
 
 	if left_num is None or right_num is None:
 		return None
-	
+
 	try:
 		match operation:
 			case "operator_add":
@@ -11395,10 +11414,10 @@ def _constant_expression_block(block_id, blocks, visiting):
 				return None
 	except (OverflowError, ValueError, ZeroDivisionError):
 		return None
-	
+
 	if not math.isfinite(result):
 		return None
-	
+
 	return _constant("number", result), left[1] | right[1] | {block_id}
 
 
@@ -11407,7 +11426,7 @@ def _input_block_ids(value, blocks):
 
 
 def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
-	roots = _direct_input_block_refs(value, blocks)
+	roots = direct_input_block_refs(value, blocks)
 
 	if not roots:
 		return set()
@@ -11433,7 +11452,7 @@ def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
 
 		if block.get("topLevel") is True:
 			return None
-		
+
 		stack.extend(graph.edges.get(bid, ()))
 
 	for bid in candidate:
@@ -11442,10 +11461,10 @@ def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
 		if bid in roots:
 			if any(owner_id != owner for owner in owners):
 				return None
-			
+
 			if owner_id not in owners:
 				return None
-			
+
 		else:
 			if any(owner not in candidate for owner in owners):
 				return None
@@ -11454,7 +11473,7 @@ def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
 
 
 def _reparent_serialized_input(value, blocks, parent_id):
-	for bid in _direct_input_block_refs(value, blocks):
+	for bid in direct_input_block_refs(value, blocks):
 		block = blocks.get(bid)
 		if isinstance(block, dict):
 			block["parent"] = parent_id
@@ -11463,16 +11482,16 @@ def _reparent_serialized_input(value, blocks, parent_id):
 def _sequence_primary_input_block_id(value, blocks):
 	if not (isinstance(value, list) and value):
 		return None
-	
+
 	if len(value) > 1:
 		ref = value[1]
 
 		if isinstance(ref, str) and ref in blocks:
 			return ref
-		
+
 		if isinstance(ref, (list, dict)):
 			return _sequence_primary_input_block_id(ref, blocks)
-		
+
 	return None
 
 
@@ -11485,7 +11504,7 @@ def _variable_reporter_id(value, blocks):
 	if tag == PRIMITIVE_VARIABLE:
 		if len(value) > 2 and isinstance(value[2], str) and value[2]:
 			return value[2]
-		
+
 		return None
 
 	if tag not in INPUT_TAGS or len(value) <= 1:
@@ -11495,7 +11514,7 @@ def _variable_reporter_id(value, blocks):
 
 	if isinstance(primary, list):
 		return _variable_reporter_id(primary, blocks)
-	
+
 	if not isinstance(primary, str):
 		return None
 
@@ -11503,7 +11522,7 @@ def _variable_reporter_id(value, blocks):
 
 	if not isinstance(block, dict) or block.get("opcode") != "data_variable":
 		return None
-	
+
 	field = (block.get("fields") or {}).get("VARIABLE")
 
 	if (
@@ -11707,7 +11726,7 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 	return total
 
 
-def _subtree_block_ids(raw, blocks):
+def get_subtree_block_ids(raw, blocks):
 	out = set()
 	stack = list(_input_block_ids(raw, blocks))
 
@@ -11764,21 +11783,19 @@ def _expand_removed_closure(ids, blocks, keep=frozenset()):
 	return out
 
 
-def _simplify_boolean_identity_input(
-	value, blocks, parent_id=None, incoming_refs=None, graph=None
-):
+def _short_circuit(value, blocks, parent_id=None, incoming_refs=None, graph=None):
 	if not (
 		isinstance(value, list)
 		and len(value) > 1
 		and value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
-	
+
 	block_id = value[1]
 
 	if not isinstance(block_id, str) or block_id not in blocks:
 		return None
-	
+
 	block = blocks.get(block_id)
 
 	if not isinstance(block, dict) or block.get("opcode") not in (
@@ -11794,8 +11811,8 @@ def _simplify_boolean_identity_input(
 	if left_raw is None or right_raw is None:
 		return None
 
-	left = _constant_expression_from_input(left_raw, blocks)
-	right = _constant_expression_from_input(right_raw, blocks)
+	left = constexpr_from_input(left_raw, blocks)
+	right = constexpr_from_input(right_raw, blocks)
 	left_bool = _constant_to_bool(left[0]) if left is not None else None
 	right_bool = _constant_to_bool(right[0]) if right is not None else None
 	removed_base = {block_id}
@@ -11803,7 +11820,7 @@ def _simplify_boolean_identity_input(
 
 	def discard(raw, constant_result, constant_ids):
 		dead_ids = (
-			_exclusive_input_block_subtree_fast(
+			get_exclusive_input_subtree(
 				raw, blocks, block_id, incoming_refs, graph=graph
 			)
 			if graph is not None and incoming_refs is not None
@@ -11812,8 +11829,8 @@ def _simplify_boolean_identity_input(
 
 		if dead_ids is None:
 			return None
-		
-		replacement, _ = _constant_to_scratch_input(
+
+		replacement, _ = constant_to_input(
 			_constant("bool", constant_result), blocks, parent_id or block_id
 		)
 		return replacement, _expand_removed_closure(
@@ -11822,18 +11839,18 @@ def _simplify_boolean_identity_input(
 
 	def preserve(raw, constant_ids):
 		owned_ids = (
-			_exclusive_input_block_subtree_fast(
+			get_exclusive_input_subtree(
 				raw, blocks, block_id, incoming_refs, graph=graph
 			)
 			if graph is not None and incoming_refs is not None
 			else _exclusive_input_block_subtree(raw, blocks, block_id)
 		)
-		
+
 		if owned_ids is None:
 			return None
-		
+
 		return copy.deepcopy(raw), _expand_removed_closure(
-			removed_base | constant_ids, blocks, keep=_subtree_block_ids(raw, blocks)
+			removed_base | constant_ids, blocks, keep=get_subtree_block_ids(raw, blocks)
 		)
 
 	if operator == "operator_and":
@@ -11864,7 +11881,237 @@ def _simplify_boolean_identity_input(
 	return None
 
 
-def _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
+def remap_block_input(owner_value, block_id):
+	if (
+		isinstance(owner_value, list)
+		and owner_value[0] == INPUT_DIFF_BLOCK_SHADOW
+		and len(owner_value) > 2
+	):
+		return [INPUT_DIFF_BLOCK_SHADOW, block_id, copy.deepcopy(owner_value[2])]
+
+	return [INPUT_BLOCK_NO_SHADOW, block_id]
+
+
+def get_block_parts(raw, blocks, opcode=None):
+	block_id = raw[1]
+	if block_id is None:
+		return None
+
+	block = blocks[block_id]
+	op = block.get("opcode")
+	if op not in ("operator_and", "operator_or") or (
+		opcode is not None and op != opcode
+	):
+		return None
+
+	if block.get("next") is not None:
+		return None
+
+	inputs = block.get("inputs") or {}
+	left, right = inputs.get("OPERAND1"), inputs.get("OPERAND2")
+	if left is None or right is None:
+		return None
+
+	return block_id, block, left, right
+
+
+def _simplify_boolean_identities(
+	value, blocks, parent_id=None, incoming_refs=None, graph=None, slot_is_boolean=False
+):
+	if not (
+		isinstance(value, list)
+		and len(value) > 1
+		and value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
+	):
+		return None
+
+	block_id: str = value[1]
+
+	if not isinstance(block_id, str) or block_id not in blocks:
+		return None
+
+	block: dict = blocks.get(block_id)
+
+	if not isinstance(block, dict) or block.get("opcode") not in (
+		"operator_and",
+		"operator_or",
+	):
+		return None
+
+	inputs: dict = block.get("inputs") or {}
+	left_raw: list = inputs.get("OPERAND1")
+	right_raw: list = inputs.get("OPERAND2")
+
+	if left_raw is None or right_raw is None:
+		return None
+
+	closure: set|None = get_exclusive_input_subtree(
+		value, blocks, parent_id, incoming_refs, graph=graph
+	)
+
+	if closure is None or block_id not in closure:
+		return None
+
+	if not condition_is_pure(value, blocks, graph):
+		return None
+
+	dual: str = "operator_and" if block["opcode"] == "operator_or" else "operator_or"
+	closures: dict = {}
+
+	def closure_of(raw) -> set:
+		key: int = id(raw)
+		if key not in closures:
+			closures[key] = get_subtree_block_ids(raw, blocks)
+		return closures[key]
+
+	def same(a, b) -> bool:
+		return _branch_factor_value_equal(
+			a, b, blocks, closure_of(a), closure_of(b), {}, set()
+		)
+
+	def keepable(raw) -> bool:
+		return slot_is_boolean or value_is_boolean(raw, blocks)
+
+	def replace_with(law, kept_raw) -> dict[str, Any]:
+		removed = closure - closure_of(kept_raw)
+		if block_id not in removed or not removed:
+			return None
+
+		return {
+			"law": law,
+			"replacement": remap_block_input(value, kept_raw[1]),
+			"removed": removed,
+			"touched": set(removed),
+		}
+
+	# idempotent law: A op A -> A
+	if keepable(left_raw) and same(left_raw, right_raw):
+		plan = replace_with("idempotent", left_raw)
+		if plan is not None:
+			return plan
+
+	# absorption law: A op (A dual B) -> A
+	for kept, other in ((left_raw, right_raw), (right_raw, left_raw)):
+		parts = get_block_parts(other, blocks, dual)
+		if parts is None or not keepable(kept):
+			continue
+
+		if same(kept, parts[2]) or same(kept, parts[3]):
+			plan = replace_with("absorption", kept)
+			if plan is not None:
+				return plan
+
+	# factoring: (A dual B) op (A dual C) -> A dual (B op C)
+	left_parts = get_block_parts(left_raw, blocks, dual)
+	right_parts = get_block_parts(right_raw, blocks, dual)
+
+	if left_parts is None or right_parts is None:
+		return None
+
+	if block.get("parent") != parent_id:
+		return None
+
+	l_id, r_id = left_parts[0], right_parts[0]
+	l_ops = (left_parts[2], left_parts[3])
+	r_ops = (right_parts[2], right_parts[3])
+
+	for i in (0, 1):
+		for j in (0, 1):
+			if l_ops[i][1] is None or not same(l_ops[i], r_ops[j]):
+				continue
+
+			removed = {r_id} | closure_of(r_ops[j])
+
+			return {
+				"law": "factoring",
+				"outer_id": l_id,
+				"inner_id": block_id,
+				"outer_inputs": {
+					"OPERAND1": copy.deepcopy(l_ops[i]),
+					"OPERAND2": [INPUT_BLOCK_NO_SHADOW, block_id],
+				},
+				"inner_inputs": {
+					"OPERAND1": copy.deepcopy(l_ops[1 - i]),
+					"OPERAND2": copy.deepcopy(r_ops[1 - j]),
+				},
+				"owner_input": remap_block_input(value, l_id),
+				"old_parent": block.get("parent"),
+				"removed": removed,
+				"touched": removed | {block_id, l_id},
+			}
+
+	return None
+
+
+def _apply_boolean_law_plan(
+	plan, blocks, graph, owner_id, input_name, ti, opts, stats, commented_ids
+) -> bool:
+	if fold_blocked_by_comment(plan["touched"], blocks, commented_ids):
+		return False
+
+	owner = blocks.get(owner_id)
+	owner_inputs = owner.get("inputs") if isinstance(owner, dict) else None
+
+	if not isinstance(owner_inputs, dict) or input_name not in owner_inputs:
+		return False
+
+	link_edits = opts.folded_constant_expression_link_edits
+	input_edits = opts.folded_constant_expression_inputs
+	removed = plan["removed"]
+
+	def set_parent(child_id, parent_id) -> None:
+		child = blocks.get(child_id)
+
+		if isinstance(child, dict) and child.get("parent") != parent_id:
+			child["parent"] = parent_id
+			link_edits[(ti, child_id, "parent")] = parent_id
+
+	if plan["law"] != "factoring":
+		new_input = copy.deepcopy(plan["replacement"])
+
+		for child_id in _input_block_ids(new_input, blocks):
+			set_parent(child_id, owner_id)
+
+		owner_inputs[input_name] = new_input
+		input_edits[(ti, owner_id, input_name)] = copy.deepcopy(new_input)
+		changed_ids = (owner_id, *removed)
+	else:
+		outer_id, inner_id = plan["outer_id"], plan["inner_id"]
+		outer, inner = blocks[outer_id], blocks[inner_id]
+
+		for target, key in ((outer, "outer_inputs"), (inner, "inner_inputs")):
+			target_inputs = target.get("inputs") or {}
+			target_id = outer_id if target is outer else inner_id
+
+			for name, raw in plan[key].items():
+				target_inputs[name] = copy.deepcopy(raw)
+				input_edits[(ti, target_id, name)] = copy.deepcopy(raw)
+
+			target["inputs"] = target_inputs
+
+			for raw in plan[key].values():
+				for child_id in _input_block_ids(raw, blocks):
+					if child_id not in removed:
+						set_parent(child_id, target_id)
+
+		set_parent(outer_id, plan["old_parent"])
+		set_parent(inner_id, outer_id)
+
+		owner_inputs[input_name] = copy.deepcopy(plan["owner_input"])
+		input_edits[(ti, owner_id, input_name)] = copy.deepcopy(plan["owner_input"])
+		changed_ids = (owner_id, outer_id, inner_id, *removed)
+
+	opts.folded_constant_expression_blocks[ti].update(removed)
+ 
+	for remove_id in removed:
+		blocks.pop(remove_id, None)
+
+	graph.refresh_blocks(changed_ids)
+	stats["boolean_" + plan["law"]] += 1
+	return True
+
+
+def fold_blocked_by_comment(folded_ids, blocks, commented_ids) -> bool:
 	return any(
 		bid in commented_ids
 		or (isinstance(blocks.get(bid), dict) and "comment" in blocks[bid])
@@ -11872,10 +12119,10 @@ def _fold_blocked_by_comment(folded_ids, blocks, commented_ids):
 	)
 
 
-def _direct_input_block_refs(value, blocks) -> tuple:
+def direct_input_block_refs(value, blocks) -> tuple:
 	if not isinstance(value, list) or not value:
 		return ()
-	
+
 	refs = []
 
 	if value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW) and len(value) > 1:
@@ -11893,13 +12140,13 @@ def _direct_input_block_refs(value, blocks) -> tuple:
 	return tuple(refs)
 
 
-def _exclusive_input_block_subtree_fast(
+def get_exclusive_input_subtree(
 	value, blocks, owner_id, incoming_refs, graph=None
 ):
 	if graph is None:
 		graph = ProjectGraph({"blocks": blocks})
 
-	roots = _direct_input_block_refs(value, blocks)
+	roots = direct_input_block_refs(value, blocks)
 
 	if not roots:
 		return set()
@@ -11917,10 +12164,10 @@ def _exclusive_input_block_subtree_fast(
 
 		if not isinstance(block, dict) or block.get("topLevel") is True:
 			return None
-		
+
 		if incoming_refs.get(bid, 0) != 1:
 			return None
-		
+
 		candidate.add(bid)
 		stack.extend(graph.edges.get(bid, ()))
 
@@ -11933,11 +12180,11 @@ def _exclusive_input_block_subtree_fast(
 				return None
 		elif not owners or not owners <= candidate:
 			return None
-		
+
 	return candidate
 
 
-def _constant_to_scratch_input(constant, blocks, parent_id):
+def constant_to_input(constant, blocks, parent_id) -> tuple[list|None, set]:
 	kind, value = constant
 
 	if kind == "number":
@@ -11945,10 +12192,10 @@ def _constant_to_scratch_input(constant, blocks, parent_id):
 			int(value) if isinstance(value, float) and value.is_integer() else value
 		)
 		return [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_NUMBER, number]], set()
-	
+
 	if kind == "string":
 		return [INPUT_SAME_BLOCK_SHADOW, [PRIMITIVE_TEXT, value]], set()
-	
+
 	if kind == "bool":
 		return [
 			INPUT_SAME_BLOCK_SHADOW,
@@ -11957,7 +12204,7 @@ def _constant_to_scratch_input(constant, blocks, parent_id):
 	return None, set()
 
 
-def _fold_ids_have_external_refs(folded_ids, blocks, owner_id, graph=None):
+def _fold_ids_have_external_refs(folded_ids, blocks, owner_id, graph=None) -> bool:
 	folded_ids = set(folded_ids)
 
 	if graph is None:
@@ -11967,7 +12214,7 @@ def _fold_ids_have_external_refs(folded_ids, blocks, owner_id, graph=None):
 		for owner in graph.parents.get(bid, ()):
 			if owner != owner_id and owner not in folded_ids:
 				return True
-			
+
 	return False
 
 
@@ -11993,10 +12240,10 @@ def _demorgan_boolean_input(
 
 	if owner_id is None or incoming_refs is None:
 		return None
-	
+
 	if owner_id == logic_id or logic.get("parent") != owner_id:
 		return None
-	
+
 	if incoming_refs.get(logic_id, 0) != 1:
 		return None
 
@@ -12021,7 +12268,7 @@ def _demorgan_boolean_input(
 		or right_not_id in (logic_id, owner_id)
 	):
 		return None
-	
+
 	if (
 		incoming_refs.get(left_not_id, 0) != 1
 		or incoming_refs.get(right_not_id, 0) != 1
@@ -12038,14 +12285,14 @@ def _demorgan_boolean_input(
 		and right_not.get("opcode") == "operator_not"
 	):
 		return None
-	
+
 	if (
 		logic.get("next") is not None
 		or left_not.get("next") is not None
 		or right_not.get("next") is not None
 	):
 		return None
-	
+
 	if left_not.get("parent") != logic_id or right_not.get("parent") != logic_id:
 		return None
 
@@ -12060,10 +12307,10 @@ def _demorgan_boolean_input(
 	):
 		return None
 
-	left_owned = _exclusive_input_block_subtree_fast(
+	left_owned = get_exclusive_input_subtree(
 		left_operand, blocks, left_not_id, incoming_refs, graph=graph
 	)
-	right_owned = _exclusive_input_block_subtree_fast(
+	right_owned = get_exclusive_input_subtree(
 		right_operand, blocks, right_not_id, incoming_refs, graph=graph
 	)
 
@@ -12075,7 +12322,7 @@ def _demorgan_boolean_input(
 
 	if left_root and left_root == right_root:
 		return None
-	
+
 	for root in (left_root, right_root):
 		if root in (logic_id, left_not_id, right_not_id, owner_id):
 			return None
@@ -12146,11 +12393,11 @@ FINITE_NUMERIC_REPORTER_OPCODES = {
 }
 
 
-def _value_is_definitely_numeric(value, blocks, visiting=frozenset()):
-	constant = _constant_expression_from_input(value, blocks, visiting)
+def value_is_numeric(value, blocks, visiting=frozenset()):
+	constant = constexpr_from_input(value, blocks, visiting)
 	if constant is not None:
 		return constant[0][0] in ("number", "bool")
-	
+
 	if not (isinstance(value, list) and len(value) > 1):
 		return False
 
@@ -12158,17 +12405,17 @@ def _value_is_definitely_numeric(value, blocks, visiting=frozenset()):
 
 	if not isinstance(child, str) or child in visiting:
 		return False
-	
+
 	block = blocks.get(child)
 	return isinstance(block, dict) and block.get("opcode") in NUMERIC_REPORTER_OPCODES
 
 
-def _value_is_definitely_finite_numeric(value, blocks, visiting=frozenset()):
-	constant = _constant_expression_from_input(value, blocks, visiting)
+def value_is_finite(value, blocks, visiting=frozenset()):
+	constant = constexpr_from_input(value, blocks, visiting)
 	if constant is not None and constant[0][0] in ("number", "bool"):
-		number = _constant_to_number(constant[0])
+		number = constant_to_number(constant[0])
 		return number is not None and math.isfinite(number)
-	
+
 	if not (isinstance(value, list) and len(value) > 1):
 		return False
 
@@ -12176,7 +12423,7 @@ def _value_is_definitely_finite_numeric(value, blocks, visiting=frozenset()):
 
 	if not isinstance(child, str) or child in visiting:
 		return False
-	
+
 	block = blocks.get(child)
 	return (
 		isinstance(block, dict)
@@ -12184,23 +12431,23 @@ def _value_is_definitely_finite_numeric(value, blocks, visiting=frozenset()):
 	)
 
 
-def _value_is_definitely_boolean(value, blocks, visiting=frozenset()):
-	constant = _constant_expression_from_input(value, blocks, visiting)
+def value_is_boolean(value, blocks, visiting=frozenset()):
+	constant = constexpr_from_input(value, blocks, visiting)
 	if constant is not None:
 		return constant[0][0] == "bool"
 
 	if not (isinstance(value, list) and len(value) > 1):
 		return False
-	
+
 	child = value[1]
 	if not isinstance(child, str) or child in visiting:
 		return False
-	
+
 	block = blocks.get(child)
 
 	if not isinstance(block, dict):
 		return False
-	
+
 	op = block.get("opcode")
 	return op in BOOLEAN_REPORTER_OPCODES or op == "argument_reporter_boolean"
 
@@ -12214,15 +12461,15 @@ def _simplify_double_boolean_negation(
 		and value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
-	
+
 	outer_id = value[1]
 	if not isinstance(outer_id, str) or outer_id == owner_id:
 		return None
-	
+
 	outer = blocks.get(outer_id)
 	if not isinstance(outer, dict) or outer.get("opcode") != "operator_not":
 		return None
-	
+
 	inner_raw = (outer.get("inputs") or {}).get("OPERAND")
 
 	if not (
@@ -12231,7 +12478,7 @@ def _simplify_double_boolean_negation(
 		and inner_raw[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
-	
+
 	inner_id = inner_raw[1]
 	if not isinstance(inner_id, str) or inner_id in (owner_id, outer_id):
 		return None
@@ -12239,30 +12486,30 @@ def _simplify_double_boolean_negation(
 	inner = blocks.get(inner_id)
 	if not isinstance(inner, dict) or inner.get("opcode") != "operator_not":
 		return None
-	
+
 	operand = (inner.get("inputs") or {}).get("OPERAND")
 	if operand is None:
 		return None
-	
+
 	if not (
 		_is_boolean_slot(blocks.get(owner_id), input_name)
-		or _value_is_definitely_boolean(operand, blocks)
+		or value_is_boolean(operand, blocks)
 	):
 		return None
-	
-	closure = _exclusive_input_block_subtree_fast(
+
+	closure = get_exclusive_input_subtree(
 		value, blocks, owner_id, incoming_refs, graph=graph
 	)
 
 	if closure is None or outer_id not in closure or inner_id not in closure:
 		return None
 
-	preserved_ids = _subtree_block_ids(operand, blocks)
+	preserved_ids = get_subtree_block_ids(operand, blocks)
 	removed = closure - preserved_ids
 
 	if owner_id in removed or not removed:
 		return None
-	
+
 	return copy.deepcopy(operand), removed
 
 
@@ -12295,43 +12542,43 @@ def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 	if left_raw is None or right_raw is None:
 		return None
 
-	left = _constant_expression_from_input(left_raw, blocks)
-	right = _constant_expression_from_input(right_raw, blocks)
-	left_num = _constant_to_number(left[0]) if left is not None else None
-	right_num = _constant_to_number(right[0]) if right is not None else None
+	left = constexpr_from_input(left_raw, blocks)
+	right = constexpr_from_input(right_raw, blocks)
+	left_num = constant_to_number(left[0]) if left is not None else None
+	right_num = constant_to_number(right[0]) if right is not None else None
 	preserve = None
 	dead_side = None
 
 	if op == "operator_add":
-		if left_num == 0 and _value_is_definitely_numeric(right_raw, blocks):
+		if left_num == 0 and value_is_numeric(right_raw, blocks):
 			preserve, dead_side = right_raw, left
-		elif right_num == 0 and _value_is_definitely_numeric(left_raw, blocks):
+		elif right_num == 0 and value_is_numeric(left_raw, blocks):
 			preserve, dead_side = left_raw, right
 	elif op == "operator_subtract":
-		if right_num == 0 and _value_is_definitely_numeric(left_raw, blocks):
+		if right_num == 0 and value_is_numeric(left_raw, blocks):
 			preserve, dead_side = left_raw, right
 	elif op == "operator_multiply":
-		if left_num == 1 and _value_is_definitely_numeric(right_raw, blocks):
+		if left_num == 1 and value_is_numeric(right_raw, blocks):
 			preserve, dead_side = right_raw, left
-		elif left_num == 0 and _value_is_definitely_finite_numeric(right_raw, blocks):
+		elif left_num == 0 and value_is_finite(right_raw, blocks):
 			preserve, dead_side = [
 				INPUT_SAME_BLOCK_SHADOW,
 				[PRIMITIVE_NUMBER, 0],
 			], value
-		elif right_num == 1 and _value_is_definitely_numeric(left_raw, blocks):
+		elif right_num == 1 and value_is_numeric(left_raw, blocks):
 			preserve, dead_side = left_raw, right
-		elif right_num == 0 and _value_is_definitely_finite_numeric(left_raw, blocks):
+		elif right_num == 0 and value_is_finite(left_raw, blocks):
 			preserve, dead_side = [
 				INPUT_SAME_BLOCK_SHADOW,
 				[PRIMITIVE_NUMBER, 0],
 			], value
 	elif op == "operator_divide":
-		if right_num == 1 and _value_is_definitely_numeric(left_raw, blocks):
+		if right_num == 1 and value_is_numeric(left_raw, blocks):
 			preserve, dead_side = left_raw, right
 	elif op == "operator_mod":
 		if (
 			right_num == 1
-			and _value_is_definitely_numeric(left_raw, blocks)
+			and value_is_numeric(left_raw, blocks)
 			and left_num is not None
 		):
 			preserve, dead_side = [
@@ -12342,16 +12589,16 @@ def _simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 	if preserve is None:
 		return None
 
-	closure = _exclusive_input_block_subtree_fast(
+	closure = get_exclusive_input_subtree(
 		value, blocks, owner_id, incoming_refs, graph=graph
 	)
 	if closure is None or block_id not in closure:
 		return None
 
-	removed = closure - _subtree_block_ids(preserve, blocks)
+	removed = closure - get_subtree_block_ids(preserve, blocks)
 	if owner_id in removed or not removed:
 		return None
-	if dead_side is not None and not (_subtree_block_ids(dead_side, blocks) <= removed):
+	if dead_side is not None and not (get_subtree_block_ids(dead_side, blocks) <= removed):
 		return None
 	return copy.deepcopy(preserve), removed
 
@@ -12463,7 +12710,7 @@ def _substack_closure(value, blocks, owner_id, incoming_refs, graph):
 	root = _control_substack(value, blocks)
 	if root is None:
 		return set(), None
-	closure = _exclusive_input_block_subtree_fast(
+	closure = get_exclusive_input_subtree(
 		value, blocks, owner_id, incoming_refs, graph=graph
 	)
 	if closure is None or root not in closure:
@@ -12499,16 +12746,16 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 	inputs = control.get("inputs") or {}
 	condition_name = "TIMES" if opcode == "control_repeat" else "CONDITION"
 	condition_raw = inputs.get(condition_name)
-	constant = _constant_expression_from_input(condition_raw, blocks)
+	constant = constexpr_from_input(condition_raw, blocks)
 	if constant is None:
 		return None
 
 	if opcode == "control_repeat":
-		n = _constant_to_number(constant[0])
+		n = constant_to_number(constant[0])
 		if n is None or not math.isfinite(n) or n not in (0, 1):
 			return None
 		condition_closure = (
-			_exclusive_input_block_subtree_fast(
+			get_exclusive_input_subtree(
 				condition_raw, blocks, control_id, incoming_refs, graph=graph
 			)
 			if condition_raw is not None
@@ -12522,7 +12769,7 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 		if not _constant_to_bool(constant[0]):
 			return None
 		condition_closure = (
-			_exclusive_input_block_subtree_fast(
+			get_exclusive_input_subtree(
 				condition_raw, blocks, control_id, incoming_refs, graph=graph
 			)
 			if condition_raw is not None
@@ -12536,7 +12783,7 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 		if not _constant_to_bool(constant[0]):
 			return None
 		condition_closure = (
-			_exclusive_input_block_subtree_fast(
+			get_exclusive_input_subtree(
 				condition_raw, blocks, control_id, incoming_refs, graph=graph
 			)
 			if condition_raw is not None
@@ -12548,7 +12795,7 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 		dead_raws = [inputs.get("SUBSTACK")]
 	else:
 		condition_closure = (
-			_exclusive_input_block_subtree_fast(
+			get_exclusive_input_subtree(
 				condition_raw, blocks, control_id, incoming_refs, graph=graph
 			)
 			if condition_raw is not None
@@ -12579,7 +12826,7 @@ def _constant_control_plan(blocks, control_id, incoming_refs, graph):
 	for raw in dead_raws:
 		if raw is None:
 			continue
-		dead_closure = _exclusive_input_block_subtree_fast(
+		dead_closure = get_exclusive_input_subtree(
 			raw, blocks, control_id, incoming_refs, graph=graph
 		)
 		if dead_closure is None:
@@ -12694,7 +12941,7 @@ def simplify_boolean_controls(project, stats, opts, only_repeat_one=False):
 				if plan is None:
 					continue
 				removed = set(plan["removed"])
-				if _fold_blocked_by_comment(removed, blocks, commented_ids):
+				if fold_blocked_by_comment(removed, blocks, commented_ids):
 					continue
 
 				owner_id = plan["owner_id"]
@@ -12793,7 +13040,7 @@ def _script_input_root(value, blocks):
 	return ref if isinstance(ref, str) and ref in blocks else None
 
 
-def _script_condition_is_pure(value, blocks, graph):
+def condition_is_pure(value, blocks, graph):
 	seen = set()
 	stack = list(_input_block_ids(value, blocks))
 	while stack:
@@ -12897,17 +13144,17 @@ def _script_plan_unwrap_not(raw, blocks, owner_id, incoming_refs, graph):
 	operand = (not_block.get("inputs") or {}).get("OPERAND")
 	if operand is None or _is_bare_literal_input(operand):
 		return None
-	owned = _exclusive_input_block_subtree_fast(
+	owned = get_exclusive_input_subtree(
 		raw, blocks, owner_id, incoming_refs, graph=graph
 	)
 	if owned is None or not_id not in owned:
 		return None
-	operand_owned = _exclusive_input_block_subtree_fast(
+	operand_owned = get_exclusive_input_subtree(
 		operand, blocks, not_id, incoming_refs, graph=graph
 	)
 	if operand_owned is None:
 		return None
-	moved_roots = _direct_input_block_refs(operand, blocks)
+	moved_roots = direct_input_block_refs(operand, blocks)
 	if any(
 		(not isinstance(blocks.get(ref), dict)) or blocks[ref].get("parent") != not_id
 		for ref in moved_roots
@@ -12961,14 +13208,14 @@ def _script_plan_empty_then(blocks, control_id, incoming_refs, graph, commented)
 			"moved_ids": moved_ids,
 			"else_raw": copy.deepcopy(else_raw),
 		}
-	owned = _exclusive_input_block_subtree_fast(
+	owned = get_exclusive_input_subtree(
 		condition, blocks, control_id, incoming_refs, graph=graph
 	)
 	if owned is None or owned & commented:
 		return None
-	new_id = new_id()
-	while new_id in blocks:
-		new_id = new_id()
+	new_bid = new_id()
+	while new_bid in blocks:
+		new_bid = new_id()
 	new_block = {
 		"opcode": "operator_not",
 		"next": None,
@@ -12978,7 +13225,7 @@ def _script_plan_empty_then(blocks, control_id, incoming_refs, graph, commented)
 	}
 	return {
 		"mode": "wrap",
-		"new_id": new_id,
+		"new_id": new_bid,
 		"new_block": new_block,
 		"condition_owned": owned,
 		"else_raw": copy.deepcopy(else_raw),
@@ -13027,22 +13274,22 @@ def _script_plan_nested_if(blocks, outer_id, incoming_refs, graph, commented):
 	if body_closure is None:
 		return None
 	condition_b = inner_inputs.get("CONDITION")
-	if not _script_condition_is_pure(condition_b, blocks, graph):
+	if not condition_is_pure(condition_b, blocks, graph):
 		return None
 	condition_a = outer_inputs.get("CONDITION")
-	outer_owned = _exclusive_input_block_subtree_fast(
+	outer_owned = get_exclusive_input_subtree(
 		condition_a, blocks, outer_id, incoming_refs, graph=graph
 	)
-	inner_owned = _exclusive_input_block_subtree_fast(
+	inner_owned = get_exclusive_input_subtree(
 		condition_b, blocks, inner_id, incoming_refs, graph=graph
 	)
 	if outer_owned is None or inner_owned is None:
 		return None
 	if ({inner_id} | outer_owned | inner_owned) & commented:
 		return None
-	new_id = new_id()
-	while new_id in blocks:
-		new_id = new_id()
+	new_bid: str = new_id()
+	while new_bid in blocks:
+		new_bid = new_id()
 	new_block = {
 		"opcode": "operator_and",
 		"next": None,
@@ -13056,7 +13303,7 @@ def _script_plan_nested_if(blocks, outer_id, incoming_refs, graph, commented):
 	return {
 		"outer_id": outer_id,
 		"inner_id": inner_id,
-		"new_id": new_id,
+		"new_id": new_bid,
 		"new_block": new_block,
 		"body_raw": copy.deepcopy(body_raw),
 		"body_root": body_root,
@@ -13094,7 +13341,7 @@ def _branch_factor_segment_closure(blocks, sequence, graph):
 		if not isinstance(block, dict):
 			continue
 		for value in (block.get("inputs") or {}).values():
-			stack.extend(_direct_input_block_refs(value, blocks))
+			stack.extend(direct_input_block_refs(value, blocks))
 	while stack:
 		bid = stack.pop()
 		if bid in closure or bid not in blocks:
@@ -13339,7 +13586,7 @@ def _branch_factor_plan(target, control_id, graph, commented):
 	if prefix_len == len(then_sequence) == len(else_sequence):
 		keep_closure = _branch_factor_segment_closure(blocks, then_sequence, graph)
 		remove_closure = _branch_factor_segment_closure(blocks, else_sequence, graph)
-		condition_closure = _exclusive_input_block_subtree_fast(
+		condition_closure = get_exclusive_input_subtree(
 			inputs.get("CONDITION"), blocks, control_id, incoming, graph=graph
 		)
 		if condition_closure is None:
@@ -13625,7 +13872,7 @@ def simplify_script_structures(project, stats, opts) -> int:
 								opts.script_rewrite_link_edits[
 									(ti, moved, "parent")
 								] = bid
-						
+
 						for n in ("CONDITION", "SUBSTACK", "SUBSTACK2"):
 							opts.script_rewrite_input_edits[(ti, bid, n)] = (
 								copy.deepcopy(inputs[n])
@@ -13635,7 +13882,7 @@ def simplify_script_structures(project, stats, opts) -> int:
 
 						for dead in plan["removed"]:
 							blocks.pop(dead, None)
-						
+
 						graph.refresh_blocks((bid, *plan["removed"]))
 						stats["branch_swaps"] += 1
 						changed = True
@@ -13675,7 +13922,7 @@ def simplify_script_structures(project, stats, opts) -> int:
 										(ti, moved, "parent")
 									] = bid
 						else:
-							for ref in _direct_input_block_refs(
+							for ref in direct_input_block_refs(
 								plan["new_block"]["inputs"]["OPERAND"], blocks
 							):
 								if isinstance(blocks.get(ref), dict):
@@ -13692,7 +13939,9 @@ def simplify_script_structures(project, stats, opts) -> int:
 						for dead in plan["removed"]:
 							blocks.pop(dead, None)
 
-						graph.refresh_blocks((bid, plan.get("new_id"), *plan["removed"]))
+						graph.refresh_blocks(
+							(bid, plan.get("new_id"), *plan["removed"])
+						)
 						stats["empty_then_rewrites"] += 1
 						changed = True
 						break
@@ -13736,7 +13985,7 @@ def simplify_script_structures(project, stats, opts) -> int:
 						new_id = plan["new_id"]
 
 						for input_name in ("OPERAND1", "OPERAND2"):
-							for ref in _direct_input_block_refs(
+							for ref in direct_input_block_refs(
 								plan["new_block"]["inputs"][input_name], blocks
 							):
 								if isinstance(blocks.get(ref), dict):
@@ -13744,7 +13993,7 @@ def simplify_script_structures(project, stats, opts) -> int:
 									opts.script_rewrite_link_edits[
 										(ti, ref, "parent")
 									] = new_id
-						
+
 						blocks[new_id] = plan["new_block"]
 						outer.setdefault("inputs", {})["CONDITION"] = [
 							INPUT_BLOCK_NO_SHADOW,
@@ -13808,12 +14057,12 @@ def plan_associations(blocks, outer_id, graph, commented):
 	outer = blocks.get(outer_id)
 	if not isinstance(outer, dict) or outer.get("next") is not None:
 		return None
-	
+
 	op = outer.get("opcode")
 
 	if op not in OPERATOR_INPUTS.keys():
 		return None
-	
+
 	left_name = OPERATOR_INPUTS[op] + "1"
 	right_name = OPERATOR_INPUTS[op] + "2"
 	outer_left = (outer.get("inputs") or {}).get(left_name)
@@ -13827,32 +14076,32 @@ def plan_associations(blocks, outer_id, graph, commented):
 		or inner.get("next") is not None
 	):
 		return None
-	
+
 	inner_inputs = inner.get("inputs") or {}
 	inner_left = inner_inputs.get(left_name)
 	inner_right = inner_inputs.get(right_name)
-	c1 = _constant_expression_from_input(inner_right, blocks)
-	c2 = _constant_expression_from_input(outer_right, blocks)
+	c1 = constexpr_from_input(inner_right, blocks)
+	c2 = constexpr_from_input(outer_right, blocks)
 
 	if inner_left is None or c1 is None or c2 is None:
 		return None
-	
-	owned = _exclusive_input_block_subtree_fast(
+
+	owned = get_exclusive_input_subtree(
 		outer_left, blocks, outer_id, graph.incoming, graph=graph
 	)
-	
+
 	if owned is None:
 		return None
-	
-	survivor_owned = _exclusive_input_block_subtree_fast(
+
+	survivor_owned = get_exclusive_input_subtree(
 		inner_left, blocks, inner_id, graph.incoming, graph=graph
 	)
-	
+
 	if survivor_owned is None or inner_id not in owned or not survivor_owned <= owned:
 		return None
-	
+
 	removed = owned - survivor_owned
-	
+
 	if removed & commented:
 		return None
 
@@ -13864,8 +14113,8 @@ def plan_associations(blocks, outer_id, graph, commented):
 		)
 
 	elif op in ("operator_add", "operator_multiply"):
-		a = _constant_to_number(c1[0])
-		b = _constant_to_number(c2[0])
+		a = constant_to_number(c1[0])
+		b = constant_to_number(c2[0])
 
 		if a is None or b is None:
 			return None
@@ -13886,12 +14135,12 @@ def plan_associations(blocks, outer_id, graph, commented):
 
 		value = a and b if op == "operator_and" else a or b
 		combined = _constant("bool", value)
-	
-	new_const, _ = _constant_to_scratch_input(combined, blocks, outer_id)
-	
+
+	new_const, _ = constant_to_input(combined, blocks, outer_id)
+
 	if new_const is None:
 		return None
-	
+
 	return {
 		"inner_id": inner_id,
 		"base": copy.deepcopy(inner_left),
@@ -13907,13 +14156,15 @@ def merge_associative_constants(project, stats, opts: Options):
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks: dict = target.get("blocks") or {}
 		graph = ProjectGraph(target)
-		commented:set = get_comment_ids(target)
+		commented: set = get_comment_ids(target)
 
 		while True:
 			changed: bool = False
 
 			for bid in list(blocks):
-				plan: dict[str, Any] | None = plan_associations(blocks, bid, graph, commented)
+				plan: dict[str, Any] | None = plan_associations(
+					blocks, bid, graph, commented
+				)
 				if plan is None:
 					continue
 
@@ -13922,7 +14173,7 @@ def merge_associative_constants(project, stats, opts: Options):
 				name = OPERATOR_INPUTS[opcode] + "1"
 				name2 = OPERATOR_INPUTS[opcode] + "2"
 
-				for ref in _direct_input_block_refs(plan["base"], blocks):
+				for ref in direct_input_block_refs(plan["base"], blocks):
 					if isinstance(blocks.get(ref), dict):
 						blocks[ref]["parent"] = bid
 						opts.script_rewrite_link_edits[(ti, ref, "parent")] = bid
@@ -13941,7 +14192,7 @@ def merge_associative_constants(project, stats, opts: Options):
 
 				record_removed_blocks(opts, ti, plan["removed"])
 				graph.refresh_after_mutation(
-					changed={bid} | set(_direct_input_block_refs(plan["base"], blocks)),
+					changed={bid} | set(direct_input_block_refs(plan["base"], blocks)),
 					removed=set(plan["removed"]),
 				)
 				stats["associative_constant_merges"] += 1
@@ -13974,7 +14225,7 @@ def _replace_known_reads(
 	ti,
 	opts,
 	graph,
-	allow_literal: bool =True,
+	allow_literal: bool = True,
 	visiting=frozenset(),
 ):
 	if not isinstance(value, list) or not value:
@@ -14000,7 +14251,7 @@ def _replace_known_reads(
 		if isinstance(child, dict) and child.get("opcode") == "data_variable":
 			vid = _get_var_id(child)
 			if allow_literal and vid in env and child.get("parent") == owner_id:
-				owned = _exclusive_input_block_subtree_fast(
+				owned = get_exclusive_input_subtree(
 					value, blocks, owner_id, graph.incoming, graph=graph
 				)
 				if owned == {ref}:
@@ -14021,7 +14272,7 @@ def _replace_known_reads(
 				"procedures_definition",
 			}
 		):
-			owned = _exclusive_input_block_subtree_fast(
+			owned = get_exclusive_input_subtree(
 				value,
 				blocks,
 				owner_id,
@@ -14094,7 +14345,7 @@ def _replace_known_reads(
 			if c:
 				if i == 1 and _is_bare_literal_input(new):
 					return new, True, removed | dead
-				
+
 				value[i] = new
 				changed = True
 			removed |= dead
@@ -14127,7 +14378,7 @@ def get_cfg_statement_roots(blocks) -> list:
 def get_cfg_tail(blocks, root) -> str | None:
 	if not isinstance(root, str) or root not in blocks:
 		return None
-	
+
 	current = root
 	seen = set()
 
@@ -14136,11 +14387,11 @@ def get_cfg_tail(blocks, root) -> str | None:
 		block = blocks.get(current)
 		if not isinstance(block, dict):
 			return None
-		
+
 		nxt = block.get("next")
 		if not isinstance(nxt, str) or nxt not in blocks:
 			return current
-		
+
 		current = nxt
 
 	return None
@@ -14155,15 +14406,15 @@ def cfg_may_fall_through(blocks, block_id, memo=None, active=None) -> bool:
 
 	if block_id in memo:
 		return memo[block_id]
-	
+
 	if block_id in active:
 		return True
-	
+
 	block = blocks.get(block_id)
 	if not isinstance(block, dict):
 		memo[block_id] = False
 		return False
-	
+
 	op = block.get("opcode", "")
 	if op == "control_stop":
 		field = (block.get("fields") or {}).get("STOP_OPTION")
@@ -14175,7 +14426,7 @@ def cfg_may_fall_through(blocks, block_id, memo=None, active=None) -> bool:
 		result = option == "other scripts in sprite"
 		memo[block_id] = result
 		return result
-	
+
 	if op in {
 		"control_forever",
 		"control_stop_all",
@@ -14222,11 +14473,11 @@ def cfg_may_fall_through(blocks, block_id, memo=None, active=None) -> bool:
 def cfg_substack_may_fall_through(blocks, root, memo=None, active=None) -> bool:
 	if root is None:
 		return True
-	
+
 	tail = get_cfg_tail(blocks, root)
 	if tail is None:
 		return True
-	
+
 	return cfg_may_fall_through(blocks, tail, memo, active)
 
 
@@ -14252,7 +14503,7 @@ def build_cfg(target) -> tuple:
 			or not isinstance(blocks.get(bid), dict)
 		):
 			return False
-		
+
 		seen_by_root[root].add(bid)
 		successors.setdefault(bid, set())
 		predecessors.setdefault(bid, set())
@@ -14261,14 +14512,14 @@ def build_cfg(target) -> tuple:
 	def add_edge(a, b, root, *, scheduler=False) -> None:
 		if not add_node(root, a):
 			return
-		
+
 		if (
 			not isinstance(b, str)
 			or b not in blocks
 			or not isinstance(blocks.get(b), dict)
 		):
 			return
-		
+
 		add_node(root, b)
 		successors[a].add(b)
 		predecessors[b].add(a)
@@ -14294,13 +14545,13 @@ def build_cfg(target) -> tuple:
 			local_seen.add(current)
 			if current in active:
 				return
-			
+
 			active.add(current)
 			block = blocks.get(current)
 			if not isinstance(block, dict):
 				active.discard(current)
 				return
-			
+
 			add_node(root, current)
 			op = block.get("opcode", "")
 			inputs = block.get("inputs") or {}
@@ -14312,7 +14563,7 @@ def build_cfg(target) -> tuple:
 			def add_continuation_edge(*, force_scheduler=False):
 				if continuation is None:
 					return
-				
+
 				is_scheduler = force_scheduler or op in _CFG_SCHEDULER_YIELD_OPCODES
 				if (
 					scheduler_fallthrough is not None
@@ -14320,7 +14571,7 @@ def build_cfg(target) -> tuple:
 				):
 					is_scheduler = True
 				add_edge(current, continuation, root, scheduler=is_scheduler)
-			
+
 			match op:
 				case "control_if":
 					body_root = _control_substack(inputs.get("SUBSTACK"), blocks)
@@ -14350,7 +14601,7 @@ def build_cfg(target) -> tuple:
 						)
 					else:
 						add_continuation_edge()
-						
+
 					if else_root is not None:
 						add_edge(current, else_root, root)
 						process_chain(
@@ -14388,7 +14639,12 @@ def build_cfg(target) -> tuple:
 							scheduler_fallthrough=current,
 						)
 
-				case "control_stop" | "control_stop_all" | "control_stop_other_scripts" | "control_delete_this_clone":
+				case (
+					"control_stop"
+					| "control_stop_all"
+					| "control_stop_other_scripts"
+					| "control_delete_this_clone"
+				):
 					if op == "control_stop":
 						field = (block.get("fields") or {}).get("STOP_OPTION")
 						option = (
@@ -14398,7 +14654,10 @@ def build_cfg(target) -> tuple:
 							and isinstance(field[0], str)
 							else None
 						)
-						if option == "other scripts in sprite" and continuation is not None:
+						if (
+							option == "other scripts in sprite"
+							and continuation is not None
+						):
 							add_continuation_edge()
 
 				case _:
@@ -14407,7 +14666,7 @@ def build_cfg(target) -> tuple:
 			active.discard(current)
 			if not isinstance(nxt, str) or nxt not in blocks:
 				return
-			
+
 			current = nxt
 
 	for root in roots:
@@ -14436,7 +14695,7 @@ def build_cfg(target) -> tuple:
 def cfg_meet_constant_envs(envs):
 	if not envs:
 		return {}
-	
+
 	common = dict(envs[0])
 
 	for env in envs[1:]:
@@ -14450,7 +14709,7 @@ def cfg_meet_constant_envs(envs):
 def _cfg_is_hard_constant_barrier(block: Any) -> bool:
 	if not isinstance(block, dict):
 		return True
-	
+
 	op = block.get("opcode", "")
 	return op in {
 		"procedures_call",
@@ -14747,27 +15006,29 @@ def _compact_data_entry_equal(original, minified):
 	return _compact_data_value_equal(original[1], minified[1])
 
 
-def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], opts: Options):
+def fold_constant_expressions(
+	project: dict[str, Any], stats: dict[str, int], opts: Options
+):
 	targets = project.get("targets", [])
 	if opts.folded_constant_expression_link_edits is None:
 		opts.folded_constant_expression_link_edits = {}
-	
+
 	if opts.folded_constant_expression_inputs is None:
 		opts.folded_constant_expression_inputs = {}
-	
+
 	if opts.folded_constant_expression_opcode_edits is None:
 		opts.folded_constant_expression_opcode_edits = {}
-	
+
 	if opts.folded_constant_expression_blocks is None or len(
 		opts.folded_constant_expression_blocks
 	) != len(targets):
 		opts.folded_constant_expression_blocks = [set() for _ in targets]
-	
+
 	if opts.folded_constant_expression_new_blocks is None or len(
 		opts.folded_constant_expression_new_blocks
 	) != len(targets):
 		opts.folded_constant_expression_new_blocks = [set() for _ in targets]
-	
+
 	folded = 0
 
 	for ti, target in enumerate(targets):
@@ -14800,10 +15061,13 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 				block = blocks.get(block_id)
 				if not isinstance(block, dict):
 					continue
+
 				inputs_now = block.get("inputs") or {}
 				input_val = inputs_now.get(input_name)
+
 				if input_val is None:
 					continue
+
 				if not (
 					isinstance(input_val, list)
 					and len(input_val) > 1
@@ -14815,9 +15079,11 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 					)
 				):
 					continue
+
 				if input_val[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
 					root_id = input_val[1]
 					root = blocks.get(root_id) if isinstance(root_id, str) else None
+
 					if not isinstance(root, dict) or not str(
 						root.get("opcode", "")
 					).startswith("operator_"):
@@ -14828,7 +15094,7 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 					)
 					if boolean_negation is not None:
 						replacement, removed_ids = boolean_negation
-						if not _fold_blocked_by_comment(
+						if not fold_blocked_by_comment(
 							removed_ids, blocks, commented_ids
 						) and not _fold_ids_have_external_refs(
 							removed_ids, blocks, block_id, graph=graph
@@ -14868,7 +15134,7 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 					)
 					if algebraic is not None:
 						replacement, removed_ids = algebraic
-						if not _fold_blocked_by_comment(
+						if not fold_blocked_by_comment(
 							removed_ids, blocks, commented_ids
 						) and not _fold_ids_have_external_refs(
 							removed_ids, blocks, block_id, graph=graph
@@ -14916,7 +15182,7 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 						incoming_refs=incoming_refs,
 						graph=graph,
 					)
-					if demorgan is not None and not _fold_blocked_by_comment(
+					if demorgan is not None and not fold_blocked_by_comment(
 						demorgan["changed_ids"], blocks, commented_ids
 					):
 						logic_id = demorgan["logic_id"]
@@ -14947,7 +15213,7 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 							(demorgan["new_inner_left"], left_not_id),
 							(demorgan["new_inner_right"], right_not_id),
 						):
-							for ref in _direct_input_block_refs(raw, blocks):
+							for ref in direct_input_block_refs(raw, blocks):
 								blocks[ref]["parent"] = logic_id
 								opts.folded_constant_expression_link_edits[
 									(ti, ref, "parent")
@@ -14987,39 +15253,46 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 					if changed:
 						break
 
-					identity = _simplify_boolean_identity_input(
+					short_circuited = _short_circuit(
 						input_val,
 						blocks,
 						parent_id=block_id,
 						incoming_refs=incoming_refs,
 						graph=graph,
 					)
-					if identity is not None:
-						replacement, folded_ids = identity
-						if _fold_blocked_by_comment(
+					if short_circuited is not None:
+						replacement, folded_ids = short_circuited
+						if fold_blocked_by_comment(
 							folded_ids, blocks, commented_ids
 						) or _fold_ids_have_external_refs(
 							folded_ids, blocks, block_id, graph=graph
 						):
 							continue
+
 						if block_id not in blocks:
 							continue
+
 						inputs = blocks[block_id].get("inputs") or {}
+
 						if input_name not in inputs:
 							continue
+
 						if isinstance(replacement, list):
 							new_input = copy.deepcopy(replacement)
 							new_ids = set()
 						else:
-							new_input, new_ids = _constant_to_scratch_input(
+							new_input, new_ids = constant_to_input(
 								replacement, blocks, block_id
 							)
+
 						if new_input is None:
 							continue
+
 						if _is_boolean_slot(
 							block, input_name
 						) and _is_bare_literal_input(new_input):
 							continue  # a literal can't live in a boolean slot
+
 						if isinstance(replacement, list):
 							for child_id in _input_block_ids(new_input, blocks):
 								child = blocks.get(child_id)
@@ -15031,6 +15304,7 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 										(ti, child_id, "parent")
 									] = block_id
 							_reparent_serialized_input(new_input, blocks, block_id)
+
 						inputs[input_name] = new_input
 						stats["boolean_constants_propagated"] += 1
 						opts.folded_constant_expression_inputs[
@@ -15038,27 +15312,45 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 						] = copy.deepcopy(new_input)
 						opts.folded_constant_expression_blocks[ti].update(folded_ids)
 						opts.folded_constant_expression_new_blocks[ti].update(new_ids)
+
 						for remove_id in folded_ids:
 							blocks.pop(remove_id, None)
+
 						graph.refresh_blocks((block_id, *owned_ids))
 						incoming_refs = graph.incoming
 						folded += 1
 						changed = True
 						break
 
-					res = _constant_expression_from_input(input_val, blocks)
+					laws = _simplify_boolean_identities(
+						input_val,
+						blocks,
+						parent_id=block_id,
+						incoming_refs=incoming_refs,
+						graph=graph,
+						slot_is_boolean=_is_boolean_slot(block, input_name)
+					)
+					if laws is not None and _apply_boolean_law_plan(
+						laws, blocks, graph, block_id, input_name, ti, opts, stats, commented_ids
+					):
+						incoming_refs = graph.incoming
+						folded += 1
+						changed = True
+						break
+
+					res = constexpr_from_input(input_val, blocks)
 					if res is None:
 						continue
 					constant, folded_ids = res
 					if not folded_ids:
 						continue
 
-					owned_ids = _exclusive_input_block_subtree_fast(
+					owned_ids = get_exclusive_input_subtree(
 						input_val, blocks, block_id, incoming_refs, graph=graph
 					)
 					if owned_ids is None or not folded_ids <= owned_ids:
 						continue
-					if _fold_blocked_by_comment(
+					if fold_blocked_by_comment(
 						owned_ids, blocks, commented_ids
 					) or _fold_ids_have_external_refs(
 						owned_ids, blocks, block_id, graph=graph
@@ -15069,7 +15361,7 @@ def fold_constant_expressions(project: dict[str, Any], stats: dict[str, int], op
 					inputs = blocks[block_id].get("inputs") or {}
 					if input_name not in inputs:
 						continue
-					new_input, new_ids = _constant_to_scratch_input(
+					new_input, new_ids = constant_to_input(
 						constant, blocks, block_id
 					)
 					if new_input is None:
@@ -15781,13 +16073,13 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			round_changes = 0
 			if opts.constant_propagation:
 				round_changes += constant_propagation(project, stats, opts)
-			
+
 			if opts.fold_constant_expressions:
 				round_changes += fold_constant_expressions(project, stats, opts)
 
 			if opts.associative_constant_merging:
 				round_changes += merge_associative_constants(project, stats, opts)
-			
+
 			if round_changes == 0:
 				break
 	if (
@@ -15801,9 +16093,6 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.specialize_procedures:
 		stage("Specialize custom procedures")
 		specialize_procedures(project, stats, opts)
-	if opts.fold_constant_expressions:
-		stage("Fold constant expressions")
-		fold_constant_expressions(project, stats, opts)
 	if opts.simplify_boolean_control:
 		stage("Simplify boolean control flow")
 		simplify_boolean_controls(project, stats, opts)
@@ -16207,7 +16496,7 @@ def _restore_block_data_broadcast_ids(project, opts):
 				if value[0] == PRIMITIVE_BROADCAST:
 					value[2] = broadcast_rev.get(value[2], value[2])
 					return
-			
+
 			if value and value[0] in (
 				INPUT_SAME_BLOCK_SHADOW,
 				INPUT_BLOCK_NO_SHADOW,
@@ -18077,7 +18366,7 @@ def _restore_representation_for_verify(original, result, opts):
 	):
 		left_blocks = left_target.get("blocks") or {}
 		right_blocks = right_target.get("blocks") or {}
-		
+
 		for bid, left in left_blocks.items():
 			right = right_blocks.get(bid)
 			if not isinstance(left, dict) or not isinstance(right, dict):
@@ -18108,7 +18397,7 @@ def _restore_representation_for_verify(original, result, opts):
 					right["next"] = None
 				left_fields = left.get("fields") or {}
 				right_fields = right.get("fields")
-				
+
 				if isinstance(right_fields, dict):
 					for name, value in left_fields.items():
 						if (
@@ -18130,12 +18419,12 @@ def _restore_representation_for_verify(original, result, opts):
 				right_costumes, list
 			):
 				continue
-			
+
 			for left, right in zip(left_costumes, right_costumes):
 				if not isinstance(left, dict) or not isinstance(right, dict):
 					continue
 				canonical = _canonical_costume_filename(left)
-				
+
 				if (
 					canonical is not None
 					and left.get("md5ext") == canonical
@@ -18153,10 +18442,10 @@ def verify(original_path, minified_path, opts):
 
 			if err:
 				return False, f"archive '{zpath}': {err}"
-			
+
 			if "project.json" not in names:
 				return False, f"archive '{zpath}' has no project.json"
-			
+
 		orig_assets = {name for name in a.namelist() if name != "project.json"}
 		mini_assets = {name for name in b.namelist() if name != "project.json"}
 		original_asset_cache = {}
@@ -18173,7 +18462,7 @@ def verify(original_path, minified_path, opts):
 				False,
 				f"zip archive entries differ. Missing: {diff_missing[:10]}, unexpected extra: {diff_extra[:10]}",
 			)
-		
+
 		for name in orig_assets:
 			if name in conversions:
 				new_name = _final_asset_name(conversions[name], opts)
@@ -18182,7 +18471,7 @@ def verify(original_path, minified_path, opts):
 				if new_bytes is None:
 					new_bytes = b.read(new_name)
 					minified_asset_cache[new_name] = new_bytes
-				
+
 				if hashlib.md5(new_bytes).hexdigest() != new_name.rsplit(".", 1)[0]:
 					return (
 						False,
@@ -18219,15 +18508,15 @@ def verify(original_path, minified_path, opts):
 			mini_raw_project = json.loads(b.read("project.json"))
 		except (UnicodeDecodeError, json.JSONDecodeError) as exc:
 			return False, f"project.json is not valid UTF-8 JSON: {exc}"
-		
+
 		if not isinstance(orig_raw, dict) or not isinstance(mini_raw_project, dict):
 			return False, "project.json root must be an object"
-		
+
 		if not isinstance(orig_raw.get("targets"), list) or not isinstance(
 			mini_raw_project.get("targets"), list
 		):
 			return False, "project.json targets must be arrays"
-		
+
 		orig_raw, mini_raw_project, representation_block_ids_restored = (
 			_restore_representation_for_verify(orig_raw, mini_raw_project, opts)
 		)
@@ -18235,20 +18524,20 @@ def verify(original_path, minified_path, opts):
 		mini = _reinflate(mini_raw_project)
 		opts._verify_project = orig
 		err = _validate_asset_entries(mini, b, "minified project", minified_asset_cache)
-		
+
 		if err:
 			return False, err
-		
+
 		err = _validate_asset_entries(orig, a, "original project")
-		
+
 		if err:
 			return False, err
-		
+
 		if opts.rename_block_ids and not representation_block_ids_restored:
 			_restore_block_ids(mini, opts.renamed_block_ids)
-		
+
 		err = _validate_block_structure(mini, "minified project", orig)
-		
+
 		if err:
 			return False, err
 
@@ -18905,6 +19194,9 @@ STAT_GROUPS = [
 			("boolean_constants_propagated", "boolean constants propagated"),
 			("algebraic_simplifications", "algebraic simplifications"),
 			("demorgan_rewrites", "De Morgan rewrites"),
+			("boolean_idempotent", "idempotent law rewrites"),
+			("boolean_absorption", "absorption law rewrites"),
+			("boolean_factoring", "boolean factorizations")
 		],
 	),
 	(
@@ -18979,7 +19271,7 @@ STAT_GROUPS = [
 ]
 
 
-def _print_transform_stats(stats, opts):
+def print_transform_stats(stats, opts):
 	print(Ansi.heading("Transforms applied:"))
 	for number, title, entries in STAT_GROUPS:
 		print(Ansi.subheading(f"  {number} {title}"))
@@ -19743,7 +20035,7 @@ def minify_sb3(src, dst, opts=None):
 	print(Ansi.success("Verified successfully."))
 
 	print(f'Input : "{src}"\nOutput: "{dst}"\n')
-	_print_transform_stats(stats, opts)
+	print_transform_stats(stats, opts)
 
 	b, a = len(raw), len(out_json)
 	print("")
