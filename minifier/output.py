@@ -464,3 +464,12 @@ def format_size_report(before_json, after_json, before_archive, after_archive):
 		f"project.json : {before_json / mib:.4f} MiB -> {after_json / mib:.4f} MiB  ({sign}{abs(saving) / mib:.4f} MiB, {percent:.1f}%)",
 		f"archive      : {before_archive / mib:.4f} MiB -> {after_archive / mib:.4f} MiB",
 	)
+
+
+def _render_layout(parts, order=None, shapes=None):
+	if shapes is None:
+		shapes = {}
+	return b"".join(
+		part if isinstance(part, bytes) else part.render(order, shapes)
+		for part in parts
+	)

@@ -1,7 +1,7 @@
 import sys
 
 from math import isfinite
-from tools.output import Ansi
+from .output import Ansi
 
 
 DEFAULT_LIST_BYTES = 4096
@@ -365,6 +365,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 					values[key] = n
 					continue
 		bad.append(f)
+	
 	if bad:
 		print(Ansi.error(f"Unknown or malformed option(s): {bad}"))
 		print(
@@ -373,6 +374,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 			)
 		)
 		sys.exit(1)
+	
 	if not args:
 		print(Ansi.error("Path and flags are not specified."))
 		print(
@@ -384,6 +386,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 	if "--strip-covered-shadows" in flags and "--keep-covered" in flags:
 		print(Ansi.error("--strip-covered-shadows is incompatible with --keep-covered"))
 		sys.exit(1)
+	
 	for strip, keep in (
 		("--strip-editor-comments", "--keep-comments"),
 		("--strip-script-positions", "--keep-positions"),
@@ -394,6 +397,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 		if strip in flags and keep in flags:
 			print(Ansi.error(f"{strip} is incompatible with {keep}"))
 			sys.exit(1)
+	
 	if "--fast-json" in flags and "--thorough-json" in flags:
 		print(Ansi.error("--fast-json is incompatible with --thorough-json"))
 		sys.exit(1)
