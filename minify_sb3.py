@@ -28,7 +28,6 @@ from minifier.json_layout import (
 	quote,
 )
 from minifier.json_optimizer import (
-	javascript_keys,
 	_canonical_costume_filename,
 	relabel_blocks,
 	restore_block_labels,
@@ -43,7 +42,6 @@ from minifier.metadata import (
 	restore_ref_names,
 	prune_orphan_arguments,
 	_SYNC_REPORTERS,
-	_RESERVED_PROCEDURE_SYMBOLS,
 	_COVERED_INPUT_OPCODES,
 	_terminal_link_ids,
 	_restore_covered_shadows,
@@ -63,7 +61,6 @@ from minifier.output import (
 	ProgressBar,
 	print_transform_stats,
 	format_size_report,
-	_render_layout
 )
 from minifier.tags import (
 	INPUT_SAME_BLOCK_SHADOW,
@@ -3789,60 +3786,6 @@ def _sequence_make_call_input(value, blocks, generated, parent_id):
 
 
 SEQUENCE_MAX_WINDOW = 256
-
-
-def _sequence_warp_context(blocks, block_id, cache=None):
-	if cache is None:
-		cache = {}
-
-	if block_id in cache:
-		return cache[block_id]
-
-	path = []
-	seen = set()
-	current = block_id
-	result = False
-
-	while isinstance(current, str) and current in blocks and current not in seen:
-		if current in cache:
-			result = cache[current]
-			break
-
-		seen.add(current)
-		path.append(current)
-		block = blocks.get(current)
-
-		if not isinstance(block, dict):
-			break
-
-		parent = block.get("parent")
-
-		if not isinstance(parent, str) or parent not in blocks:
-			break
-
-		parent_block = blocks[parent]
-
-		if not isinstance(parent_block, dict):
-			break
-
-		if parent_block.get("opcode") == "procedures_definition":
-			custom = (parent_block.get("inputs") or {}).get("custom_block")
-
-			if isinstance(custom, list) and len(custom) > 1:
-				prototype = blocks.get(custom[1])
-
-				if isinstance(prototype, dict):
-					result = _procedure_warp_enabled(
-						(prototype.get("mutation") or {}).get("warp")
-					)
-			break
-
-		current = parent
-
-	for item in path:
-		cache[item] = result
-
-	return result
 
 
 def _collect_similar_sequence_candidates(runs, blocks, threshold):
