@@ -33,7 +33,7 @@ class JsonNumber(str):
 		return self
 
 
-def _unique_object(pairs) -> dict:
+def get_unique_object(pairs) -> dict:
 	result = {}
 	for key, value in pairs:
 		if key in result:
@@ -42,7 +42,7 @@ def _unique_object(pairs) -> dict:
 	return result
 
 
-def _invalid_constant(value) -> NoReturn:
+def invalid_constant(value) -> NoReturn:
 	raise ValueError(f"non-finite JSON number: {value}")
 
 
@@ -53,12 +53,12 @@ def loads_exact(data) -> dict:
 		data,
 		parse_int=JsonNumber,
 		parse_float=JsonNumber,
-		parse_constant=_invalid_constant,
-		object_pairs_hook=_unique_object,
+		parse_constant=invalid_constant,
+		object_pairs_hook=get_unique_object,
 	)
 
 
-def _copy_json(value, memo=None):
+def copy_json(value, memo=None):
 	kind = type(value)
 
 	if value is None or kind in (str, bool, int, float, JsonNumber):
@@ -79,11 +79,11 @@ def _copy_json(value, memo=None):
 
 	if kind is dict:
 		for key, child in value.items():
-			result[key if type(key) in (str, JsonNumber) else _copy_json(key, memo)] = (
-				_copy_json(child, memo)
+			result[key if type(key) in (str, JsonNumber) else copy_json(key, memo)] = (
+				copy_json(child, memo)
 			)
 	else:
-		result.extend(_copy_json(child, memo) for child in value)
+		result.extend(copy_json(child, memo) for child in value)
 	return result
 
 
@@ -320,7 +320,7 @@ _REFERENCE_FIELDS = {
 }
 
 
-def _reference_name_slots(project) -> Generator:
+def get_ref_name_slots(project) -> Generator:
 	def primitive(node, path):
 		if not isinstance(node, list) or len(node) < 3:
 			return
@@ -339,13 +339,13 @@ def _reference_name_slots(project) -> Generator:
 			)
 
 	for ti, target in enumerate(project.get("targets", [])):
-		for bid, block in (target.get("blocks") or {}).items():
+		for bid, block in target.get("blocks", {}).items():
 			path = ("targets", ti, "blocks", bid)
 			if isinstance(block, list):
 				yield from primitive(block, path)
 			elif isinstance(block, dict):
 				for field, (kind, opcodes) in _REFERENCE_FIELDS.items():
-					value = (block.get("fields") or {}).get(field)
+					value = block.get("fields", {}).get(field)
 					if (
 						block.get("opcode") in opcodes
 						and isinstance(value, list)
@@ -353,7 +353,7 @@ def _reference_name_slots(project) -> Generator:
 					):
 						yield path + ("fields", field, 0), value, 0, value[1], kind
 
-				for key, desc in (block.get("inputs") or {}).items():
+				for key, desc in block.get("inputs", {}).items():
 					if not isinstance(desc, list) or not desc:
 						continue
 
@@ -374,7 +374,7 @@ def _reference_name_slots(project) -> Generator:
 							)
 
 
-def _reference_scopes(project):
+def get_ref_scopes(project):
 	scopes = []
 	stages = []
 
@@ -400,13 +400,13 @@ def _reference_scopes(project):
 	return [dict(global_scope, **scope) for scope in scopes]
 
 
-def _restore_reference_names(original, result, *, copy_result=True):
+def restore_ref_names(original, result, *, copy_result=True):
 	if copy_result:
 		result = copy.deepcopy(result)
 
-	scopes = _reference_scopes(original)
+	scopes = get_ref_scopes(original)
 
-	for path, container, index, ident, kind in _reference_name_slots(original):
+	for path, container, index, ident, kind in get_ref_name_slots(original):
 		if (
 			type(ident) is not str
 			or not ident
@@ -430,8 +430,8 @@ def _restore_reference_names(original, result, *, copy_result=True):
 	return result
 
 
-def _orphan_argument_ids(target):
-	blocks = target.get("blocks") or {}
+def get_orphan_argument_ids(target):
+	blocks = target.get("blocks", {})
 	if not isinstance(blocks, dict):
 		return set()
 
@@ -505,7 +505,7 @@ def _orphan_argument_ids(target):
 	return orphans
 
 
-def _prune_orphan_arguments(project, result=None):
+def prune_orphan_arguments(project, result=None):
 	pruned = dict(project)
 	pruned["targets"] = []
 
@@ -514,7 +514,7 @@ def _prune_orphan_arguments(project, result=None):
 		blocks = target.get("blocks")
 
 		if isinstance(blocks, dict):
-			orphans = _orphan_argument_ids(target)
+			orphans = get_orphan_argument_ids(target)
 			if result is not None:
 				other_targets = result.get("targets", [])
 				other = (
@@ -891,7 +891,7 @@ def _covered_shadow_slots(project) -> Generator:
 					"warp",
 				}:
 					continue
-			for name, desc in (block.get("inputs") or {}).items():
+			for name, desc in block.get("inputs", {}).items():
 				if (
 					not isinstance(desc, list)
 					or len(desc) != 3
@@ -965,7 +965,7 @@ def _restore_covered_shadows(
 def _procedure_symbol_info(target: dict[str, Any]) -> list[Counter] | None:
 	counts = [Counter(), Counter(), Counter()]
 
-	for block in (target.get("blocks") or {}).values():
+	for block in target.get("blocks", {}).values():
 		if not isinstance(block, dict):
 			continue
 
@@ -1039,7 +1039,7 @@ def _procedure_symbol_info(target: dict[str, Any]) -> list[Counter] | None:
 
 			counts[1].update(inputs.keys())
 		elif op in ("argument_reporter_string_number", "argument_reporter_boolean"):
-			value = (block.get("fields") or {}).get("VALUE")
+			value = block.get("fields", {}).get("VALUE")
 			if not isinstance(value, list) or not value or type(value[0]) is not str:
 				return None
 
@@ -1089,7 +1089,7 @@ def _compact_procedure_symbols(project: dict[str, Any], *, copy_result=True):
 
 			maps.append(mapping)
 
-		for block in (target.get("blocks") or {}).values():
+		for block in target.get("blocks", {}).values():
 			if not isinstance(block, dict):
 				continue
 
@@ -1175,11 +1175,11 @@ def _restore_procedure_symbols(
 				forward[index][old], reverse[index][new] = new, old
 
 			pairs = []
-			for bid, block in (left.get("blocks") or {}).items():
+			for bid, block in left.get("blocks", {}).items():
 				if not isinstance(block, dict):
 					continue
 
-				other = (right.get("blocks") or {}).get(bid)
+				other = right.get("blocks", {}).get(bid)
 				if not isinstance(other, dict):
 					continue
 
@@ -1282,7 +1282,7 @@ def _restore_procedure_symbols(
 						for key, value in other["inputs"].items()
 					}
 
-			for block in (right.get("blocks") or {}).values():
+			for block in right.get("blocks", {}).values():
 				if isinstance(block, dict) and block.get("opcode") in (
 					"argument_reporter_string_number",
 					"argument_reporter_boolean",
@@ -1710,8 +1710,8 @@ def _restore_editor_metadata(
 						for cid in before
 					}
 
-		for bid, block in (left.get("blocks") or {}).items():
-			other = (right.get("blocks") or {}).get(bid)
+		for bid, block in left.get("blocks", {}).items():
+			other = right.get("blocks", {}).get(bid)
 
 			if not isinstance(block, dict) or not isinstance(other, dict):
 				continue
@@ -1981,7 +1981,7 @@ def exact_difference(
 		result = _rebuild_procedure_displays(result)
 
 	if prune_orphan_arguments:
-		original = _prune_orphan_arguments(original, result)
+		original = prune_orphan_arguments(original, result)
 
 	if (
 		relabel_block_ids
@@ -1992,7 +1992,7 @@ def exact_difference(
 		or strip_script_positions
 		or prune_unused_data
 	):
-		result = _copy_json(result)
+		result = copy_json(result)
 
 	if relabel_block_ids:
 		try:
@@ -2007,7 +2007,7 @@ def exact_difference(
 			return f"procedure symbol correspondence failed: {error}"
 
 	if compact_reference_names:
-		result = _restore_reference_names(original, result, copy_result=False)
+		result = restore_ref_names(original, result, copy_result=False)
 
 	if strip_covered_shadows:
 		result = _restore_covered_shadows(original, result)
@@ -2069,7 +2069,7 @@ def exact_difference(
 
 				if isinstance(right.get("fields"), dict):
 					right["fields"] = dict(right["fields"])
-					for name, value in (left.get("fields") or {}).items():
+					for name, value in left.get("fields", {}).items():
 						if (
 							name not in ("VARIABLE", "LIST", "BROADCAST_OPTION")
 							and isinstance(value, list)
@@ -2152,41 +2152,6 @@ def _ordered_blocks(target, order):
 	return result
 
 
-def _layout(project, order):
-	result = dict(project)
-
-	if isinstance(project.get("targets"), list):
-		result["targets"] = [
-			_ordered_blocks(target, order) for target in project["targets"]
-		]
-
-	return result
-
-
-def _compact_block_defaults(project):
-	result = dict(project)
-	result["targets"] = []
-
-	for target in project.get("targets", []):
-		target = dict(target)
-		if isinstance(target.get("blocks"), dict):
-			target["blocks"] = {
-				bid: (
-					{
-						key: value
-						for key, value in block.items()
-						if key not in ("fields", "inputs") or value != {}
-					}
-					if isinstance(block, dict)
-					else block
-				)
-				for bid, block in target["blocks"].items()
-			}
-		result["targets"].append(target)
-
-	return result
-
-
 def _canonical_costume_filename(costume):
 	aid, fmt = costume.get("assetId"), costume.get("dataFormat")
 
@@ -2225,10 +2190,10 @@ def compact_representation(
 		or strip_covered_shadows
 		or rebuild_procedure_displays
 	):
-		project = _copy_json(project)
+		project = copy_json(project)
 
 	if prune_orphan_arguments:
-		project = _prune_orphan_arguments(project)
+		project = prune_orphan_arguments(project)
 
 	if rebuild_procedure_displays:
 		project = _rebuild_procedure_displays(project)
@@ -2525,7 +2490,7 @@ def _input_tag(value) -> int | None:
 
 
 def _block_slots(target):
-	for block in (target.get("blocks") or {}).values():
+	for block in target.get("blocks", {}).values():
 		if not isinstance(block, dict):
 			continue
 
@@ -2535,7 +2500,7 @@ def _block_slots(target):
 			):
 				yield block, key
 
-		for desc in (block.get("inputs") or {}).values():
+		for desc in block.get("inputs", {}).values():
 			if not isinstance(desc, list) or not desc:
 				continue
 
@@ -2554,7 +2519,7 @@ def _block_slots(target):
 				):
 					yield desc, position
 
-	for comment in (target.get("comments") or {}).values():
+	for comment in target.get("comments", {}).values():
 		if (
 			isinstance(comment, dict)
 			and isinstance(comment.get("blockId"), str)
@@ -2618,7 +2583,7 @@ def relabel_blocks(project, *, copy_result=True):
 						"verified block relabeling requires string or null next/parent links"
 					)
 
-			for desc in (block.get("inputs") or {}).values():
+			for desc in block.get("inputs", {}).values():
 				if (
 					not isinstance(desc, list)
 					or not desc
@@ -2645,7 +2610,7 @@ def relabel_blocks(project, *, copy_result=True):
 							"verified block relabeling rejects numeric or opaque input references"
 						)
 
-		for comment in (target.get("comments") or {}).values():
+		for comment in target.get("comments", {}).values():
 			if isinstance(comment, dict):
 				value = comment.get("blockId")
 				if value is not None and (
@@ -2869,7 +2834,7 @@ def _sample_blocks(project, width=64):
 	result = {"targets": []}
 
 	for target in project.get("targets", []):
-		blocks = target.get("blocks") or {}
+		blocks = target.get("blocks", {})
 		items = list(blocks.items())
 		if len(items) > width * 3:
 			starts = (0, len(items) // 2 - width // 2, len(items) - width)
@@ -2904,7 +2869,7 @@ def _specialized_layout(project, orders, level, grouping):
 		return (ti, key) if grouping == "target-opcode" else key
 
 	for ti, target in enumerate(project.get("targets", [])):
-		for bid, block in (target.get("blocks") or {}).items():
+		for bid, block in target.get("blocks", {}).items():
 			if isinstance(block, dict):
 				groups.setdefault(group_key(ti, block), []).append((ti, bid, block))
 
@@ -3249,7 +3214,7 @@ def optimize_project_json(
 		orphan_removed = (
 			sum(
 				min(
-					len(_orphan_argument_ids(a)),
+					len(get_orphan_argument_ids(a)),
 					max(0, len(a.get("blocks", {})) - len(b.get("blocks", {}))),
 				)
 				for a, b in zip(project.get("targets", []), result.get("targets", []))
@@ -3458,7 +3423,7 @@ class ProgressBar:
 			print()
 
 
-def _progress_stage_count(opts: Options) -> int:
+def progress_stage_count(opts: Options) -> int:
 	count = 1  # normalize block defaults
 	count += opts.convert_wav_to_mp3
 	count += opts.deduplicate_assets
@@ -3469,7 +3434,7 @@ def _progress_stage_count(opts: Options) -> int:
 	count += opts.remove_unreachable
 	count += opts.remove_unused_procedures
 	count += opts.remove_unreachable or opts.remove_unused_procedures
-	count += opts.constant_propagation
+	count += opts.constant_propagation or opts.fold_constant_expressions or opts.associative_constant_merging
 	count += bool(opts.cleared_lists)
 	count += bool(opts.folded_constant_variables)
 	count += (
@@ -3478,8 +3443,6 @@ def _progress_stage_count(opts: Options) -> int:
 		or opts.trivial_loops
 		or opts.nested_conditionals
 	)
-	count += opts.associative_constant_merging
-	count += opts.fold_constant_expressions
 	count += opts.simplify_boolean_control or opts.trivial_loops
 	count += opts.simplify_blocks
 	count += opts.group_similar_sequences
@@ -3573,42 +3536,46 @@ class AnsiPrint:
 Ansi = AnsiPrint()
 
 
-def _short_id(index):
+def short_id(index):
 	base = len(BLOCK_ID_ALPHABET)
 	length = 1
+
 	while index >= base**length:
 		index -= base**length
 		length += 1
+	
 	digits = []
+	
 	for _ in range(length):
 		digits.append(BLOCK_ID_ALPHABET[index % base])
 		index //= base
+	
 	return "".join(reversed(digits))
 
 
-def _mapped_block_id(value, block_ids):
+def mapped_block_id(value, block_ids):
 	return block_ids.get(value, value) if isinstance(value, str) else value
 
 
-def _replace_input_block_ids(value, block_ids):
+def replace_input_block_ids(value, block_ids):
 	for node in iterate_input_nodes(value):
 		tag = node[0]
 		if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW) and len(node) > 1:
-			node[1] = _mapped_block_id(node[1], block_ids)
+			node[1] = mapped_block_id(node[1], block_ids)
 		elif tag == INPUT_DIFF_BLOCK_SHADOW:
 			if len(node) > 1:
-				node[1] = _mapped_block_id(node[1], block_ids)
+				node[1] = mapped_block_id(node[1], block_ids)
 			if len(node) > 2:
-				node[2] = _mapped_block_id(node[2], block_ids)
+				node[2] = mapped_block_id(node[2], block_ids)
 
 
-def _count_input_block_refs(value, blocks, refs):
-	for ref in _iter_input_block_refs(value):
+def count_input_block_refs(value, blocks, refs):
+	for ref in iter_input_block_refs(value):
 		if ref in blocks:
 			refs[ref] += 1
 
 
-def _count_block_references(target):
+def count_block_refs(target):
 	blocks = target.get("blocks", {})
 	refs = Counter()
 	for bid, block in blocks.items():
@@ -3620,9 +3587,9 @@ def _count_block_references(target):
 			par = block.get("parent")
 			if isinstance(par, str) and par in blocks:
 				refs[par] += 1
-			for value in (block.get("inputs") or {}).values():
-				_count_input_block_refs(value, blocks, refs)
-	for comment in (target.get("comments") or {}).values():
+			for value in block.get("inputs", {}).values():
+				count_input_block_refs(value, blocks, refs)
+	for comment in target.get("comments", {}).values():
 		if isinstance(comment, dict):
 			cbid = comment.get("blockId")
 			if isinstance(cbid, str) and cbid in blocks:
@@ -3630,7 +3597,7 @@ def _count_block_references(target):
 	return refs
 
 
-def _analyze_block_ids(target):
+def analyze_block_ids(target):
 	blocks = target.get("blocks", {})
 	ids = set(blocks)
 	refs = Counter({bid: 1 for bid in blocks})
@@ -3650,14 +3617,14 @@ def _analyze_block_ids(target):
 			else:
 				dangling.add(v)
 
-		for value in (block.get("inputs") or {}).values():
-			for ref in _iter_input_block_refs(value):
+		for value in block.get("inputs", {}).values():
+			for ref in iter_input_block_refs(value):
 				if ref in ids:
 					refs[ref] += 1
 				else:
 					dangling.add(ref)
 
-	for comment in (target.get("comments") or {}).values():
+	for comment in target.get("comments", {}).values():
 		if isinstance(comment, dict):
 			cbid = comment.get("blockId")
 
@@ -3682,10 +3649,10 @@ def rename_block_ids(project, stats, frequency_order=False):
 			continue
 
 		if frequency_order:
-			refs, dangling = _analyze_block_ids(target)
+			refs, dangling = analyze_block_ids(target)
 			old_ids = sorted(old_ids, key=lambda x: (-refs[x], x))
 		else:
-			_, dangling = _analyze_block_ids(target)
+			_, dangling = analyze_block_ids(target)
 		block_ids = _rename_id_map(old_ids, existing_ids=dangling)
 		all_maps[ti] = block_ids
 
@@ -3699,10 +3666,10 @@ def rename_block_ids(project, stats, frequency_order=False):
 					if block.get(key) in block_ids:
 						block[key] = block_ids[block[key]]
 
-				for value in (block.get("inputs") or {}).values():
-					_replace_input_block_ids(value, block_ids)
+				for value in block.get("inputs", {}).values():
+					replace_input_block_ids(value, block_ids)
 
-		for comment in (target.get("comments") or {}).values():
+		for comment in target.get("comments", {}).values():
 			if (
 				isinstance(comment, dict)
 				and "blockId" in comment
@@ -3720,8 +3687,8 @@ def rename_block_ids(project, stats, frequency_order=False):
 	return all_maps
 
 
-def _collect_dangling_in_input(value, ids, dangling):
-	for ref in _iter_input_block_refs(value):
+def collect_dangling_in_input(value, ids, dangling):
+	for ref in iter_input_block_refs(value):
 		if ref not in ids:
 			dangling.add(ref)
 
@@ -3772,7 +3739,7 @@ def minify_blocks(project):
 	return stats
 
 
-def _round_num(v):
+def round_num(v):
 	if not isinstance(v, (int, float)):
 		return v
 
@@ -3790,24 +3757,24 @@ def round_positions(project, stats):
 			if isinstance(block, dict):
 				for k in ("x", "y"):
 					if k in block:
-						n = _round_num(block[k])
+						n = round_num(block[k])
 						if n != block[k] or type(n) is not type(block[k]):
 							block[k] = n
 							stats["rounded"] += 1
 			elif isinstance(block, list) and len(block) >= 5:  # [12, name, id, x, y]
 				for i in (3, 4):
-					n = _round_num(block[i])
+					n = round_num(block[i])
 					if n != block[i] or type(n) is not type(block[i]):
 						block[i] = n
 						stats["rounded"] += 1
 
-		for comment in (target.get("comments") or {}).values():
+		for comment in target.get("comments", {}).values():
 			if not isinstance(comment, dict):
 				continue
 
 			for k in ("x", "y", "width", "height"):
 				if k in comment:
-					n = _round_num(comment[k])
+					n = round_num(comment[k])
 					if n != comment[k] or type(n) is not type(comment[k]):
 						comment[k] = n
 						stats["rounded"] += 1
@@ -3818,14 +3785,14 @@ def round_positions(project, stats):
 
 			for k in ("rotationCenterX", "rotationCenterY"):
 				if k in costume:
-					n = _round_num(costume[k])
+					n = round_num(costume[k])
 
 					if n != costume[k] or type(n) is not type(costume[k]):
 						costume[k] = n
 						stats["rounded"] += 1
 
 
-_BOOLEAN_INPUTS = {
+BOOLEAN_INPUTS = {
 	"operator_and": ("OPERAND1", "OPERAND2"),
 	"operator_or": ("OPERAND1", "OPERAND2"),
 	"operator_not": ("OPERAND",),
@@ -3837,12 +3804,12 @@ _BOOLEAN_INPUTS = {
 }
 
 
-def _boolean_input_names(block):
+def get_bool_input_names(block) -> frozenset:
 	if not isinstance(block, dict):
 		return frozenset()
 
 	op = block.get("opcode")
-	names = set(_BOOLEAN_INPUTS.get(op, ()))
+	names = set(BOOLEAN_INPUTS.get(op, ()))
 
 	if op == "procedures_call":
 		mut = block.get("mutation")
@@ -3864,11 +3831,11 @@ def _boolean_input_names(block):
 	return frozenset(names)
 
 
-def _is_boolean_slot(block, input_name):
-	return input_name in _boolean_input_names(block)
+def is_boolean_slot(block, input_name) -> bool:
+	return input_name in get_bool_input_names(block)
 
 
-def _scratch_numeric_tag(value):
+def scratch_numeric_tag(value) -> int | None:
 	if isinstance(value, JsonNumber):
 		try:
 			return int(value)
@@ -3880,11 +3847,11 @@ def _scratch_numeric_tag(value):
 	return None
 
 
-def _is_bare_literal_input(value):
+def is_literal_input(value) -> bool:
 	if not (isinstance(value, list) and len(value) > 1):
 		return False
 
-	tag = _scratch_numeric_tag(value[0])
+	tag = scratch_numeric_tag(value[0])
 	if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_DIFF_BLOCK_SHADOW):
 		return isinstance(value[1], list)
 
@@ -3923,7 +3890,7 @@ def clear_covered_values(project, stats):
 			if not isinstance(block, dict):
 				continue
 
-			for iv in (block.get("inputs") or {}).values():
+			for iv in block.get("inputs", {}).values():
 				if not (
 					isinstance(iv, list)
 					and len(iv) == 3
@@ -3961,7 +3928,7 @@ def _variable_ids_used_by_blocks(project):
 		for block in target.get("blocks", {}).values():
 			if isinstance(block, dict) and block.get("opcode") in show_ops:
 				for fk in ("VARIABLE", "LIST"):
-					f = (block.get("fields") or {}).get(fk)
+					f = block.get("fields", {}).get(fk)
 
 					if isinstance(f, list) and len(f) > 1:
 						shown.add(f[1])
@@ -4064,7 +4031,7 @@ def get_list_usage(project, ti, list_id) -> Counter:
 		scan = [
 			i
 			for i, t in enumerate(targets)
-			if i == ti or list_id not in (t.get("lists") or {})
+			if i == ti or list_id not in t.get("lists", {})
 		]
 	else:
 		scan = [ti]
@@ -4091,7 +4058,7 @@ def get_list_usage(project, ti, list_id) -> Counter:
 			if not isinstance(block, dict):
 				continue
 
-			f = (block.get("fields") or {}).get("LIST")
+			f = block.get("fields", {}).get("LIST")
 
 			if isinstance(f, list) and len(f) > 1 and f[1] == list_id:
 				op = block.get("opcode")
@@ -4108,7 +4075,7 @@ def get_list_usage(project, ti, list_id) -> Counter:
 				else:
 					use["other"] += 1
 
-			for iv in (block.get("inputs") or {}).values():
+			for iv in block.get("inputs", {}).values():
 				scan_prim(iv)
 
 	for m in project.get("monitors", []):
@@ -4168,7 +4135,7 @@ def find_large_lists(
 	found: list[dict[str, Any]] = []
 
 	for ti, target in enumerate(project.get("targets", [])):
-		for lid, entry in (target.get("lists") or {}).items():
+		for lid, entry in target.get("lists", {}).items():
 			if not (
 				isinstance(entry, list)
 				and len(entry) >= 2
@@ -4486,7 +4453,7 @@ def get_data_refs(project: dict[str, Any], var_owners=None, list_owners=None):
 					broadcast_refs.setdefault(block[2], []).append(desc)
 
 			for v in (
-				(block.get("inputs") or {}).values() if isinstance(block, dict) else ()
+				block.get("inputs", {}).values() if isinstance(block, dict) else ()
 			):
 				for node in iterate_input_nodes(v):
 					if len(node) <= 2 or not isinstance(node[2], str):
@@ -4504,7 +4471,7 @@ def get_data_refs(project: dict[str, Any], var_owners=None, list_owners=None):
 			if not isinstance(block, dict):
 				continue
 
-			fields = block.get("fields") or {}
+			fields = block.get("fields", {})
 			for name, f in fields.items():
 				if isinstance(f, list) and f and name in ("VARIABLE", "LIST"):
 					add_named_refs(
@@ -4536,7 +4503,7 @@ def get_data_refs(project: dict[str, Any], var_owners=None, list_owners=None):
 				):
 					prop_name = prop_field[0]
 					for target_idx, t in enumerate(targets):
-						for vid, vdata in (t.get("variables") or {}).items():
+						for vid, vdata in t.get("variables", {}).items():
 							if (
 								isinstance(vdata, list)
 								and len(vdata) > 0
@@ -4565,9 +4532,9 @@ def get_data_refs(project: dict[str, Any], var_owners=None, list_owners=None):
 		mid = m.get("id")
 		desc = f"monitor {mid!r} ({op})"
 		if op == "data_variable" and isinstance(mid, str):
-			add_var_ref(ti, mid, desc, (m.get("params") or {}).get("VARIABLE"))
+			add_var_ref(ti, mid, desc, m.get("params", {}).get("VARIABLE"))
 		elif op == "data_listcontents" and isinstance(mid, str):
-			add_list_ref(ti, mid, desc, (m.get("params") or {}).get("LIST"))
+			add_list_ref(ti, mid, desc, m.get("params", {}).get("LIST"))
 
 	return var_refs, list_refs, broadcast_refs
 
@@ -4583,10 +4550,10 @@ def _rename_id_map(ids, existing_ids=(), prefix=""):
 	n = 0
 
 	for old in ids:
-		new = f"{prefix}{_short_id(n)}"
+		new = f"{prefix}{short_id(n)}"
 		while new in used:
 			n += 1
-			new = f"{prefix}{_short_id(n)}"
+			new = f"{prefix}{short_id(n)}"
 		result[old] = new
 		used.add(new)
 		n += 1
@@ -4607,7 +4574,7 @@ def _replace_field_id(block, field_names, mapping):
 	if not isinstance(block, dict):
 		return 0
 	changed = 0
-	fields = block.get("fields") or {}
+	fields = block.get("fields", {})
 	for name in field_names:
 		f = fields.get(name)
 		if isinstance(f, list) and len(f) > 1 and f[1] in mapping:
@@ -4819,7 +4786,7 @@ def rename_variable_list_ids(
 	return var_map, list_map
 
 
-def _replace_broadcast_ids_in_value(value, mapping):
+def replace_broadcast_ids_in_value(value, mapping):
 	for node in iterate_input_nodes(value):
 		if (
 			len(node) > 2
@@ -4830,7 +4797,7 @@ def _replace_broadcast_ids_in_value(value, mapping):
 			node[2] = mapping[node[2]]
 
 
-def _collect_broadcast_references(project: dict[str, Any]) -> dict[str, Any]:
+def get_broadcast_refs(project: dict[str, Any]) -> dict[str, Any]:
 	refs = {}
 
 	def add(bid: str, name: str | None = None, desc: str | None = None):
@@ -4859,14 +4826,14 @@ def _collect_broadcast_references(project: dict[str, Any]) -> dict[str, Any]:
 					)
 
 			for value in (block.get("inputs") or {}).values():
-				_collect_broadcast_refs_in_value(
+				get_broadcast_refs_in_value(
 					value, add, f"block {bid!r} ({block.get('opcode')}) in {tname!r}"
 				)
 
 	return refs
 
 
-def _collect_broadcast_refs_in_value(value, add, desc=None):
+def get_broadcast_refs_in_value(value, add, desc=None):
 	for node in iterate_input_nodes(value):
 		if (
 			len(node) > 2
@@ -4877,7 +4844,7 @@ def _collect_broadcast_refs_in_value(value, add, desc=None):
 			add(node[2], name, desc)
 
 
-def _all_broadcast_ids(project):
+def get_all_broadcast_ids(project):
 	ids = set()
 
 	for target in project.get("targets", []):
@@ -4886,7 +4853,7 @@ def _all_broadcast_ids(project):
 	return ids
 
 
-def _repair_dangling_broadcast_refs(project, stats):
+def repair_dangling_broadcast_refs(project, stats):
 	targets = project.get("targets", [])
 	stage_index = next((i for i, t in enumerate(targets) if t.get("isStage")), None)
 
@@ -4895,11 +4862,11 @@ def _repair_dangling_broadcast_refs(project, stats):
 
 	stage = targets[stage_index]
 	broadcasts = stage.setdefault("broadcasts", {})
-	defined = _all_broadcast_ids(project)
+	defined = get_all_broadcast_ids(project)
 	repaired = set()
 	conflicts = {}
 
-	for bid, info in _collect_broadcast_references(project).items():
+	for bid, info in get_broadcast_refs(project).items():
 		if bid in defined:
 			continue
 
@@ -4935,7 +4902,7 @@ def rename_broadcast_ids(project, stats, existing_ids=(), frequency_order=False)
 						ids.add(f[1])
 
 				for value in (block.get("inputs") or {}).values():
-					_collect_broadcast_ids_in_value(value, ids)
+					get_broadcast_ids_in_value(value, ids)
 
 	if frequency_order:
 		_, _, bcast_refs = get_data_refs(project)
@@ -4959,13 +4926,13 @@ def rename_broadcast_ids(project, stats, existing_ids=(), frequency_order=False)
 			_replace_field_id(block, ("BROADCAST_OPTION", "BROADCAST_INPUT"), mapping)
 
 			for value in (block.get("inputs") or {}).values():
-				_replace_broadcast_ids_in_value(value, mapping)
+				replace_broadcast_ids_in_value(value, mapping)
 
 	stats["broadcast_ids"] += len(mapping)
 	return mapping
 
 
-def _collect_broadcast_ids_in_value(value, ids):
+def get_broadcast_ids_in_value(value, ids):
 	if not isinstance(value, list) or not value:
 		return
 
@@ -4973,7 +4940,7 @@ def _collect_broadcast_ids_in_value(value, ids):
 		ids.add(value[2])
 	else:
 		for v in value:
-			_collect_broadcast_ids_in_value(v, ids)
+			get_broadcast_ids_in_value(v, ids)
 
 
 def parse_argument_ids(mut):
@@ -5517,10 +5484,10 @@ def rename_identifiers(
 				field = fields.get("PROPERTY")
 
 				if isinstance(field, list) and field and isinstance(field[0], str):
-					property_ti = _resolve_sensing_of_target(
+					property_ti = resolve_sensing_of_target(
 						project, ti, block, stage_index
 					)
-					new_prop = _resolve_renamed_property_name(
+					new_prop = resolve_renamed_property_name(
 						ti,
 						field[0],
 						variable_names,
@@ -5648,7 +5615,7 @@ def rename_identifiers(
 	}
 
 
-def _target_index_for_object_name(targets, object_name, stage_index):
+def get_target_idx_from_obj(targets, object_name, stage_index):
 	if not isinstance(object_name, str):
 		return None
 
@@ -5662,7 +5629,7 @@ def _target_index_for_object_name(targets, object_name, stage_index):
 	return None
 
 
-def _resolve_sensing_of_target(project, ti, block, stage_index):
+def resolve_sensing_of_target(project, ti, block, stage_index):
 	targets = project.get("targets", [])
 	if not isinstance(block, dict):
 		return ti
@@ -5692,12 +5659,12 @@ def _resolve_sensing_of_target(project, ti, block, stage_index):
 							fields = menu.get("fields") or {}
 							field = fields.get("OBJECT")
 							if isinstance(field, list) and field:
-								index = _target_index_for_object_name(
+								index = get_target_idx_from_obj(
 									targets, field[0], stage_index
 								)
 								if index is not None:
 									return index
-						index = _target_index_for_object_name(targets, ref, stage_index)
+						index = get_target_idx_from_obj(targets, ref, stage_index)
 						if index is not None:
 							return index
 				else:
@@ -5706,7 +5673,7 @@ def _resolve_sensing_of_target(project, ti, block, stage_index):
 						return index
 
 			if value[0] == PRIMITIVE_TEXT and isinstance(value[1], str):
-				index = _target_index_for_object_name(targets, value[1], stage_index)
+				index = get_target_idx_from_obj(targets, value[1], stage_index)
 				if index is not None:
 					return index
 
@@ -5719,7 +5686,7 @@ def _resolve_sensing_of_target(project, ti, block, stage_index):
 			fields = value.get("fields") or {}
 			field = fields.get("OBJECT")
 			if isinstance(field, list) and field:
-				index = _target_index_for_object_name(targets, field[0], stage_index)
+				index = get_target_idx_from_obj(targets, field[0], stage_index)
 				if index is not None:
 					return index
 			for child in value.values():
@@ -5733,7 +5700,7 @@ def _resolve_sensing_of_target(project, ti, block, stage_index):
 	return selected if selected is not None else ti
 
 
-def _resolve_renamed_property_name(
+def resolve_renamed_property_name(
 	ti,
 	old_name,
 	variable_names,
@@ -5763,7 +5730,7 @@ def _resolve_renamed_property_name(
 	return None
 
 
-def _restore_identifier_names(project, renamed_names):
+def restore_identifier_names(project, renamed_names):
 	if not renamed_names:
 		return
 	targets = project.get("targets", [])
@@ -5914,10 +5881,10 @@ def _restore_identifier_names(project, renamed_names):
 				field = fields.get("PROPERTY")
 
 				if isinstance(field, list) and field and isinstance(field[0], str):
-					property_ti = _resolve_sensing_of_target(
+					property_ti = resolve_sensing_of_target(
 						project, ti, block, stage_index
 					)
-					restored = _resolve_original_property_name(
+					restored = resolve_original_property_name(
 						ti,
 						field[0],
 						variable_name_rev,
@@ -5978,7 +5945,7 @@ def _restore_identifier_names(project, renamed_names):
 				params["LIST"] = list_names[owner]
 
 
-def _resolve_original_property_name(
+def resolve_original_property_name(
 	ti,
 	current_name,
 	variable_name_rev,
@@ -6008,13 +5975,13 @@ def _resolve_original_property_name(
 	return None
 
 
-def _all_referenced_ids(project):
+def all_referenced_ids(project):
 	vars_, lists_, broadcasts = _collect_data_ids(project)
 	return vars_, lists_, broadcasts
 
 
 def remove_unused_data(project, stats, remove_variables=True, remove_lists=True):
-	used_vars, used_lists, _ = _all_referenced_ids(project)
+	used_vars, used_lists, _ = all_referenced_ids(project)
 	removed_vars = removed_lists = 0
 
 	for ti, target in enumerate(project.get("targets", [])):
@@ -6060,7 +6027,7 @@ def remove_unused_broadcasts(project, stats):
 	return removed
 
 
-def _is_hat(block):
+def is_hat_block(block):
 	if not isinstance(block, dict):
 		return False
 
@@ -6100,7 +6067,7 @@ class ProjectGraph:
 					parents.setdefault(nxt, set()).add(bid)
 
 				for value in (block.get("inputs") or {}).values():
-					for ref in set(_iter_input_block_refs(value)):
+					for ref in set(iter_input_block_refs(value)):
 						if ref in blocks:
 							out.add(ref)
 
@@ -6149,7 +6116,7 @@ class ProjectGraph:
 				new_out.add(nxt)
 
 			for value in (block.get("inputs") or {}).values():
-				for ref in set(_iter_input_block_refs(value)):
+				for ref in set(iter_input_block_refs(value)):
 					if ref in blocks:
 						new_out.add(ref)
 
@@ -6194,14 +6161,14 @@ class ProjectGraph:
 		return self
 
 
-def _build_block_graph(target, graph=None) -> dict:
+def build_block_graph(target, graph=None) -> dict:
 	if graph is None:
 		graph = ProjectGraph(target)
 
 	return graph.edges
 
 
-def _repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
+def repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 	if not isinstance(value, list) or not value:
 		return value, False
 
@@ -6219,7 +6186,7 @@ def _repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 			return None, True
 
 		if isinstance(ref, (list, dict)):
-			fixed, changed = _repair_dangling_block_ref(ref, blocks)
+			fixed, changed = repair_dangling_block_ref(ref, blocks)
 
 			if fixed is None:
 				return None, True
@@ -6251,7 +6218,7 @@ def _repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 			if isinstance(shadow, str) and shadow not in blocks:
 				return [value[0], value[1]], True
 			if isinstance(shadow, (list, dict)):
-				fixed, shadow_changed = _repair_dangling_block_ref(shadow, blocks)
+				fixed, shadow_changed = repair_dangling_block_ref(shadow, blocks)
 
 				if fixed is None:
 					return [value[0], value[1]], True
@@ -6267,7 +6234,7 @@ def _repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 		v = value[i]
 
 		if isinstance(v, (list, dict)):
-			fixed, sub_changed = _repair_dangling_block_ref(v, blocks)
+			fixed, sub_changed = repair_dangling_block_ref(v, blocks)
 
 			if fixed is None:
 				continue
@@ -6279,7 +6246,7 @@ def _repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 	return value, changed
 
 
-def _is_known_orphan_argument_reporter(block, blocks) -> bool:
+def is_orphan_arg_reporter(block, blocks) -> bool:
 	if not isinstance(block, dict):
 		return False
 
@@ -6291,7 +6258,7 @@ def _is_known_orphan_argument_reporter(block, blocks) -> bool:
 	)
 
 
-def _iter_input_block_refs(value):
+def iter_input_block_refs(value):
 	if not isinstance(value, list) or not value:
 		return
 
@@ -6302,21 +6269,21 @@ def _iter_input_block_refs(value):
 			if isinstance(ref, str):
 				yield ref
 			elif isinstance(ref, (list, dict)):
-				yield from _iter_input_block_refs(ref)
+				yield from iter_input_block_refs(ref)
 		return
 	if tag == INPUT_DIFF_BLOCK_SHADOW:
 		for ref in value[1:3]:
 			if isinstance(ref, str):
 				yield ref
 			elif isinstance(ref, (list, dict)):
-				yield from _iter_input_block_refs(ref)
+				yield from iter_input_block_refs(ref)
 		return
 	for item in value[1:]:
 		if isinstance(item, (list, dict)):
-			yield from _iter_input_block_refs(item)
+			yield from iter_input_block_refs(item)
 
 
-def _repair_dangling_block_refs(
+def repair_dangling_block_refs(
 	target: dict[str, Any], preserve_comments: bool = False, preserve_refs=()
 ):
 	blocks = target.get("blocks", {})
@@ -6332,7 +6299,7 @@ def _repair_dangling_block_refs(
 			ref = block.get(key)
 
 			if isinstance(ref, str) and ref not in available:
-				if key == "parent" and _is_known_orphan_argument_reporter(
+				if key == "parent" and is_orphan_arg_reporter(
 					block, blocks
 				):
 					continue
@@ -6345,7 +6312,7 @@ def _repair_dangling_block_refs(
 			continue
 
 		for name in list(inputs):
-			fixed_value, changed = _repair_dangling_block_ref(inputs[name], available)
+			fixed_value, changed = repair_dangling_block_ref(inputs[name], available)
 
 			if not changed:
 				continue
@@ -6365,7 +6332,7 @@ def _repair_dangling_block_refs(
 			continue
 
 		for value in (block.get("inputs") or {}).values():
-			for child_id in _iter_input_block_refs(value):
+			for child_id in iter_input_block_refs(value):
 				if child_id in blocks:
 					input_owners.setdefault(child_id, set()).add(owner_id)
 
@@ -6448,7 +6415,7 @@ def new_id():
 	return str(uuid.uuid4()).replace("-", "")[:20]
 
 
-def _procedure_key(block):
+def procedure_key(block):
 	mut = block.get("mutation") if isinstance(block, dict) else None
 	if not isinstance(mut, dict):
 		return None
@@ -6491,7 +6458,7 @@ def _sequence_reporter_block(block) -> bool:
 
 
 def _sequence_input_refs(value, blocks):
-	for ref in _iter_input_block_refs(value):
+	for ref in iter_input_block_refs(value):
 		if ref in blocks:
 			yield ref
 
@@ -6580,7 +6547,7 @@ def _sequence_block_signature(
 
 	for name in sorted((block.get("inputs") or {}).keys()):
 		value = block["inputs"][name]
-		if not _is_boolean_slot(block, name) and _sequence_input_parameterizable(
+		if not is_boolean_slot(block, name) and _sequence_input_parameterizable(
 			value, blocks
 		):
 			inputs_sig.append((name, "PARAM"))
@@ -6674,7 +6641,7 @@ def _sequence_compare(
 			if a_value == b_value:
 				continue
 
-			if _is_boolean_slot(a, name) or not (
+			if is_boolean_slot(a, name) or not (
 				_sequence_input_parameterizable(a_value, blocks)
 				and _sequence_input_parameterizable(b_value, blocks)
 			):
@@ -6697,7 +6664,7 @@ def _sequence_collect_closure(sequence, blocks, graph=None) -> set:
 			continue
 
 		for value in (block.get("inputs") or {}).values():
-			for ref in _iter_input_block_refs(value):
+			for ref in iter_input_block_refs(value):
 				if ref in blocks and ref not in closure:
 					closure.add(ref)
 					stack.append(ref)
@@ -7127,7 +7094,7 @@ def _sequence_prepare_candidate(sequences, blocks, comments, graph, threshold):
 			if len({dumps_compact(v) for v in values}) <= 1:
 				continue
 
-			if _is_boolean_slot(base_block, input_name) or not all(
+			if is_boolean_slot(base_block, input_name) or not all(
 				_sequence_input_parameterizable(v, blocks) for v in values
 			):
 				return None
@@ -7168,12 +7135,12 @@ def _sequence_estimate_group_savings(
 	)
 
 	seq_index = {bid: i for i, bid in enumerate(base)}
-	body_fake_ids = {bid: _short_id(20 + i) for i, bid in enumerate(base_closure)}
+	body_fake_ids = {bid: short_id(20 + i) for i, bid in enumerate(base_closure)}
 
 	for i, bid in enumerate(base):
 		body_fake_ids[bid] = f"{20 + i:020d}"
 
-	body_reporter_ids = [_short_id(128 + i) for i in range(parameter_count)]
+	body_reporter_ids = [short_id(128 + i) for i in range(parameter_count)]
 
 	def entry_cost(bid, block):
 		return (
@@ -7331,7 +7298,7 @@ def _sequence_estimate_group_savings(
 
 	def fresh_fake_id():
 		nonlocal fake_counter
-		value = _short_id(fake_counter)
+		value = short_id(fake_counter)
 		fake_counter += 1
 		return value
 
@@ -7563,11 +7530,11 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 
 		proc_counter = 0
 		existing_procs = {
-			_procedure_key(block)
+			procedure_key(block)
 			for block in blocks.values()
 			if isinstance(block, dict)
 			and block.get("opcode") in ("procedures_prototype", "procedures_call")
-			and isinstance(_procedure_key(block), str)
+			and isinstance(procedure_key(block), str)
 		}
 
 		for _, candidate_sequences in scored_candidates:
@@ -8097,7 +8064,7 @@ def _procedure_infos(target):
 			continue
 
 		mut = proto.get("mutation")
-		proc = _procedure_key(proto)
+		proc = procedure_key(proto)
 		argids = parse_argument_ids(mut)
 
 		if not isinstance(mut, dict) or proc is None or argids is None:
@@ -8327,7 +8294,7 @@ def _procedure_recursive_set(by_proc):
 					or block.get("opcode") != "procedures_call"
 				):
 					continue
-				called = _procedure_key(block)
+				called = procedure_key(block)
 				if called in by_proc:
 					call_graph[proc].add(called)
 
@@ -8381,7 +8348,7 @@ def _inline_argument_reporter_refs(
 				if changed:
 					value[index] = new_item
 
-					if index == 1 and _is_bare_literal_input(new_item):
+					if index == 1 and is_literal_input(new_item):
 						return new_item, True
 
 					return value, True
@@ -8458,7 +8425,7 @@ def _clone_procedure_closure(
 			return None
 
 		for raw in (block.get("inputs") or {}).values():
-			if any(ref not in closure for ref in _iter_input_block_refs(raw)):
+			if any(ref not in closure for ref in iter_input_block_refs(raw)):
 				return None
 
 	old_ids = list(closure)
@@ -8486,7 +8453,7 @@ def _clone_procedure_closure(
 
 		if isinstance(new.get("inputs"), dict):
 			for raw in new["inputs"].values():
-				_replace_input_block_ids(raw, new_ids)
+				replace_input_block_ids(raw, new_ids)
 
 		if old_id == info["definition_id"]:
 			new["parent"] = None
@@ -8564,7 +8531,7 @@ def _clone_procedure_closure(
 			if any(
 				rid in cloned_reporters
 				for raw in (block.get("inputs") or {}).values()
-				for rid in _iter_input_block_refs(raw)
+				for rid in iter_input_block_refs(raw)
 			):
 				still_referenced = True
 				break
@@ -8587,7 +8554,7 @@ def _clone_procedure_closure(
 				return None
 
 		for raw in (block.get("inputs") or {}).values():
-			refs = set(_iter_input_block_refs(raw))
+			refs = set(iter_input_block_refs(raw))
 			if any(ref not in clones for ref in refs):
 				return None
 
@@ -8639,7 +8606,7 @@ def specialize_procedures(project, stats, opts):
 				):
 					continue
 
-				proc = _procedure_key(block)
+				proc = procedure_key(block)
 
 				if proc is not None:
 					calls_by_proc.setdefault(proc, []).append((call_id, block))
@@ -8963,7 +8930,7 @@ def inline_single_use_procedures(project, stats, opts):
 				):
 					continue
 
-				proc = _procedure_key(block)
+				proc = procedure_key(block)
 
 				if proc is not None:
 					calls_by_proc.setdefault(proc, []).append((call_id, block))
@@ -9202,7 +9169,7 @@ def inline_single_use_procedures(project, stats, opts):
 
 						if any(
 							ref in removed
-							for ref in _iter_input_block_refs(check_value)
+							for ref in iter_input_block_refs(check_value)
 						):
 							can_inline = False
 							break
@@ -9292,7 +9259,7 @@ def _clear_procedure_definition_shadow(target, proto_id):
 	if (
 		not isinstance(custom, list)
 		or not custom
-		or _scratch_numeric_tag(custom[0]) != INPUT_DIFF_BLOCK_SHADOW
+		or scratch_numeric_tag(custom[0]) != INPUT_DIFF_BLOCK_SHADOW
 	):
 		return False
 
@@ -9423,7 +9390,7 @@ def optimize_procedure_arguments(project, stats, opts):
 
 		for bid, block in blocks.items():
 			if isinstance(block, dict) and block.get("opcode") == "procedures_call":
-				proc = _procedure_key(block)
+				proc = procedure_key(block)
 
 				if proc is not None:
 					calls_by_proc.setdefault(proc, []).append((bid, block))
@@ -9703,7 +9670,7 @@ def optimize_procedure_arguments(project, stats, opts):
 					old_ids[i] for i in removed_set
 				}
 
-			reference_counts = _count_block_references(target)
+			reference_counts = count_block_refs(target)
 			old_names = json.loads(base_mut.get("argumentnames") or "[]")
 			removed_names = {old_names[i] for i in removed_set if i < len(old_names)}
 
@@ -9754,7 +9721,7 @@ def _canonicalize_procedure(target, info, graph=None, procedure_aliases=None):
 		graph = ProjectGraph(target)
 	procedure_aliases = procedure_aliases or {}
 	self_proc = info["mutation"].get("proccode")
-	procedure_arg_ids = list(info.get("argument_ids") or [])
+	procedure_arg_ids = list(info.get("argument_ids", []))
 	procedure_arg_id_map = {old: f"@arg{i}" for i, old in enumerate(procedure_arg_ids)}
 	procedure_arg_names = {}
 	raw_argument_names = info["mutation"].get("argumentnames")
@@ -9797,7 +9764,7 @@ def _canonicalize_procedure(target, info, graph=None, procedure_aliases=None):
 		inputs = block.get("inputs") or {}
 
 		for name in sorted(inputs, reverse=True):
-			for ref in reversed(list(_iter_input_block_refs(inputs[name]))):
+			for ref in reversed(list(iter_input_block_refs(inputs[name]))):
 				if ref in closure and ref not in seen:
 					stack.append(ref)
 
@@ -10057,7 +10024,7 @@ def merge_duplicate_procedures(project, stats, opts):
 						isinstance(block, dict)
 						and block.get("opcode") == "procedures_call"
 					):
-						call_counts[_procedure_key(block)] += 1
+						call_counts[procedure_key(block)] += 1
 
 				def key(item):
 					proc, info = item
@@ -10087,7 +10054,7 @@ def merge_duplicate_procedures(project, stats, opts):
 						if (
 							isinstance(call, dict)
 							and call.get("opcode") == "procedures_call"
-							and _procedure_key(call) == source_proc
+							and procedure_key(call) == source_proc
 						):
 							old_ids = parse_argument_ids(call.get("mutation"))
 							if old_ids is None or len(old_ids) != len(canonical_ids):
@@ -10109,7 +10076,7 @@ def merge_duplicate_procedures(project, stats, opts):
 							if (
 								isinstance(call, dict)
 								and call.get("opcode") == "procedures_call"
-								and _procedure_key(call) == source_proc
+								and procedure_key(call) == source_proc
 							):
 								_rewrite_procedure_call_to_canonical(
 									call, canonical_proc, canonical_ids
@@ -10160,12 +10127,12 @@ def remove_unused_procedures(project, stats):
 			if not isinstance(b, dict) or b.get("opcode") != "procedures_definition":
 				continue
 
-			custom = (b.get("inputs") or {}).get("custom_block") or [None, None]
+			custom = b.get("inputs", {}).get("custom_block", [None, None])
 			proto_id = (
 				custom[1] if len(custom) > 1 and isinstance(custom[1], str) else None
 			)
 			proto = blocks.get(proto_id)
-			proc = _procedure_key(proto) if isinstance(proto, dict) else None
+			proc = procedure_key(proto) if isinstance(proto, dict) else None
 
 			if proc is None:
 				continue
@@ -10194,7 +10161,7 @@ def remove_unused_procedures(project, stats):
 				b = blocks.get(x)
 
 				if isinstance(b, dict) and b.get("opcode") == "procedures_call":
-					proc = _procedure_key(b)
+					proc = procedure_key(b)
 
 					if proc is not None and proc not in live_procs:
 						queue.append(proc)
@@ -10232,7 +10199,7 @@ def remove_unused_procedures(project, stats):
 
 		removed_procedures += len(dead_procs)
 
-		stats["procedure_dangling_block_refs_fixed"] += _repair_dangling_block_refs(
+		stats["procedure_dangling_block_refs_fixed"] += repair_dangling_block_refs(
 			target
 		)
 
@@ -10788,7 +10755,7 @@ def fold_constant_variables(project, selected, stats) -> int:
 				continue
 
 			for input_name, value in (block.get("inputs") or {}).items():
-				if _is_boolean_slot(block, input_name):
+				if is_boolean_slot(block, input_name):
 					continue  # would leave a literal in a boolean slot
 
 				changed += _replace_constant_variable_reporters(
@@ -11422,7 +11389,7 @@ def _constant_expression_block(block_id, blocks, visiting):
 
 
 def _input_block_ids(value, blocks):
-	return {ref for ref in _iter_input_block_refs(value) if ref in blocks}
+	return {ref for ref in iter_input_block_refs(value) if ref in blocks}
 
 
 def _exclusive_input_block_subtree(value, blocks, owner_id, graph=None):
@@ -12549,7 +12516,7 @@ def simplify_double_boolean_negation(
 		return None
 
 	if not (
-		_is_boolean_slot(blocks.get(owner_id), input_name)
+		is_boolean_slot(blocks.get(owner_id), input_name)
 		or value_is_boolean(operand, blocks)
 	):
 		return None
@@ -13153,14 +13120,14 @@ def literal_from_input(value):
 	if not (
 		isinstance(value, list)
 		and len(value) == 2
-		and _scratch_numeric_tag(value[0]) == INPUT_SAME_BLOCK_SHADOW
+		and scratch_numeric_tag(value[0]) == INPUT_SAME_BLOCK_SHADOW
 	):
 		return None
 	literal = value[1]
 	if not (isinstance(literal, list) and len(literal) == 2):
 		return None
 	tag, raw = literal
-	tag = _scratch_numeric_tag(tag)
+	tag = scratch_numeric_tag(tag)
 	if (
 		tag in NUMERIC_TAGS
 		and not isinstance(raw, bool)
@@ -13184,7 +13151,7 @@ def plan_unwrap_not(raw, blocks, owner_id, incoming_refs, graph):
 	if not_block.get("opcode") != "operator_not" or not_block.get("next") is not None:
 		return None
 	operand = (not_block.get("inputs") or {}).get("OPERAND")
-	if operand is None or _is_bare_literal_input(operand):
+	if operand is None or is_literal_input(operand):
 		return None
 	owned = get_exclusive_input_subtree(
 		raw, blocks, owner_id, incoming_refs, graph=graph
@@ -14275,7 +14242,7 @@ def replace_known_reads(
 
 	if (
 		len(value) >= 3
-		and _scratch_numeric_tag(value[0]) == PRIMITIVE_VARIABLE
+		and scratch_numeric_tag(value[0]) == PRIMITIVE_VARIABLE
 		and isinstance(value[2], str)
 		and value[2] in env
 	):
@@ -14284,7 +14251,7 @@ def replace_known_reads(
 		entry = env[value[2]]
 		return [INPUT_SAME_BLOCK_SHADOW, copy.deepcopy(entry)], True, set()
 
-	tag = _scratch_numeric_tag(value[0])
+	tag = scratch_numeric_tag(value[0])
 
 	if tag in INPUT_TAGS and len(value) > 1 and isinstance(value[1], str):
 		ref = value[1]
@@ -14338,7 +14305,7 @@ def replace_known_reads(
 						ti,
 						opts,
 						graph,
-						allow_literal=not _is_boolean_slot(child, child_input_name),
+						allow_literal=not is_boolean_slot(child, child_input_name),
 						visiting=child_visiting,
 					)
 
@@ -14385,7 +14352,7 @@ def replace_known_reads(
 				visiting=visiting,
 			)
 			if c:
-				if i == 1 and _is_bare_literal_input(new):
+				if i == 1 and is_literal_input(new):
 					return new, True, removed | dead
 
 				value[i] = new
@@ -14411,7 +14378,7 @@ def get_cfg_statement_roots(blocks) -> list:
 			continue
 		if block.get("topLevel") is True:
 			roots.append(bid)
-		elif block.get("parent") is None and _is_hat(block):
+		elif block.get("parent") is None and is_hat_block(block):
 			roots.append(bid)
 
 	return roots
@@ -14869,7 +14836,7 @@ def _cfg_propagate_root_constants(
 				ti,
 				opts,
 				graph,
-				allow_literal=not _is_boolean_slot(block, input_name),
+				allow_literal=not is_boolean_slot(block, input_name),
 			)
 			if not changed:
 				continue
@@ -14969,9 +14936,9 @@ def compact_data_literals(project, stats):
 
 
 def strip_reference_names(project, stats):
-	scopes = _reference_scopes(project)
+	scopes = get_ref_scopes(project)
 	count = 0
-	for path, container, index, ident, kind in _reference_name_slots(project):
+	for path, container, index, ident, kind in get_ref_name_slots(project):
 		name = container[index]
 		if (
 			type(name) is str
@@ -15183,8 +15150,8 @@ def fold_constant_expressions(
 						):
 							new_input = copy.deepcopy(replacement)
 							if not (
-								_is_boolean_slot(block, input_name)
-								and _is_bare_literal_input(new_input)
+								is_boolean_slot(block, input_name)
+								and is_literal_input(new_input)
 							):
 								for child_id in _input_block_ids(new_input, blocks):
 									child = blocks.get(child_id)
@@ -15330,9 +15297,9 @@ def fold_constant_expressions(
 						if new_input is None:
 							continue
 
-						if _is_boolean_slot(
+						if is_boolean_slot(
 							block, input_name
-						) and _is_bare_literal_input(new_input):
+						) and is_literal_input(new_input):
 							continue  # a literal can't live in a boolean slot
 
 						if isinstance(replacement, list):
@@ -15370,7 +15337,7 @@ def fold_constant_expressions(
 						parent_id=block_id,
 						incoming_refs=incoming_refs,
 						graph=graph,
-						slot_is_boolean=_is_boolean_slot(block, input_name)
+						slot_is_boolean=is_boolean_slot(block, input_name)
 					)
 					law_new_ids = set()
 					if laws is not None and laws.get("law") == "complement":
@@ -15385,8 +15352,8 @@ def fold_constant_expressions(
 							if (
 								new_input is None
 								or (
-									_is_boolean_slot(block, input_name)
-									and _is_bare_literal_input(new_input)
+									is_boolean_slot(block, input_name)
+									and is_literal_input(new_input)
 								)
 							):
 								# roll back if result cannot occupy this input
@@ -15467,7 +15434,7 @@ def fold_constant_expressions(
 					)
 					if new_input is None:
 						continue
-					if _is_boolean_slot(block, input_name) and _is_bare_literal_input(
+					if is_boolean_slot(block, input_name) and is_literal_input(
 						new_input
 					):
 						continue  # a literal can't live in a boolean slot
@@ -16118,10 +16085,11 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	inherited_dangling = [
 		_dangling_block_ids(target) for target in project.get("targets", [])
 	]
-	progress = progress or ProgressBar(_progress_stage_count(opts))
+	progress = progress or ProgressBar(progress_stage_count(opts))
 	stage = progress.next
 	stage("Normalize block defaults")
 	stats = minify_blocks(project)
+
 	if opts.convert_wav_to_mp3 and assets is not None:
 		stage("Convert WAV sounds to MP3")
 		opts.wav_conversions = convert_wav_sounds_to_mp3(project, assets, stats)
@@ -16179,7 +16147,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		remove_constant_variable_setters(
 			project, opts.folded_constant_variable_setters, stats, opts
 		)
-	if opts.constant_propagation or opts.fold_constant_expressions:
+	if opts.constant_propagation or opts.fold_constant_expressions or opts.associative_constant_merging:
 		stage("Propagate, fold & merge associative constants")
 		while True:
 			round_changes = 0
@@ -16262,7 +16230,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		)
 	stage("Repair dangling broadcast references")
 	opts.repaired_broadcast_ids, opts.broadcast_repair_conflicts = (
-		_repair_dangling_broadcast_refs(project, stats)
+		repair_dangling_broadcast_refs(project, stats)
 	)
 	if opts.remove_unused_broadcasts:
 		stage("Remove unused broadcasts")
@@ -16366,13 +16334,16 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.remove_unused_extensions:
 		stage("Remove unused extensions")
 		remove_unused_extensions(project, stats, opts)
+	
 	stage("Repair dangling block links")
+	
 	for ti, target in enumerate(project.get("targets", [])):
-		stats["dangling_block_refs_fixed"] += _repair_dangling_block_refs(
+		stats["dangling_block_refs_fixed"] += repair_dangling_block_refs(
 			target,
 			preserve_comments=not opts.comments,
 			preserve_refs=inherited_dangling[ti],
 		)
+	
 	return stats
 
 
@@ -16413,7 +16384,7 @@ def _restore_block_ids(project, renamed_ids):
 					if key in block:
 						block[key] = block_ids.get(block[key], block[key])
 				for value in (block.get("inputs") or {}).values():
-					_replace_input_block_ids(value, block_ids)
+					replace_input_block_ids(value, block_ids)
 		for comment in (target.get("comments") or {}).values():
 			if (
 				isinstance(comment, dict)
@@ -16520,7 +16491,7 @@ def _restore_broadcast_ids(project, mapping):
 			if isinstance(block, dict):
 				_replace_field_id(block, ("BROADCAST_OPTION", "BROADCAST_INPUT"), rev)
 				for value in (block.get("inputs") or {}).values():
-					_replace_broadcast_ids_in_value(value, rev)
+					replace_broadcast_ids_in_value(value, rev)
 
 
 def _restore_argument_ids(project, mapping):
@@ -16608,7 +16579,7 @@ def _check_broadcast_consistency(project):
 				return f"broadcast {bid!r} has conflicting definitions {definitions[bid][0]!r} and {name!r}"
 			definitions[bid] = (name, ti)
 
-	for bid, info in _collect_broadcast_references(project).items():
+	for bid, info in get_broadcast_refs(project).items():
 		if bid not in definitions:
 			names = sorted(info["names"])
 			if len(names) > 1:
@@ -16622,7 +16593,7 @@ def _check_broadcast_consistency(project):
 
 
 def _check_broadcast_ids_resolve(project):
-	valid = _all_broadcast_ids(project)
+	valid = get_all_broadcast_ids(project)
 	for target in project.get("targets", []):
 		for bid, b in target.get("blocks", {}).items():
 			if not isinstance(b, dict):
@@ -16672,7 +16643,7 @@ def _check_block_references_resolve(project, original=None):
 			if (
 				isinstance(parent, str)
 				and parent not in blocks
-				and not _is_known_orphan_argument_reporter(block, blocks)
+				and not is_orphan_arg_reporter(block, blocks)
 				and not (parent not in old_blocks and old_block.get("parent") == parent)
 			):
 				return f"{target.get('name')!r}/{bid!r}: parent points to missing block {parent!r}"
@@ -16684,10 +16655,10 @@ def _check_block_references_resolve(project, original=None):
 			):
 				return f"{target.get('name')!r}/{bid!r}: next points to missing block {nxt!r}"
 			for name, value in (block.get("inputs") or {}).items():
-				for child_id in _iter_input_block_refs(value):
+				for child_id in iter_input_block_refs(value):
 					if child_id not in blocks:
 						if child_id not in old_blocks and any(
-							child_id in _iter_input_block_refs(value)
+							child_id in iter_input_block_refs(value)
 							for value in (old_block.get("inputs") or {}).values()
 						):
 							continue
@@ -16862,7 +16833,7 @@ def _check_inputs_match(
 		and _input_has_dangling_block_ref(oi, remaining_blocks)
 	):
 		expected = copy.deepcopy(oi)
-		expected, _ = _repair_dangling_block_ref(expected, remaining_blocks)
+		expected, _ = repair_dangling_block_ref(expected, remaining_blocks)
 		if expected is None:
 			return False
 		if expected != oi:
@@ -17201,7 +17172,7 @@ def _check_blocks(
 			allowed_gone = set()
 			if allow_repairs and remaining_blocks is not None:
 				for name in gone_inputs:
-					fixed, changed = _repair_dangling_block_ref(
+					fixed, changed = repair_dangling_block_ref(
 						copy.deepcopy(o["inputs"][name]), remaining_blocks
 					)
 					if changed and fixed is None:
@@ -17460,7 +17431,7 @@ def _check_blocks(
 				k == "parent"
 				and m[k] is None
 				and isinstance(o[k], str)
-				and _is_known_orphan_argument_reporter(o, original_blocks or {})
+				and is_orphan_arg_reporter(o, original_blocks or {})
 				and o[k] not in (original_blocks or {})
 			):
 				continue
@@ -17602,7 +17573,7 @@ def _validate_asset_entries(project, zf, label, payload_cache=None):
 
 
 def _serialized_input_refs(value, out):
-	out.update(_iter_input_block_refs(value))
+	out.update(iter_input_block_refs(value))
 
 
 def _validate_block_structure(project, label, original=None):
@@ -17639,7 +17610,7 @@ def _validate_block_structure(project, label, original=None):
 						and old_block.get(key) == ref
 					):
 						continue
-					if key == "parent" and _is_known_orphan_argument_reporter(
+					if key == "parent" and is_orphan_arg_reporter(
 						block, blocks
 					):
 						continue
@@ -17714,7 +17685,7 @@ def _validate_block_structure(project, label, original=None):
 						and old_parent.get("next") != bid
 						and isinstance(old_parent.get("inputs"), dict)
 						and not any(
-							bid in _iter_input_block_refs(value)
+							bid in iter_input_block_refs(value)
 							for value in old_parent["inputs"].values()
 						)
 					)
@@ -17732,7 +17703,7 @@ def _validate_block_structure(project, label, original=None):
 						and isinstance(old_owner, dict)
 						and isinstance(old_owner.get("inputs"), dict)
 						and any(
-							bid in _iter_input_block_refs(value)
+							bid in iter_input_block_refs(value)
 							for value in old_owner["inputs"].values()
 						)
 					):
@@ -17830,7 +17801,7 @@ def _check_costumes(original_target, minified_target, opts, zf):
 
 def _reachable_block_ids(target):
 	blocks = target.get("blocks", {})
-	edges = _build_block_graph(target)
+	edges = build_block_graph(target)
 	roots = {
 		bid
 		for bid, block in blocks.items()
@@ -17866,10 +17837,10 @@ def _dead_procedure_block_ids(target):
 			or block.get("opcode") != "procedures_definition"
 		):
 			continue
-		custom = (block.get("inputs") or {}).get("custom_block") or [None, None]
+		custom = block.get("inputs", {}).get("custom_block", [None, None])
 		proto_id = custom[1] if len(custom) > 1 and isinstance(custom[1], str) else None
 		proto = blocks.get(proto_id)
-		proc = _procedure_key(proto) if isinstance(proto, dict) else None
+		proc = procedure_key(proto) if isinstance(proto, dict) else None
 		if proc is None:
 			continue
 		todo, seen = [bid], set()
@@ -17890,7 +17861,7 @@ def _dead_procedure_block_ids(target):
 		for bid in ids:
 			b = blocks.get(bid)
 			if isinstance(b, dict) and b.get("opcode") == "procedures_call":
-				proc = _procedure_key(b)
+				proc = procedure_key(b)
 				if proc is not None and proc not in live:
 					queue.append(proc)
 
@@ -18264,7 +18235,7 @@ def _restore_representation_for_verify(original, result, opts):
 		result = _rebuild_procedure_displays(result)
 
 	if getattr(opts, "prune_orphan_arguments", False):
-		original = _prune_orphan_arguments(original, result)
+		original = prune_orphan_arguments(original, result)
 
 	if getattr(opts, "relabel_block_ids", False):
 		try:
@@ -18290,7 +18261,7 @@ def _restore_representation_for_verify(original, result, opts):
 			...
 
 	if getattr(opts, "compact_reference_names", False):
-		result = _restore_reference_names(original, result, copy_result=False)
+		result = restore_ref_names(original, result, copy_result=False)
 
 	if getattr(opts, "prune_unused_data", False):
 		try:
@@ -18322,8 +18293,8 @@ def _restore_representation_for_verify(original, result, opts):
 	for ti, (left_target, right_target) in enumerate(
 		zip(original.get("targets", []), result.get("targets", []))
 	):
-		left_blocks = left_target.get("blocks") or {}
-		right_blocks = right_target.get("blocks") or {}
+		left_blocks = left_target.get("blocks", {})
+		right_blocks = right_target.get("blocks", {})
 
 		for bid, left in left_blocks.items():
 			right = right_blocks.get(bid)
@@ -18353,7 +18324,7 @@ def _restore_representation_for_verify(original, result, opts):
 			):
 				if left.get("next", False) is None and "next" not in right:
 					right["next"] = None
-				left_fields = left.get("fields") or {}
+				left_fields = left.get("fields", {})
 				right_fields = right.get("fields")
 
 				if isinstance(right_fields, dict):
@@ -18529,7 +18500,7 @@ def verify(original_path, minified_path, opts):
 			or opts.rename_argument_names
 			or opts.rename_procedure_names
 		):
-			_restore_identifier_names(mini, opts.renamed_identifiers)
+			restore_identifier_names(mini, opts.renamed_identifiers)
 
 		for key in set(orig) | set(mini):
 			if key == "extensions" and getattr(opts, "remove_unused_extensions", False):
@@ -18545,8 +18516,8 @@ def verify(original_path, minified_path, opts):
 				continue
 			if key not in ("targets", "monitors") and orig.get(key) != mini.get(key):
 				if key == "meta" and opts.remove_project_meta:
-					mo = orig.get("meta") or {}
-					mm = mini.get("meta") or {}
+					mo = orig.get("meta", {})
+					mm = mini.get("meta", {})
 					if mo.get("semver") == mm.get("semver") and mo.get("vm") == mm.get(
 						"vm"
 					):
@@ -18881,7 +18852,7 @@ def verify(original_path, minified_path, opts):
 						f"Target {ti} ({name!r}): comments remain ({len(cm)} comments) despite comment stripping enabled",
 					)
 			else:
-				_mini_blocks = tm.get("blocks") or {}
+				_mini_blocks = tm.get("blocks", {})
 				_missing_cids = set(co) - set(cm)
 				_orphaned_ok = {
 					cid
@@ -19573,7 +19544,7 @@ def minify_sb3(src, dst, opts=None):
 		}
 
 		print("\n" + Ansi.prompt("--- BEGIN ---") + "\n")
-		progress = ProgressBar(_progress_stage_count(opts))
+		progress = ProgressBar(progress_stage_count(opts))
 		stats = apply_transforms(project, opts, assets, progress)
 		
 		if opts.relabel_block_ids:
@@ -19794,9 +19765,9 @@ def _dangling_block_ids(target):
 			v = block.get(key)
 			if isinstance(v, str) and v not in ids:
 				dangling.add(v)
-		for value in (block.get("inputs") or {}).values():
-			_collect_dangling_in_input(value, ids, dangling)
-	for comment in (target.get("comments") or {}).values():
+		for value in block.get("inputs", {}).values():
+			collect_dangling_in_input(value, ids, dangling)
+	for comment in target.get("comments", {}).values():
 		if isinstance(comment, dict):
 			bid = comment.get("blockId")
 			if isinstance(bid, str) and bid not in ids:
