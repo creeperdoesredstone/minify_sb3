@@ -1,51 +1,12 @@
 import sys
 
 from math import isfinite
+from tools.output import Ansi
 
 
 DEFAULT_LIST_BYTES = 4096
 DEFAULT_LIST_ITEMS = 1000
 DEFAULT_EPSILON = 1e-8
-
-
-class AnsiPrint:
-	RESET = "\033[0m"
-	BOLD = "\033[1m"
-	DIM = "\033[2m"
-	RED = "\033[31m"
-	GREEN = "\033[32m"
-	YELLOW = "\033[33m"
-	PURPLE = "\033[35m"
-	CYAN = "\033[36m"
-
-	def __init__(self, enabled=None):
-		self.enabled = sys.stdout.isatty() if enabled is None else enabled
-
-	def paint(self, text, *codes):
-		if not self.enabled:
-			return text
-		return f"{''.join(codes)}{text}{self.RESET}"
-
-	def heading(self, text):
-		return self.paint(text, self.BOLD, self.CYAN)
-
-	def subheading(self, text):
-		return self.paint(text, self.PURPLE)
-
-	def success(self, text):
-		return self.paint(text, self.GREEN)
-
-	def warning(self, text):
-		return self.paint(text, self.YELLOW)
-
-	def error(self, text):
-		return self.paint(text, self.RED)
-
-	def muted(self, text):
-		return self.paint(text, self.DIM)
-
-	def prompt(self, text):
-		return self.paint(text, self.BOLD)
 
 
 class Options:
@@ -626,6 +587,3 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 	)
 
 	return opts
-
-
-Ansi = AnsiPrint()
