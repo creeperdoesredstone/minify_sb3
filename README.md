@@ -565,6 +565,9 @@ The lossless verifier checks:
 - exact JSON values;
 - collection order.
 
+The lossless path preserves JSON numeric values without converting decimal tokens
+through binary floating point.
+
 The only permitted representation changes are the ones explicitly selected by the lossless options, such as approved block-flag/default compaction or block-ID relabeling.
 
 `--all-lossless`, `--all-safe`, and `--all-safe-flags` enable the strongest built-in lossless bundle and require Zopfli.

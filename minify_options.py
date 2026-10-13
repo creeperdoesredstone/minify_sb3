@@ -1,12 +1,51 @@
 import sys
 
 from math import isfinite
-from .output import Ansi
 
 
 DEFAULT_LIST_BYTES = 4096
 DEFAULT_LIST_ITEMS = 1000
 DEFAULT_EPSILON = 1e-8
+
+
+class AnsiPrint:
+	RESET = "\033[0m"
+	BOLD = "\033[1m"
+	DIM = "\033[2m"
+	RED = "\033[31m"
+	GREEN = "\033[32m"
+	YELLOW = "\033[33m"
+	PURPLE = "\033[35m"
+	CYAN = "\033[36m"
+
+	def __init__(self, enabled=None):
+		self.enabled = sys.stdout.isatty() if enabled is None else enabled
+
+	def paint(self, text, *codes):
+		if not self.enabled:
+			return text
+		return f"{''.join(codes)}{text}{self.RESET}"
+
+	def heading(self, text):
+		return self.paint(text, self.BOLD, self.CYAN)
+
+	def subheading(self, text):
+		return self.paint(text, self.PURPLE)
+
+	def success(self, text):
+		return self.paint(text, self.GREEN)
+
+	def warning(self, text):
+		return self.paint(text, self.YELLOW)
+
+	def error(self, text):
+		return self.paint(text, self.RED)
+
+	def muted(self, text):
+		return self.paint(text, self.DIM)
+
+	def prompt(self, text):
+		return self.paint(text, self.BOLD)
 
 
 class Options:
@@ -365,7 +404,6 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 					values[key] = n
 					continue
 		bad.append(f)
-	
 	if bad:
 		print(Ansi.error(f"Unknown or malformed option(s): {bad}"))
 		print(
@@ -374,7 +412,6 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 			)
 		)
 		sys.exit(1)
-	
 	if not args:
 		print(Ansi.error("Path and flags are not specified."))
 		print(
@@ -386,7 +423,6 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 	if "--strip-covered-shadows" in flags and "--keep-covered" in flags:
 		print(Ansi.error("--strip-covered-shadows is incompatible with --keep-covered"))
 		sys.exit(1)
-	
 	for strip, keep in (
 		("--strip-editor-comments", "--keep-comments"),
 		("--strip-script-positions", "--keep-positions"),
@@ -397,7 +433,6 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 		if strip in flags and keep in flags:
 			print(Ansi.error(f"{strip} is incompatible with {keep}"))
 			sys.exit(1)
-	
 	if "--fast-json" in flags and "--thorough-json" in flags:
 		print(Ansi.error("--fast-json is incompatible with --thorough-json"))
 		sys.exit(1)
@@ -591,3 +626,6 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 	)
 
 	return opts
+
+
+Ansi = AnsiPrint()
