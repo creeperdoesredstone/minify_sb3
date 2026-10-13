@@ -1,51 +1,3 @@
-import copy
-import hashlib
-import os
-import zlib
-
-from .json_layout import (
-	JsonNumber,
-	_number_components,
-	copy_json,
-	dumps_exact,
-	get_shortest_num_repr,
-	is_record_order_irrelevant,
-	loads_exact,
-	quote,
-	BLOCK_KEY_ORDERS
-)
-from .metadata import (
-	_SYNC_REPORTERS,
-	_rebuild_procedure_displays,
-	_restore_editor_metadata,
-	_terminal_link_ids,
-	_covered_shadow_slots,
-	_compact_procedure_symbols,
-	_editor_position_keys,
-	_editor_comment_ids,
-	_unused_data_ids,
-	_restore_unused_data,
-	_restore_procedure_symbols,
-	_restore_covered_shadows,
-	restore_ref_names,
-	get_orphan_argument_ids,
-)
-from .output import _render_layout
-from .tags import (
-	INPUT_SAME_BLOCK_SHADOW,
-	INPUT_BLOCK_NO_SHADOW,
-	INPUT_DIFF_BLOCK_SHADOW,
-	INPUT_TAGS,
-	_input_tag
-)
-from .transforms import strip_reference_names
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
-from itertools import permutations, product
-from typing import Any, NoReturn
-
-
 def exact_difference(
 	original: dict[str, Any],
 	result: dict[str, Any],
@@ -269,21 +221,21 @@ def compact_representation(
 	strip_editor_comments: bool = False,
 	strip_script_positions: bool = False,
 	prune_unused_data: bool = False,
-	rebuild_procedure_displays: bool = False,
+	rebuild_proc_displays: bool = False,
 	compact_terminal_links: bool = False,
 ) -> dict[str, Any]:
 	if (
 		compact_procedure_symbols
 		or compact_reference_names
 		or strip_covered_shadows
-		or rebuild_procedure_displays
+		or rebuild_proc_displays
 	):
 		project = copy_json(project)
 
 	if prune_orphan_arguments:
 		project = prune_orphan_arguments(project)
 
-	if rebuild_procedure_displays:
+	if rebuild_proc_displays:
 		project = _rebuild_procedure_displays(project)
 
 	if strip_covered_shadows:

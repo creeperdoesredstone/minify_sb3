@@ -1,38 +1,3 @@
-import copy
-import json
-import re
-
-from .json_layout import JsonNumber, _number_components, _REFERENCE_FIELDS
-from .json_optimizer import (
-	javascript_keys,
-	_block_slots,
-	_identifier_names
-)
-from .options import Options
-from .tags import (
-	INPUT_SAME_BLOCK_SHADOW,
-	INPUT_BLOCK_NO_SHADOW,
-	INPUT_DIFF_BLOCK_SHADOW,
-	PRIMITIVE_NUMBER,
-	PRIMITIVE_POSITIVE_NUMBER,
-	PRIMITIVE_WHOLE_NUMBER,
-	PRIMITIVE_INTEGER,
-	PRIMITIVE_ANGLE,
-	PRIMITIVE_COLOR,
-	PRIMITIVE_TEXT,
-	PRIMITIVE_BROADCAST,
-	PRIMITIVE_VARIABLE,
-	PRIMITIVE_LIST,
-	INPUT_TAGS,
-	NUMERIC_TAGS,
-	CONTAINER_TAGS,
-	_input_tag
-)
-from collections import Counter
-from collections.abc import Generator
-from typing import Any
-
-
 def get_ref_name_slots(project) -> Generator:
 	def primitive(node, path):
 		if not isinstance(node, list) or len(node) < 3:
@@ -1669,3 +1634,5 @@ def _rebuild_procedure_displays(project):
 		result["targets"].append(target)
 
 	return result
+
+
