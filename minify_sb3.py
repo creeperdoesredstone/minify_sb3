@@ -506,7 +506,7 @@ def get_orphan_argument_ids(target):
 	return orphans
 
 
-def prune_orphan_arguments(project, result=None):
+def _prune_orphan_arguments(project, result=None):
 	pruned = dict(project)
 	pruned["targets"] = []
 
@@ -1982,7 +1982,7 @@ def exact_difference(
 		result = _rebuild_procedure_displays(result)
 
 	if prune_orphan_arguments:
-		original = prune_orphan_arguments(original, result)
+		original = _prune_orphan_arguments(original, result)
 
 	if (
 		relabel_block_ids
@@ -2194,7 +2194,7 @@ def compact_representation(
 		project = copy_json(project)
 
 	if prune_orphan_arguments:
-		project = prune_orphan_arguments(project)
+		project = _prune_orphan_arguments(project)
 
 	if rebuild_procedure_displays:
 		project = _rebuild_procedure_displays(project)
@@ -6365,7 +6365,7 @@ def remove_unreachable_blocks(project, stats, stat_key="unreachable_blocks_remov
 	return removed
 
 
-def new_id():
+def _new_id():
 	return str(uuid.uuid4()).replace("-", "")[:20]
 
 
@@ -6706,10 +6706,10 @@ def _sequence_replace_direct_ref(value, old_id, new_id):
 
 
 def _sequence_new_id(blocks, generated):
-	bid = new_id()
+	bid = _new_id()
 
 	while bid in blocks or bid in generated:
-		bid = new_id()
+		bid = _new_id()
 
 	return bid
 
@@ -6810,10 +6810,10 @@ def _sequence_default_value(value, blocks) -> str:
 def _sequence_make_argument_reporter(
 	generated, parent_id, arg_id, name, shadow=False, blocks=None
 ):
-	bid = new_id()
+	bid = _new_id()
 
 	while bid in generated or (blocks is not None and bid in blocks):
-		bid = new_id()
+		bid = _new_id()
 
 	block = {
 		"opcode": "argument_reporter_string_number",
@@ -7548,10 +7548,10 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			argument_defaults = []
 
 			for pidx in range(parameter_count):
-				arg_id = new_id()
+				arg_id = _new_id()
 
 				while arg_id in generated or arg_id in blocks or arg_id in argument_ids:
-					arg_id = new_id()
+					arg_id = _new_id()
 
 				argument_ids.append(arg_id)
 				arg_name = f"p{pidx}"
@@ -7913,6 +7913,9 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			graph.refresh_after_mutation(
 				changed=set(owner_previews) | set(generated),
 				removed=removed,
+			)
+			_debug_structure_checkpoint(
+				project, f"sequence group commit in target {ti}, generated {len(generated)} blocks"
 			)
 
 
@@ -8386,10 +8389,10 @@ def _clone_procedure_closure(
 	new_ids = {}
 
 	for old_id in old_ids:
-		new_bid = new_id()
+		new_bid = _new_id()
 
 		while new_bid in blocks or new_bid in new_ids.values():
-			new_bid = new_id()
+			new_bid = _new_id()
 
 		new_ids[old_id] = new_bid
 
@@ -9497,13 +9500,55 @@ def optimize_procedure_arguments(project, stats, opts):
 			if not can_constant_fold:
 				only_unused = [idx for idx in removable if idx not in constants]
 				removed_set = set(only_unused)
-				remaining_indices = [
-					i for i in range(len(base_ids)) if i not in removed_set
-				]
 				constants = {}
 
 				if not removed_set:
 					continue
+
+			commented_ids = get_comment_ids(target)
+			safe_removed = set(removed_set)
+			for call_id, call in calls:
+				call_mut = call.get("mutation")
+				call_ids = parse_argument_ids(call_mut)
+				if not isinstance(call_mut, dict) or call_ids is None or len(call_ids) != len(base_ids):
+					safe_removed.clear()
+					break
+
+				call_inputs = call.get("inputs") or {}
+				for idx in tuple(safe_removed):
+					subtree = _exclusive_input_block_subtree(
+						call_inputs.get(call_ids[idx]), blocks, call_id
+					)
+					if subtree is None or any(
+						bid in commented_ids
+						or (isinstance(blocks.get(bid), dict) and "comment" in blocks[bid])
+						for bid in (subtree or ())
+					):
+						safe_removed.discard(idx)
+
+			removed_set = safe_removed
+			constants = {
+				idx: literal for idx, literal in constants.items() if idx in removed_set
+			}
+			if not removed_set:
+				continue
+			remaining_indices = [i for i in range(len(base_ids)) if i not in removed_set]
+
+			call_removed_subtrees = {}
+			for call_id, call in calls:
+				call_ids = parse_argument_ids(call.get("mutation"))
+				if call_ids is None or len(call_ids) != len(base_ids):
+					call_removed_subtrees[call_id] = set()
+					continue
+				call_inputs = call.get("inputs") or {}
+				removed_blocks = set()
+				for idx in removed_set:
+					subtree = _exclusive_input_block_subtree(
+						call_inputs.get(call_ids[idx]), blocks, call_id
+					)
+					if subtree:
+						removed_blocks.update(subtree)
+				call_removed_subtrees[call_id] = removed_blocks
 
 			for info, usage in body_uses:
 				proto_id = info["prototype_id"]
@@ -9624,6 +9669,11 @@ def optimize_procedure_arguments(project, stats, opts):
 					old_ids[i] for i in removed_set
 				}
 
+				removed_value_blocks = call_removed_subtrees.get(call_id, set())
+				for value_block_id in removed_value_blocks:
+					blocks.pop(value_block_id, None)
+				opts.procedure_argument_removed_blocks[ti].update(removed_value_blocks)
+
 			reference_counts = count_block_refs(target)
 			old_names = json.loads(base_mut.get("argumentnames") or "[]")
 			removed_names = {old_names[i] for i in removed_set if i < len(old_names)}
@@ -9661,6 +9711,7 @@ def optimize_procedure_arguments(project, stats, opts):
 
 			total_removed += len(removed_set)
 			total_constant += len(constants)
+			graph.rebuild()
 
 	stats["procedure_arguments_removed"] += total_removed
 	stats["procedure_constant_arguments_folded"] += total_constant
@@ -13176,9 +13227,9 @@ def plan_empty_then(blocks, control_id, incoming_refs, graph, commented):
 	)
 	if owned is None or owned & commented:
 		return None
-	new_bid = new_id()
+	new_bid = _new_id()
 	while new_bid in blocks:
-		new_bid = new_id()
+		new_bid = _new_id()
 	new_block = {
 		"opcode": "operator_not",
 		"next": None,
@@ -13250,9 +13301,9 @@ def plan_nested_if(blocks, outer_id, incoming_refs, graph, commented):
 		return None
 	if ({inner_id} | outer_owned | inner_owned) & commented:
 		return None
-	new_bid: str = new_id()
+	new_bid: str = _new_id()
 	while new_bid in blocks:
-		new_bid = new_id()
+		new_bid = _new_id()
 	new_block = {
 		"opcode": "operator_and",
 		"next": None,
@@ -13782,6 +13833,9 @@ def factor_branches(project, stats, opts) -> int:
 				stats["branch_factor_bytes_saved"] += before - after
 				for key, value in local.items():
 					stats[key] += value
+				_debug_structure_checkpoint(
+					project, f"branch factoring ({plan['kind']}) in target {ti}, control block {control_id!r}"
+				)
 				total += 1
 				changed = True
 				break
@@ -13813,6 +13867,13 @@ def simplify_script_structures(project, stats, opts) -> int:
 		]
 		while True:
 			changed = False
+			debug_rewrite_keys = (
+				"branch_swaps",
+				"empty_then_rewrites",
+				"repeat_until_not_rewrites",
+				"nested_if_merges",
+			)
+			debug_before_rewrites = {key: stats.get(key, 0) for key in debug_rewrite_keys}
 			for bid in candidate_ids:
 				block = blocks.get(bid)
 				if not isinstance(block, dict) or bid not in blocks:
@@ -13984,6 +14045,14 @@ def simplify_script_structures(project, stats, opts) -> int:
 						stats["nested_if_merges"] += 1
 						changed = True
 						break
+			if changed and _DEBUG_STRUCTURE_ENABLED:
+				debug_changed = next(
+					(key for key in debug_rewrite_keys if stats.get(key, 0) > debug_before_rewrites[key]),
+					"unknown control rewrite",
+				)
+				_debug_structure_checkpoint(
+					project, f"{debug_changed} in target {ti}, control block {bid!r}"
+				)
 			if not changed:
 				break
 
@@ -15735,7 +15804,31 @@ def compact_numeric_inputs(project, stats):
 	return count
 
 
+class _DebugStructureError(RuntimeError):
+	...
+
+
+_DEBUG_STRUCTURE_ENABLED = False
+_DEBUG_STRUCTURE_BASELINE = None
+
+
+def _debug_structure_checkpoint(project, label):
+	if not _DEBUG_STRUCTURE_ENABLED:
+		return
+	debug_project = _reinflate(copy.deepcopy(project))
+	error = _validate_block_structure(
+		debug_project, f"structure debug after {label}", _DEBUG_STRUCTURE_BASELINE
+	)
+	if error:
+		raise _DebugStructureError(error)
+
+
 def apply_transforms(project, opts: Options, assets=None, progress=None):
+	global _DEBUG_STRUCTURE_ENABLED, _DEBUG_STRUCTURE_BASELINE
+	_DEBUG_STRUCTURE_ENABLED = os.environ.get("MINIFY_DEBUG_STRUCTURE", "").strip().lower() in (
+		"1", "true", "yes", "on"
+	)
+	_DEBUG_STRUCTURE_BASELINE = copy.deepcopy(project) if _DEBUG_STRUCTURE_ENABLED else None
 	inherited_dangling = [
 		_dangling_block_ids(target) for target in project.get("targets", [])
 	]
@@ -15743,6 +15836,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	stage = progress.next
 	stage("Normalize block defaults")
 	stats = minify_blocks(project)
+	_debug_structure_checkpoint(project, "block-default normalization")
 
 	if opts.convert_wav_to_mp3 and assets is not None:
 		stage("Convert WAV sounds to MP3")
@@ -15771,6 +15865,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			set((target.get("blocks") or {})) for target in project.get("targets", [])
 		]
 		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_first")
+		_debug_structure_checkpoint(project, "first unreachable-block removal")
 		opts.unreachable_removed_blocks_first = [
 			before[ti] - set((target.get("blocks") or {}))
 			for ti, target in enumerate(project.get("targets", []))
@@ -15781,6 +15876,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			set((target.get("blocks") or {})) for target in project.get("targets", [])
 		]
 		remove_unused_procedures(project, stats)
+		_debug_structure_checkpoint(project, "initial unused-procedure removal")
 		opts.unused_procedure_removed_blocks = [
 			before[ti] - set((target.get("blocks") or {}))
 			for ti, target in enumerate(project.get("targets", []))
@@ -15791,6 +15887,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			set((target.get("blocks") or {})) for target in project.get("targets", [])
 		]
 		remove_unreachable_blocks(project, stats, "unreachable_blocks_removed_second")
+		_debug_structure_checkpoint(project, "second unreachable-block removal")
 		opts.unreachable_removed_blocks_second = [
 			before[ti] - set((target.get("blocks") or {}))
 			for ti, target in enumerate(project.get("targets", []))
@@ -15801,18 +15898,22 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		remove_constant_variable_setters(
 			project, opts.folded_constant_variable_setters, stats, opts
 		)
+		_debug_structure_checkpoint(project, "constant-variable folding")
 	if opts.constant_propagation or opts.fold_constant_expressions or opts.associative_constant_merging:
 		stage("Propagate, fold & merge associative constants")
 		while True:
 			round_changes = 0
 			if opts.constant_propagation:
 				round_changes += constant_propagation(project, stats, opts)
+				_debug_structure_checkpoint(project, "constant propagation")
 
 			if opts.fold_constant_expressions:
 				round_changes += fold_constant_expressions(project, stats, opts)
+				_debug_structure_checkpoint(project, "constant-expression folding")
 
 			if opts.associative_constant_merging:
 				round_changes += merge_associative_constants(project, stats, opts)
+				_debug_structure_checkpoint(project, "associative-constant merging")
 
 			if round_changes == 0:
 				break
@@ -15824,33 +15925,43 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	):
 		stage("Rewrite script control structures")
 		simplify_script_structures(project, stats, opts)
+		_debug_structure_checkpoint(project, "script control-structure rewrites")
 	if opts.specialize_procedures:
 		stage("Specialize custom procedures")
 		specialize_procedures(project, stats, opts)
+		_debug_structure_checkpoint(project, "procedure specialization")
 	if opts.simplify_boolean_control:
 		stage("Simplify boolean control flow")
 		simplify_boolean_controls(project, stats, opts)
+		_debug_structure_checkpoint(project, "boolean-control simplification")
 	elif opts.trivial_loops:
 		stage("Simplify trivial boolean loops")
 		simplify_boolean_controls(project, stats, opts, only_repeat_one=True)
+		_debug_structure_checkpoint(project, "trivial-loop simplification")
 	if opts.simplify_blocks:
 		stage("Simplify setter RHS blocks")
 		_simplify_setter_rhs_blocks(project, stats, opts)
+		_debug_structure_checkpoint(project, "setter-RHS simplification")
 	if opts.optimize_procedure_arguments:
 		stage("Optimize procedure arguments")
 		optimize_procedure_arguments(project, stats, opts)
+		_debug_structure_checkpoint(project, "procedure-argument optimization")
 	if opts.clear_procedure_definition_shadows:
 		stage("Clear procedure definition shadows")
 		clear_procedure_definition_shadows(project, stats, opts)
+		_debug_structure_checkpoint(project, "procedure-definition shadow removal")
 	if opts.compact_procedure_prototypes:
 		stage("Compact procedure prototypes")
 		compact_procedure_prototypes(project, stats, opts)
+		_debug_structure_checkpoint(project, "procedure-prototype compaction")
 	if opts.merge_duplicate_procedures:
 		stage("Merge duplicate procedures")
 		merge_duplicate_procedures(project, stats, opts)
+		_debug_structure_checkpoint(project, "duplicate-procedure merging")
 	if opts.inline_single_use_procedures:
 		stage("Inline safe single-use procedures")
 		inline_single_use_procedures(project, stats, opts)
+		_debug_structure_checkpoint(project, "single-use procedure inlining")
 	if opts.remove_unused_procedures and (
 		opts.optimize_procedure_arguments
 		or opts.merge_duplicate_procedures
@@ -15870,6 +15981,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			opts.unused_procedure_removed_blocks = [
 				set() for _ in project.get("targets", [])
 			]
+		_debug_structure_checkpoint(project, "post-rewrite unused-procedure removal")
 		for ti, removed_ids in enumerate(final_removed):
 			if ti >= len(opts.unused_procedure_removed_blocks):
 				opts.unused_procedure_removed_blocks.append(set())
@@ -15877,6 +15989,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 	if opts.group_similar_sequences:
 		stage("Group similar sequences")
 		group_similar_sequences(project, stats, opts.sequence_threshold, opts)
+		_debug_structure_checkpoint(project, "similar-sequence grouping")
 	if opts.remove_unused_variables or opts.remove_unused_lists:
 		stage("Remove unused variables/lists")
 		remove_unused_data(
@@ -15997,6 +16110,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			preserve_comments=not opts.comments,
 			preserve_refs=inherited_dangling[ti],
 		)
+	_debug_structure_checkpoint(project, "dangling-block-link repair")
 	
 	return stats
 
@@ -17344,7 +17458,25 @@ def _validate_block_structure(project, label, original=None):
 						)
 					)
 					if not inherited:
-						return f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: parent {parent!r} does not reference this block"
+						parent_refs = set()
+						for input_value in (pb.get("inputs") or {}).values():
+							parent_refs.update(iter_input_block_refs(input_value))
+						old_child = original_blocks.get(bid)
+						old_parent = original_blocks.get(parent)
+						old_parent_refs = set()
+						if isinstance(old_parent, dict):
+							for input_value in (old_parent.get("inputs") or {}).values():
+								old_parent_refs.update(iter_input_block_refs(input_value))
+						return (
+							f"{label}, target {ti} ({target.get('name')!r}), block {bid!r}: "
+							f"parent {parent!r} does not reference this block; "
+							f"child opcode={block.get('opcode')!r}, child.next={block.get('next')!r}, "
+							f"parent opcode={pb.get('opcode')!r}, parent.next={pb.get('next')!r}, "
+							f"parent input refs={sorted(parent_refs)!r}; "
+								f"original child parent={(old_child.get('parent') if isinstance(old_child, dict) else None)!r}, "
+								f"original parent next={(old_parent.get('next') if isinstance(old_parent, dict) else None)!r}, "
+								f"original parent input refs={sorted(old_parent_refs)!r}"
+						)
 			for child in input_parents.get(bid, set()):
 				cb = blocks.get(bid)
 				if isinstance(cb, dict) and cb.get("parent") != child:
@@ -17889,17 +18021,21 @@ def _restore_representation_for_verify(original, result, opts):
 		result = _rebuild_procedure_displays(result)
 
 	if getattr(opts, "prune_orphan_arguments", False):
-		original = prune_orphan_arguments(original, result)
+		original = _prune_orphan_arguments(original, result)
 
 	if getattr(opts, "relabel_block_ids", False):
-		try:
-			result = restore_block_labels(original, result, copy_result=False)
+		_rename_map = getattr(opts, "renamed_block_ids", {}) or {}
+		if _rename_map:
+			_restore_block_ids(result, _rename_map)
 			restored_block_ids = True
-		except (ValueError, KeyError, TypeError):
-			if getattr(opts, "rename_block_ids", False):
-				_rename_map = getattr(opts, "renamed_block_ids", {}) or {}
-				_restore_block_ids(result, _rename_map)
-				restored_block_ids = bool(_rename_map)
+		else:
+			try:
+				result = restore_block_labels(original, result, copy_result=False)
+				restored_block_ids = True
+			except (ValueError, KeyError, TypeError):
+				if getattr(opts, "rename_block_ids", False):
+					_restore_block_ids(result, _rename_map)
+					restored_block_ids = bool(_rename_map)
 
 	if getattr(opts, "rename_block_ids", False) and not restored_block_ids:
 		_rename_map = getattr(opts, "renamed_block_ids", {}) or {}
@@ -19085,7 +19221,11 @@ def minify_sb3(src, dst, opts=None):
 
 		print("\n" + Ansi.prompt("--- BEGIN ---") + "\n")
 		progress = ProgressBar(progress_stage_count(opts))
-		stats = apply_transforms(project, opts, assets, progress)
+		try:
+			stats = apply_transforms(project, opts, assets, progress)
+		except _DebugStructureError as error:
+			print(Ansi.error(f"\nStructural debug stopped before writing output:\n{error}"))
+			return 1
 		
 		if opts.relabel_block_ids:
 			progress.next("Minimize block IDs")
@@ -19104,6 +19244,14 @@ def minify_sb3(src, dst, opts=None):
 			}
 			opts.rename_block_ids = True
 			stats["block_id_bytes_saved"] = label_cost["before"] - label_cost["after"]
+			if _DEBUG_STRUCTURE_ENABLED:
+				_debug_restored = copy.deepcopy(project)
+				_restore_block_ids(_debug_restored, opts.renamed_block_ids)
+				try:
+					_debug_structure_checkpoint(_debug_restored, "block-ID relabeling and restoration")
+				except _DebugStructureError as error:
+					print(Ansi.error(f"\nStructural debug stopped before writing output:\n{error}"))
+					return 1
 		
 		out_json = dumps_compact(project, opts.sort_keys).encode("utf-8")
 		compressed_json = None
@@ -19141,6 +19289,24 @@ def minify_sb3(src, dst, opts=None):
 					if isinstance(value, int)
 				}
 			)
+			if _DEBUG_STRUCTURE_ENABLED:
+				try:
+					_debug_original_raw = loads_exact(raw)
+					_debug_minified_raw = loads_exact(out_json)
+					_debug_original_raw, _debug_minified_raw, _ = _restore_representation_for_verify(
+						_debug_original_raw, _debug_minified_raw, opts
+					)
+					_debug_original = _reinflate(_debug_original_raw)
+					_debug_minified = _reinflate(_debug_minified_raw)
+					_debug_error = _validate_block_structure(
+						_debug_minified, "structure debug after project.json optimization", _debug_original
+					)
+					if _debug_error:
+						print(Ansi.error(f"\nStructural debug stopped before writing output:\n{_debug_error}"))
+						return 1
+				except Exception as error:
+					print(Ansi.error(f"\nStructural debug itself failed before writing output: {type(error).__name__}: {error}"))
+					return 1
 
 		progress.next(
 			"Process assets and write archive"
