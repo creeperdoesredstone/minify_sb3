@@ -2558,7 +2558,7 @@ def _clone_procedure_closure(
 	return clones, new_ids, new_definition_id, new_prototype_id, len(removed_reporters)
 
 
-def specialize_procedures(project, stats, opts):
+def specialize_procedures(project, stats, opts, progress):
 	targets = project.get("targets", [])
 	opts.specialized_procedure_new_blocks = [set() for _ in targets]
 	opts.specialized_procedure_removed_blocks = [set() for _ in targets]
@@ -2575,7 +2575,8 @@ def specialize_procedures(project, stats, opts):
 	completed_passes = 0
 	serial = 0
 
-	for _ in range(max_passes):
+	for pass_idx in range(max_passes):
+		progress.detail(f"pass {pass_idx + 1}")
 		changed_this_pass = False
 		for ti, target in enumerate(targets):
 			blocks = target.get("blocks") or {}

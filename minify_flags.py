@@ -114,7 +114,7 @@ toggles = {
 	"--compression",
 	"--all-groups",
     "--factor-math-expressions",
-    "--fms"
+    "--fme"
 }
 
 valued = {

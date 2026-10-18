@@ -41,10 +41,12 @@ class _DebugStructureError(RuntimeError): ...
 def _debug_structure_checkpoint(project, label):
 	if not _DEBUG_STRUCTURE_ENABLED:
 		return
+	
 	debug_project = _reinflate(copy.deepcopy(project))
 	error = _validate_block_structure(
 		debug_project, f"structure debug after {label}", _DEBUG_STRUCTURE_BASELINE
 	)
+	
 	if error:
 		raise _DebugStructureError(error)
 
@@ -134,8 +136,11 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		or opts.factor_math_expressions
 	):
 		stage("Propagate, fold & merge associative constants")
+		constant_passes = 1
 		while True:
+			progress.detail(f"pass {constant_passes}")
 			round_changes = 0
+
 			if opts.constant_propagation:
 				round_changes += constant_propagation(project, stats, opts)
 				_debug_structure_checkpoint(project, "constant propagation")
@@ -154,6 +159,9 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 
 			if round_changes == 0:
 				break
+
+			constant_passes += 1
+
 	if (
 		opts.branch_swapping
 		or opts.branch_factoring
@@ -165,7 +173,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		_debug_structure_checkpoint(project, "script control-structure rewrites")
 	if opts.specialize_procedures:
 		stage("Specialize custom procedures")
-		specialize_procedures(project, stats, opts)
+		specialize_procedures(project, stats, opts, progress)
 		_debug_structure_checkpoint(project, "procedure specialization")
 	if opts.simplify_boolean_control:
 		stage("Simplify boolean control flow")
