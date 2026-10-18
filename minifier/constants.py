@@ -691,6 +691,7 @@ STAT_GROUPS = [
 			("boolean_idempotent", "idempotent law rewrites"),
 			("boolean_absorption", "absorption law rewrites"),
 			("boolean_factoring", "boolean factorizations"),
+			("math_factoring", "math expression factorizations"),
 		],
 	),
 	(

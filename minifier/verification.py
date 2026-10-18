@@ -131,6 +131,7 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		opts.constant_propagation
 		or opts.fold_constant_expressions
 		or opts.associative_constant_merging
+		or opts.factor_math_expressions
 	):
 		stage("Propagate, fold & merge associative constants")
 		while True:
@@ -146,6 +147,10 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 			if opts.associative_constant_merging:
 				round_changes += merge_associative_constants(project, stats, opts)
 				_debug_structure_checkpoint(project, "associative-constant merging")
+
+			if opts.factor_math_expressions:
+				round_changes += factor_math_expressions(project, stats, opts)
+				_debug_structure_checkpoint(project, "math expression factoring")
 
 			if round_changes == 0:
 				break
@@ -2822,6 +2827,7 @@ def verify(original_path, minified_path, opts):
 						opts.remove_unreachable
 						or opts.remove_unused_procedures
 						or opts.fold_constant_expressions
+						or opts.factor_math_expressions
 						or opts.simplify_blocks
 						or opts.group_similar_sequences
 						or opts.fold_constant_variables

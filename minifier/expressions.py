@@ -1892,8 +1892,17 @@ def simplify_boolean_identities(
 	return None
 
 
-def apply_boolean_law_plan(
-	plan, blocks, graph, owner_id, input_name, ti, opts, stats, commented_ids
+def apply_plan(
+	plan,
+	blocks,
+	graph,
+	owner_id,
+	input_name,
+	ti,
+	opts,
+	stats,
+	commented_ids,
+	stats_group="boolean",
 ) -> bool:
 	if fold_blocked_by_comment(plan["touched"], blocks, commented_ids):
 		return False
@@ -1932,6 +1941,14 @@ def apply_boolean_law_plan(
 			target_inputs = target.get("inputs") or {}
 			target_id = outer_id if target is outer else inner_id
 
+			opcode_key = "outer_opcode" if target is outer else "inner_opcode"
+			new_opcode = plan.get(opcode_key)
+			if new_opcode is not None and target.get("opcode") != new_opcode:
+				target["opcode"] = new_opcode
+				opts.folded_constant_expression_opcode_edits[
+					(ti, target_id)
+				] = new_opcode
+
 			for name, raw in plan[key].items():
 				target_inputs[name] = copy.deepcopy(raw)
 				input_edits[(ti, target_id, name)] = copy.deepcopy(raw)
@@ -1956,7 +1973,7 @@ def apply_boolean_law_plan(
 		blocks.pop(remove_id, None)
 
 	graph.refresh_blocks(changed_ids)
-	stats["boolean_" + plan["law"]] += 1
+	stats[f"{stats_group}_{plan['law']}"] += 1
 	return True
 
 
@@ -2403,6 +2420,215 @@ def simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 	):
 		return None
 	return copy.deepcopy(preserve), removed
+
+
+def plan_math_expr_factoring(value, blocks, owner_id, incoming_refs, graph):
+	if not (
+		isinstance(value, list)
+		and len(value) > 1
+		and value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
+	):
+		return None
+	block_id = value[1]
+	if not isinstance(block_id, str) or block_id == owner_id:
+		return None
+	block = blocks.get(block_id)
+	if (
+		not isinstance(block, dict)
+		or block.get("opcode") != "operator_add"
+		or block.get("next") is not None
+		or block.get("parent") != owner_id
+	):
+		return None
+
+	inputs = block.get("inputs") or {}
+	left_raw, right_raw = inputs.get("NUM1"), inputs.get("NUM2")
+	if left_raw is None or right_raw is None:
+		return None
+
+	left_id = get_input_root(left_raw, blocks)
+	right_id = get_input_root(right_raw, blocks)
+	if (
+		left_id is None
+		or right_id is None
+		or left_id == right_id
+		or left_id in (owner_id, block_id)
+		or right_id in (owner_id, block_id)
+	):
+		return None
+
+	left = blocks.get(left_id)
+	right = blocks.get(right_id)
+	if not (
+		isinstance(left, dict)
+		and left.get("opcode") == "operator_multiply"
+		and left.get("next") is None
+		and left.get("parent") == block_id
+		and isinstance(right, dict)
+		and right.get("opcode") == "operator_multiply"
+		and right.get("next") is None
+		and right.get("parent") == block_id
+	):
+		return None
+
+	left_inputs = left.get("inputs") or {}
+	right_inputs = right.get("inputs") or {}
+
+	def coefficient_and_term(factors):
+		for coefficient_name, term_name in (("NUM1", "NUM2"), ("NUM2", "NUM1")):
+			raw_coefficient = factors.get(coefficient_name)
+			raw_term = factors.get(term_name)
+
+			if raw_coefficient is None or raw_term is None:
+				continue
+
+			constant = constexpr_from_input(raw_coefficient, blocks)
+
+			if constant is None:
+				continue
+
+			coefficient = constant_to_number(constant[0])
+
+			if coefficient is None or not math.isfinite(coefficient):
+				continue
+
+			if (
+				constexpr_from_input(raw_term, blocks) is not None
+				or not (
+					value_is_numeric(raw_term, blocks)
+					or _variable_reporter_id(raw_term, blocks) is not None
+				)
+			):
+				continue
+
+			return coefficient, raw_coefficient, raw_term
+
+		return None
+
+	left_parts = coefficient_and_term(left_inputs)
+	right_parts = coefficient_and_term(right_inputs)
+
+	if (
+		left_parts is None
+		or right_parts is None
+		or left_parts[0] != right_parts[0]
+	):
+		return None
+
+	owned = get_exclusive_input_subtree(
+		value, blocks, owner_id, incoming_refs, graph=graph
+	)
+
+	if owned is None or not {block_id, left_id, right_id} <= owned:
+		return None
+
+	_, raw_coefficient, left_term = left_parts
+	_, _, right_term = right_parts
+	outer_inputs = {
+		"NUM1": copy.deepcopy(raw_coefficient),
+		"NUM2": [INPUT_BLOCK_NO_SHADOW, left_id],
+	}
+	inner_inputs = {
+		"NUM1": copy.deepcopy(left_term),
+		"NUM2": copy.deepcopy(right_term),
+	}
+	preserved = {block_id, left_id}
+
+	for raw in (raw_coefficient, left_term, right_term):
+		preserved.update(get_subtree_block_ids(raw, blocks))
+
+	if not preserved <= owned:
+		return None
+
+	removed = owned - preserved
+
+	if not removed or right_id not in removed:
+		return None
+
+	link_updates = {}
+
+	for raw, parent_id in (
+		(raw_coefficient, block_id),
+		(left_term, left_id),
+		(right_term, left_id),
+	):
+		for child_id in direct_input_block_refs(raw, blocks):
+			child = blocks.get(child_id)
+
+			if isinstance(child, dict) and child.get("parent") != parent_id:
+				link_updates[child_id] = parent_id
+
+	return {
+		"outer_id": block_id,
+		"inner_id": left_id,
+		"outer_opcode": "operator_multiply",
+		"inner_opcode": "operator_add",
+		"outer_inputs": outer_inputs,
+		"inner_inputs": inner_inputs,
+		"link_updates": link_updates,
+		"owner_input": remap_block_input(value, block_id),
+		"old_parent": block.get("parent"),
+		"removed": removed,
+		"touched": removed | {block_id, left_id} | set(link_updates),
+		"law": "factoring"
+	}
+
+
+def factor_math_expressions(project, stats, opts):
+	targets = project.get("targets", [])
+	if opts.folded_constant_expression_link_edits is None:
+		opts.folded_constant_expression_link_edits = {}
+	if opts.folded_constant_expression_inputs is None:
+		opts.folded_constant_expression_inputs = {}
+	if opts.folded_constant_expression_opcode_edits is None:
+		opts.folded_constant_expression_opcode_edits = {}
+	if opts.folded_constant_expression_blocks is None or len(
+		opts.folded_constant_expression_blocks
+	) != len(targets):
+		opts.folded_constant_expression_blocks = [set() for _ in targets]
+
+	total = 0
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		graph = ProjectGraph(target)
+		commented_ids = {
+			comment.get("blockId")
+			for comment in (target.get("comments") or {}).values()
+			if isinstance(comment, dict) and comment.get("blockId") is not None
+		}
+
+		while True:
+			changed = False
+			for owner_id, owner in list(blocks.items()):
+				if not isinstance(owner, dict):
+					continue
+				for input_name, value in (owner.get("inputs") or {}).items():
+					plan = plan_math_expr_factoring(
+						value, blocks, owner_id, graph.incoming, graph
+					)
+					if plan is None:
+						continue
+					if apply_plan(
+						plan,
+						blocks,
+						graph,
+						owner_id,
+						input_name,
+						ti,
+						opts,
+						stats,
+						commented_ids,
+						"math",
+					):
+						total += 1
+						changed = True
+						break
+				if changed:
+					break
+			if not changed:
+				break
+
+	return total
 
 
 def get_control_substack(value, blocks):
@@ -5067,7 +5293,7 @@ def fold_constant_expressions(
 						else:
 							laws = None
 
-					applied_law = laws is not None and apply_boolean_law_plan(
+					applied_law = laws is not None and apply_plan(
 						laws,
 						blocks,
 						graph,
@@ -5077,6 +5303,7 @@ def fold_constant_expressions(
 						opts,
 						stats,
 						commented_ids,
+						"boolean"
 					)
 					if applied_law:
 						if law_new_ids:

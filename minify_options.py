@@ -97,6 +97,7 @@ class Options:
 		compact_mutation_metadata=False,
 		fold_constant_variables=False,
 		fold_constant_expressions=False,
+		factor_math_expressions=False,
 		simplify_boolean_control=False,
 		simplify_blocks=False,
 		deduplicate_assets=False,
@@ -243,6 +244,8 @@ class Options:
 		self.compact_mutation_metadata = compact_mutation_metadata
 		self.fold_constant_variables = fold_constant_variables
 		self.fold_constant_expressions = fold_constant_expressions
+		self.factor_math_expressions = factor_math_expressions
+
 		self.simplify_boolean_control = simplify_boolean_control
 		self.simplify_blocks = simplify_blocks
 		self.deduplicate_assets = deduplicate_assets
@@ -546,6 +549,8 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 		compact_mutation_metadata="--compact-mutation-metadata" in flags,
 		fold_constant_variables="--fold-constant-variables" in flags,
 		fold_constant_expressions="--fold-constant-expressions" in flags,
+		factor_math_expressions="--factor-math-expressions" in flags
+		or "--fms" in flags,
 		simplify_boolean_control="--simplify-boolean-control" in flags,
 		simplify_blocks="--simplify-blocks" in flags,
 		deduplicate_assets="--deduplicate-assets" in flags,

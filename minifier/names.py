@@ -112,6 +112,7 @@ def progress_stage_count(opts: Options) -> int:
 		opts.constant_propagation
 		or opts.fold_constant_expressions
 		or opts.associative_constant_merging
+		or opts.factor_math_expressions
 	)
 	count += bool(opts.cleared_lists)
 	count += bool(opts.folded_constant_variables)
