@@ -187,16 +187,17 @@ individually.
 
 Without optional flags, the CLI performs these operations:
 
-1. Drops `topLevel: false` and `shadow: false`.
-2. Normalizes `mutation.warp` from `"true"`/`"false"` strings to JSON booleans.
-3. Strips sprite comments from non-Stage targets.
-4. Rounds supported coordinate values.
-5. Resets covered numeric/text shadow values.
-6. Cleans variable/list monitors.
-7. Removes sound `rate` and `sampleCount`.
-8. Repairs dangling broadcast references.
-9. Repairs dangling block links.
-10. Verifies the complete output archive.
+1. Repairs sprite layer orders below `1`, preserving their relative order.
+2. Drops `topLevel: false` and `shadow: false`.
+3. Normalizes `mutation.warp` from `"true"`/`"false"` strings to JSON booleans.
+4. Strips sprite comments from non-Stage targets.
+5. Rounds supported coordinate values.
+6. Resets covered numeric/text shadow values.
+7. Cleans variable/list monitors.
+8. Removes sound `rate` and `sampleCount`.
+9. Repairs dangling broadcast references.
+10. Repairs dangling block links.
+11. Verifies the complete output archive.
 
 The Stage is deliberately excluded from sprite-comment stripping because Stage metadata can contain TurboWarp configuration.
 
@@ -499,6 +500,7 @@ The actual stage progress bar reflects only enabled stages, so disabled transfor
 Several operations happen independently of the optional transform flags:
 
 - `topLevel: false`, `shadow: false`, and string-valued `mutation.warp` are normalized.
+- Sprite `layerOrder` values below `1` are repaired while preserving the layer ordering.
 - Sound `rate` and `sampleCount` are removed unless `--keep-sound-metadata` is set.
 - Dangling `next`/`parent` block links are repaired.
 - Inputs pointing to missing blocks are removed or reduced to their surviving shadow value.

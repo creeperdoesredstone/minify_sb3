@@ -31,6 +31,10 @@ from minify_options import (
 	Ansi,
 	build_options,
 )
+from .expressions import (
+	repaired_sprite_layer_orders,
+	repair_invalid_sprite_layer_orders,
+)
 from types import SimpleNamespace, NoneType
 from typing import Any, NoReturn
 
@@ -53,6 +57,7 @@ def _debug_structure_checkpoint(project, label):
 
 def apply_transforms(project, opts: Options, assets=None, progress=None):
 	global _DEBUG_STRUCTURE_ENABLED, _DEBUG_STRUCTURE_BASELINE
+	repair_invalid_sprite_layer_orders(project)
 	_DEBUG_STRUCTURE_ENABLED = os.environ.get(
 		"MINIFY_DEBUG_STRUCTURE", ""
 	).strip().lower() in ("1", "true", "yes", "on")
@@ -2517,11 +2522,21 @@ def verify(original_path, minified_path, opts):
 		mini_var_refs, mini_list_refs, mini_bcast_refs = get_data_refs(
 			mini, var_owners=orig_var_owners, list_owners=orig_list_owners
 		)
+		expected_layer_orders = repaired_sprite_layer_orders(orig["targets"])
 
 		for ti, (to, tm) in enumerate(zip(orig["targets"], mini["targets"])):
 			name = to.get("name", f"target_{ti}")
 			missing_target_keys = set(to) - set(tm)
 			extra_target_keys = set(tm) - set(to)
+			if ti in expected_layer_orders and tm.get(
+				"layerOrder"
+			) != expected_layer_orders[ti]:
+				return (
+					False,
+					f"Target {ti} ({name!r}): invalid sprite layer order was not repaired",
+				)
+			if ti in expected_layer_orders:
+				extra_target_keys.discard("layerOrder")
 			allowed_container_keys = set()
 			if opts.remove_empty_target_containers:
 				allowed_container_keys.update(
@@ -2563,6 +2578,8 @@ def verify(original_path, minified_path, opts):
 					f"Target {ti} ({name!r}): target keys changed. Missing: {sorted(missing_target_keys - allowed_default_keys - allowed_container_keys)}, unexpected extra: {sorted(extra_target_keys)}",
 				)
 			for k in to:
+				if k == "layerOrder" and ti in expected_layer_orders:
+					continue
 				if k in (
 					"blocks",
 					"comments",

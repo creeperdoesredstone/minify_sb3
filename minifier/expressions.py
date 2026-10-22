@@ -2330,6 +2330,225 @@ def simplify_double_boolean_negation(
 	return copy.deepcopy(operand), removed
 
 
+def simplify_abs_patterns(value, blocks, owner_id, incoming_refs, graph):
+	# <a > -x> and <a < x> should be simplified to <abs of (a) < x>
+	root_id = get_input_root(value, blocks)
+	if root_id is None or root_id == owner_id:
+		return None
+
+	root = blocks.get(root_id)
+
+	if (
+		not isinstance(root, dict)
+		or root.get("opcode") != "operator_and"
+		or root.get("parent") != owner_id
+		or root.get("next") is not None
+	):
+		return None
+
+	closure = get_exclusive_input_subtree(
+		value, blocks, owner_id, incoming_refs, graph=graph
+	)
+
+	if closure is None or root_id not in closure:
+		return None
+
+	root_inputs = root.get("inputs") or {}
+	left_id = get_input_root(root_inputs.get("OPERAND1"), blocks)
+	right_id = get_input_root(root_inputs.get("OPERAND2"), blocks)
+
+	if (
+		left_id is None
+		or right_id is None
+		or left_id == right_id
+		or left_id not in closure
+		or right_id not in closure
+	):
+		return None
+
+	comparisons = (blocks.get(left_id), blocks.get(right_id))
+	if any(
+		not isinstance(comparison, dict)
+		or comparison.get("opcode") not in ("operator_gt", "operator_lt")
+		or comparison.get("parent") != root_id
+		or comparison.get("next") is not None
+		for comparison in comparisons
+	):
+		return None
+
+	if {comparison.get("opcode") for comparison in comparisons} != {
+		"operator_gt",
+		"operator_lt",
+	}:
+		return None
+
+	gt_id = left_id if blocks[left_id]["opcode"] == "operator_gt" else right_id
+	lt_id = left_id if blocks[left_id]["opcode"] == "operator_lt" else right_id
+	gt = blocks[gt_id]
+	lt = blocks[lt_id]
+	gt_inputs = gt.get("inputs") or {}
+	lt_inputs = lt.get("inputs") or {}
+	gt_left, negative_raw = gt_inputs.get("OPERAND1"), gt_inputs.get("OPERAND2")
+	lt_left, positive_raw = lt_inputs.get("OPERAND1"), lt_inputs.get("OPERAND2")
+
+	if any(raw is None for raw in (gt_left, negative_raw, lt_left, positive_raw)):
+		return None
+
+	if not condition_is_pure(value, blocks, graph):
+		return None
+
+	def numeric_value(raw):
+		constant = constexpr_from_input(raw, blocks)
+		if constant is not None:
+			if constant[0][0] == "string" and not constant[0][1].strip():
+				return False
+			
+			number = constant_to_number(constant[0])
+			return number is not None and math.isfinite(number)
+		
+		root = get_input_root(raw, blocks)
+		reporter = blocks.get(root) if root is not None else None
+		
+		return value_is_numeric(raw, blocks) or (
+			isinstance(reporter, dict)
+			and reporter.get("opcode")
+			in ("sensing_mousex", "sensing_mousey", "sensing_distanceto")
+		)
+
+	if not all(numeric_value(raw) for raw in (gt_left, negative_raw, lt_left, positive_raw)):
+		return None
+
+	def same_value(first, second):
+		first_closure = get_subtree_block_ids(first, blocks)
+		second_closure = get_subtree_block_ids(second, blocks)
+		return branch_factor_value_equal(
+			first, second, blocks, first_closure, second_closure, {}, set()
+		)
+
+	if not same_value(gt_left, lt_left):
+		return None
+
+	def is_zero(raw):
+		constant = constexpr_from_input(raw, blocks)
+		return (
+			constant is not None
+			and constant[0][0] == "number"
+			and constant_to_number(constant[0]) == 0
+		)
+
+	negative_constant = constexpr_from_input(negative_raw, blocks)
+	positive_constant = constexpr_from_input(positive_raw, blocks)
+	negative_number = (
+		constant_to_number(negative_constant[0])
+		if negative_constant is not None
+		else None
+	)
+	positive_number = (
+		constant_to_number(positive_constant[0])
+		if positive_constant is not None
+		else None
+	)
+	bounds_match = (
+		negative_number is not None
+		and positive_number is not None
+		and math.isfinite(negative_number)
+		and math.isfinite(positive_number)
+		and negative_number <= 0
+		and positive_number == -negative_number
+	)
+	abs_operand = None
+
+	if bounds_match:
+		abs_operand = gt_left
+	else:
+		negative_id = get_input_root(negative_raw, blocks)
+		negative_block = blocks.get(negative_id) if negative_id is not None else None
+
+		if (
+			not isinstance(negative_block, dict)
+			or negative_block.get("parent") != gt_id
+			or negative_block.get("next") is not None
+		):
+			return None
+
+		negative_inputs = negative_block.get("inputs") or {}
+
+		if negative_block.get("opcode") == "operator_subtract":
+			candidate = negative_inputs.get("NUM2")
+
+			if candidate is not None and is_zero(negative_inputs.get("NUM1")):
+				if same_value(candidate, positive_raw):
+					abs_operand = gt_left
+		elif negative_block.get("opcode") == "operator_multiply":
+			for coefficient_name, candidate_name in (
+				("NUM1", "NUM2"),
+				("NUM2", "NUM1"),
+			):
+				coefficient = constexpr_from_input(
+					negative_inputs.get(coefficient_name), blocks
+				)
+				candidate = negative_inputs.get(candidate_name)
+				coefficient_number = (
+					constant_to_number(coefficient[0])
+					if coefficient is not None
+					else None
+				)
+
+				if (
+					coefficient_number == -1
+					and candidate is not None
+					and same_value(candidate, positive_raw)
+				):
+					abs_operand = gt_left
+					break
+
+	if abs_operand is None:
+		return None
+
+	preserved = {lt_id} | get_subtree_block_ids(abs_operand, blocks)
+	preserved.update(get_subtree_block_ids(positive_raw, blocks))
+	for raw in (value, lt_inputs["OPERAND1"]):
+		if (
+			isinstance(raw, list)
+			and len(raw) > 2
+			and raw[0] == INPUT_DIFF_BLOCK_SHADOW
+		):
+			preserved.update(get_subtree_block_ids(raw[2], blocks))
+
+	if not preserved <= closure:
+		return None
+
+	removed = closure - preserved
+
+	if root_id not in removed or gt_id not in removed or not removed:
+		return None
+
+	new_id = uuid.uuid4().hex
+
+	while new_id in blocks:
+		new_id = uuid.uuid4().hex
+
+	abs_block = {
+		"opcode": "operator_mathop",
+		"next": None,
+		"parent": lt_id,
+		"inputs": {"NUM": copy.deepcopy(abs_operand)},
+		"fields": {"OPERATOR": ["abs", None]},
+		"shadow": False,
+		"topLevel": False,
+	}
+	new_lt_left = remap_block_input(lt_inputs["OPERAND1"], new_id)
+
+	return {
+		"owner_input": remap_block_input(value, lt_id),
+		"outer_id": lt_id,
+		"outer_left": new_lt_left,
+		"abs_id": new_id,
+		"abs_block": abs_block,
+		"removed": removed,
+	}
+
+
 def simplify_algebraic_input(value, blocks, owner_id, incoming_refs, graph):
 	if not (
 		isinstance(value, list)
@@ -5027,6 +5246,71 @@ def fold_constant_expressions(
 					).startswith("operator_"):
 						continue
 
+					abs_pattern = simplify_abs_patterns(
+						input_val, blocks, block_id, incoming_refs, graph
+					)
+					if abs_pattern is not None:
+						removed_ids = abs_pattern["removed"]
+						outer_id = abs_pattern["outer_id"]
+						abs_id = abs_pattern["abs_id"]
+
+						if (
+							not fold_blocked_by_comment(
+								removed_ids | {outer_id}, blocks, commented_ids
+							)
+						):
+							outer = blocks[outer_id]
+							outer_inputs = outer.setdefault("inputs", {})
+							outer_inputs["OPERAND1"] = copy.deepcopy(
+								abs_pattern["outer_left"]
+							)
+							opts.folded_constant_expression_inputs[
+								(ti, outer_id, "OPERAND1")
+							] = copy.deepcopy(abs_pattern["outer_left"])
+
+							owner_input = copy.deepcopy(abs_pattern["owner_input"])
+							block.setdefault("inputs", {})[input_name] = owner_input
+							opts.folded_constant_expression_inputs[
+								(ti, block_id, input_name)
+							] = copy.deepcopy(owner_input)
+
+							blocks[abs_id] = abs_pattern["abs_block"]
+							opts.folded_constant_expression_new_blocks[ti].add(abs_id)
+
+							for child_id in direct_input_block_refs(
+								abs_pattern["abs_block"]["inputs"]["NUM"], blocks
+							):
+								child = blocks.get(child_id)
+
+								if isinstance(child, dict):
+									child["parent"] = abs_id
+									opts.folded_constant_expression_link_edits[
+										(ti, child_id, "parent")
+									] = abs_id
+
+							outer["parent"] = block_id
+							opts.folded_constant_expression_link_edits[
+								(ti, outer_id, "parent")
+							] = block_id
+
+							for remove_id in removed_ids:
+								blocks.pop(remove_id, None)
+
+							opts.folded_constant_expression_blocks[ti].update(
+								removed_ids
+							)
+							graph.refresh_blocks(
+								(block_id, outer_id, abs_id, *removed_ids)
+							)
+							incoming_refs = graph.incoming
+							stats["algebraic_simplifications"] += 1
+							folded += 1
+							changed = True
+							break
+
+					if changed:
+						break
+
 					boolean_negation = simplify_double_boolean_negation(
 						input_val, blocks, block_id, input_name, incoming_refs, graph
 					)
@@ -5592,6 +5876,47 @@ def _target_default_properties_for_removal(target):
 	}
 
 
+def repaired_sprite_layer_orders(targets) -> dict:
+	sprites = [
+		(index, target)
+		for index, target in enumerate(targets)
+		if not target.get("isStage")
+	]
+
+	if not any(
+		type(target.get("layerOrder")) in (int, float)
+		and target["layerOrder"] < 1
+		for _, target in sprites
+	):
+		return {}
+
+	def order_key(sprite):
+		index, target = sprite
+		order = target.get("layerOrder")
+		if type(order) in (int, float) and (
+			type(order) is int or math.isfinite(order)
+		):
+			return order, index
+
+		return math.inf, index
+
+	return {
+		index: order
+		for order, (index, _) in enumerate(sorted(sprites, key=order_key), 1)
+	}
+
+
+def repair_invalid_sprite_layer_orders(project):
+	targets = project.get("targets", [])
+	orders = repaired_sprite_layer_orders(targets)
+	changed = 0
+	for index, order in orders.items():
+		if targets[index].get("layerOrder") != order:
+			targets[index]["layerOrder"] = order
+			changed += 1
+	return changed
+
+
 def remove_default_target_properties(project, stats):
 	count = 0
 	for target in project.get("targets", []):
@@ -5603,6 +5928,7 @@ def remove_default_target_properties(project, stats):
 			):
 				del target[key]
 				count += 1
+
 	stats["default_target_properties_removed"] += count
 	return count
 
@@ -5613,6 +5939,7 @@ def remove_costume_metadata(project, stats, assets=None):
 		for costume in target.get("costumes", []):
 			if not isinstance(costume, dict):
 				continue
+
 			aid = costume.get("assetId")
 			fmt = costume.get("dataFormat")
 			canonical = (
@@ -5644,6 +5971,7 @@ def remove_empty_target_containers(project, stats):
 			if target.get(key) == {}:
 				del target[key]
 				count += 1
+
 	stats["empty_containers_removed"] += count
 	return count
 
@@ -5656,6 +5984,7 @@ def remove_project_meta(project, stats):
 			if key in meta:
 				del meta[key]
 				count += 1
+
 	stats["project_meta_cleaned"] += count
 	return count
 
@@ -5666,9 +5995,11 @@ def compact_numeric_inputs(project, stats):
 		for block in target.get("blocks", {}).values():
 			if not isinstance(block, dict):
 				continue
+
 			for ival in (block.get("inputs") or {}).values():
 				if not isinstance(ival, list):
 					continue
+
 				for item in ival[1:]:
 					if (
 						isinstance(item, list)
@@ -5685,6 +6016,7 @@ def compact_numeric_inputs(project, stats):
 									continue
 							except ValueError:
 								...
+
 							try:
 								fv = float(v)
 								if (
@@ -5699,6 +6031,7 @@ def compact_numeric_inputs(project, stats):
 									count += 1
 							except ValueError:
 								...
+
 	stats["numeric_inputs_compacted"] += count
 	return count
 
@@ -5706,26 +6039,36 @@ def compact_numeric_inputs(project, stats):
 def get_substack_tail(blocks, closure):
 	if not closure:
 		return None
+	
 	roots = [
 		bid
 		for bid in closure
 		if isinstance(blocks.get(bid), dict)
 		and blocks[bid].get("parent") not in closure
 	]
+
 	if len(roots) != 1:
 		return None
+	
 	current = roots[0]
 	seen = set()
+
 	while True:
 		if current in seen or current not in closure:
 			return None
+		
 		seen.add(current)
 		block = blocks.get(current)
+
 		if not isinstance(block, dict):
 			return None
+		
 		nxt = block.get("next")
+
 		if nxt is None:
 			return current
+		
 		if not isinstance(nxt, str) or nxt not in closure:
 			return None
+		
 		current = nxt
