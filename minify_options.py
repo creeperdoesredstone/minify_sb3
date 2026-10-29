@@ -151,12 +151,14 @@ class Options:
 		unbounded_sequence_length=False,
 		unbounded_sequence_params=False,
 		unbounded_layout=False,
+		unbounded_subgraph_window=False,
 	):
 		self.unbounded_json_ordering = unbounded_json_ordering
 		self.unbounded_procedure_specialization = unbounded_procedure_specialization
 		self.unbounded_sequence_length = unbounded_sequence_length
 		self.unbounded_sequence_params = unbounded_sequence_params
 		self.unbounded_layout = unbounded_layout
+		self.unbounded_subgraph_window = unbounded_subgraph_window
 		self.unbounded_json_search = (
 			self.unbounded_json_ordering or self.unbounded_layout
 		)
