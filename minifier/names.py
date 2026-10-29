@@ -214,22 +214,30 @@ def count_input_block_refs(value, blocks, refs):
 def count_block_refs(target):
 	blocks = target.get("blocks", {})
 	refs = Counter()
+
 	for bid, block in blocks.items():
 		refs[bid] += 1
+
 		if isinstance(block, dict):
 			nxt = block.get("next")
+			
 			if isinstance(nxt, str) and nxt in blocks:
 				refs[nxt] += 1
-			par = block.get("parent")
-			if isinstance(par, str) and par in blocks:
-				refs[par] += 1
+			
+			parent = block.get("parent")
+			if isinstance(parent, str) and parent in blocks:
+				refs[parent] += 1
+
 			for value in block.get("inputs", {}).values():
 				count_input_block_refs(value, blocks, refs)
+	
 	for comment in target.get("comments", {}).values():
 		if isinstance(comment, dict):
 			cbid = comment.get("blockId")
+			
 			if isinstance(cbid, str) and cbid in blocks:
 				refs[cbid] += 1
+	
 	return refs
 
 
@@ -289,6 +297,7 @@ def rename_block_ids(project, stats, frequency_order=False):
 			old_ids = sorted(old_ids, key=lambda x: (-refs[x], x))
 		else:
 			_, dangling = analyze_block_ids(target)
+		
 		block_ids = _rename_id_map(old_ids, existing_ids=dangling)
 		all_maps[ti] = block_ids
 
@@ -333,10 +342,12 @@ def strip_sprite_comments(project, stats):
 	for target in project.get("targets", []):
 		if target.get("isStage"):
 			continue
+
 		comments = target.get("comments")
 
 		if comments:
 			stats["comments"] += len(comments)
+		
 		target["comments"] = {}  # sb3fix expects an object
 
 		for block in target.get("blocks", {}).values():
@@ -783,14 +794,12 @@ def prompt_for_lists(project, candidates, project_bytes) -> set | None:
 	w_scope = max(len(c["scope"]) for c in candidates)
 	w_name = min(34, max(len(c["name"]) for c in candidates))
 
-	print()
 	print(
 		Ansi.heading(
-			f"Large lists found: {len(candidates)}  "
-			f"({total:,} bytes = {total / max(1, project_bytes) * 100:.1f}% of project.json)"
+			f"\nLarge lists found: {len(candidates)}  "
+			f"({total:,} bytes = {total / max(1, project_bytes) * 100:.1f}% of project.json)\n"
 		)
 	)
-	print()
 	print(
 		f"  {'#':>3}  {'scope':<{w_scope}}  {'list':<{w_name}}  {'items':>6}  {'bytes':>8}  usage"
 	)
@@ -806,17 +815,15 @@ def prompt_for_lists(project, candidates, project_bytes) -> set | None:
 			f" {mark}{i:>3}  {c['scope']:<{w_scope}}  {nm:<{w_name}}  {c['items']:>6,}  {c['bytes']:>8,}  {c['label']}"
 		)
 
-	print()
 	print(
 		Ansi.warning(
-			"  '!' = clearing this list can change how the project behaves. Blocks that read a"
+			"\n  '!' = clearing this list can change how the project behaves. Blocks that read a"
 		)
 	)
 	print(
 		"  cleared list get empty values, and 'replace item N' on an emptied list does nothing."
 	)
-	print("  Cleared lists stay defined, only their contents are removed.")
-	print()
+	print("  Only their contents are removed.\n")
 
 	print(Ansi.muted("  Enter / n   keep every list"))
 	print(Ansi.muted("  a           clear all large lists"))
@@ -845,19 +852,24 @@ def prompt_for_lists(project, candidates, project_bytes) -> set | None:
 
 		if answer.startswith("s") and answer[1:].strip().isdigit():
 			n = int(answer[1:].strip())
+
 			if not 1 <= n <= len(candidates):
 				print(Ansi.error(f"  no such list number: {n}"))
 				continue
+			
 			c = candidates[n - 1]
 			items = project["targets"][c["ti"]]["lists"][c["id"]][1]
 			print(
 				f"  [{c['scope']}] {c['name']!r}: {len(items):,} items, showing {min(8, len(items))}"
 			)
+
 			for k, v in enumerate(items[:8], 1):
 				text = str(v).replace("\n", "\\n")
 				print(f"    {k:>3}: {text[:70]}{'...' if len(text) > 70 else ''}")
+
 			if len(items) > 8:
 				print(f"  ... {len(items) - 8:,} more")
+			
 			continue
 
 		if answer in ("a", "all"):
@@ -886,6 +898,7 @@ def prompt_for_lists(project, candidates, project_bytes) -> set | None:
 				f"  Selected {len(chosen)} list(s), saving about {saved:,} bytes of project.json."
 			)
 		)
+		
 		if risky:
 			print(
 				Ansi.warning(
@@ -894,6 +907,7 @@ def prompt_for_lists(project, candidates, project_bytes) -> set | None:
 			)
 			for c in risky:
 				print(f"    - [{c['scope']}] {c['name']!r}: {c['label']}")
+			
 			try:
 				confirm = (
 					input(
@@ -908,9 +922,11 @@ def prompt_for_lists(project, candidates, project_bytes) -> set | None:
 			except KeyboardInterrupt:
 				print(Ansi.warning("\nAborted."))
 				return None
+			
 			if confirm != "yes":
 				print(Ansi.warning("  Not confirmed. Nothing was cleared... yet >:)."))
 				continue
+		
 		return {(c["ti"], c["id"]) for c in chosen}
 
 

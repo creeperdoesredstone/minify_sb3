@@ -27,6 +27,7 @@ toggles = {
 	"--zopfli-assets",
     "--branch-factoring",
 	"--all-flags",
+    "--all-optimizations",
 	"--keep-comments",
 	"--keep-positions",
 	"--keep-covered",
@@ -114,7 +115,13 @@ toggles = {
 	"--compression",
 	"--all-groups",
     "--factor-math-expressions",
-    "--fme"
+    "--fme",
+    "--unbounded-json-ordering",
+    "--unbounded-procedure-specialization",
+    "--unbounded-sequence-length",
+    "--unbounded-sequence-params",
+    "--unbounded-layout",
+    "--unbounded-search"
 }
 
 valued = {
@@ -342,4 +349,11 @@ groups = {
 		"--compression",
         "--relabel-block-ids"
 	),
+    "--unbounded-search": (
+        "--unbounded-json-ordering",
+		"--unbounded-procedure-specialization",
+		"--unbounded-sequence-length",
+		"--unbounded-sequence-params",
+		"--unbounded-layout",
+	)
 }

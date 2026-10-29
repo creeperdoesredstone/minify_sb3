@@ -353,6 +353,8 @@ def minify_sb3(src, dst, opts=None):
 				opts.prune_unused_data,
 				opts.rebuild_procedure_displays,
 				opts.compact_terminal_links,
+				opts.unbounded_json_ordering,
+				opts.unbounded_layout,
 			)
 			stats.update(
 				{

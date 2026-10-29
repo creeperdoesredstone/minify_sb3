@@ -937,7 +937,7 @@ def _sequence_warp_context(blocks, block_id, cache=None):
 	return result
 
 
-def get_similar_sequence_candidates(runs, blocks, threshold):
+def get_similar_sequence_candidates(runs, blocks, threshold, unbounded_sequence_length=False):
 	threshold = max(1, int(threshold))
 	segments = []
 
@@ -1013,15 +1013,17 @@ def get_similar_sequence_candidates(runs, blocks, threshold):
 		frontier = [(occurrences, threshold)]
 		while frontier:
 			group, length = frontier.pop()
+
 			if len(group) < 2:
 				continue
 
 			add_candidate(group, length)
 
-			if length >= SEQUENCE_MAX_WINDOW:
+			if not unbounded_sequence_length and length >= SEQUENCE_MAX_WINDOW:
 				continue
 
 			next_groups = {}
+
 			for ids, sigs, pos in group:
 				next_index = pos + length
 				if next_index < len(ids):
@@ -1046,7 +1048,7 @@ def get_similar_sequence_candidates(runs, blocks, threshold):
 	]
 
 
-def _prepare_candidate(sequences, blocks, comments, graph, threshold):
+def _prepare_candidate(sequences, blocks, comments, graph, threshold, unbounded_sequence_params=False):
 	if len(sequences) < 2 or any(len(seq) < threshold for seq in sequences):
 		return None
 
@@ -1080,6 +1082,7 @@ def _prepare_candidate(sequences, blocks, comments, graph, threshold):
 		return None
 
 	param_slots = []
+
 	for index, block_id in enumerate(base):
 		base_block = blocks.get(block_id)
 		if not isinstance(base_block, dict):
@@ -1108,7 +1111,8 @@ def _prepare_candidate(sequences, blocks, comments, graph, threshold):
 		param_vectors.setdefault(vector, len(param_vectors))
 
 	parameter_count = len(param_vectors)
-	if parameter_count > SEQUENCE_MAX_PARAMETERS:
+
+	if not unbounded_sequence_params and parameter_count > SEQUENCE_MAX_PARAMETERS:
 		return None
 
 	return base, closures, param_slots, parameter_count
@@ -1488,12 +1492,15 @@ def _sequence_projected_json_size(
 
 def group_similar_sequences(project, stats, threshold=3, opts=None):
 	threshold = max(1, int(threshold))
+	unbounded_sequence_length = getattr(opts, "unbounded_sequence_length", False)
+	unbounded_sequence_params = getattr(opts, "unbounded_sequence_params", False)
+
 	for ti, target in enumerate(project.get("targets", [])):
 		blocks = target.get("blocks") or {}
 		comments = target.get("comments") or {}
 		graph = ProjectGraph(target)
 		runs = get_sequence_runs(blocks)
-		candidate_groups = get_similar_sequence_candidates(runs, blocks, threshold)
+		candidate_groups = get_similar_sequence_candidates(runs, blocks, threshold, unbounded_sequence_length)
 
 		if not candidate_groups:
 			continue
@@ -1502,7 +1509,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 
 		for sequences in candidate_groups:
 			prepared = _prepare_candidate(
-				sequences, blocks, comments, graph, threshold
+				sequences, blocks, comments, graph, threshold, unbounded_sequence_params
 			)
 
 			if prepared is None:
@@ -1548,7 +1555,7 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				continue
 
 			prepared = _prepare_candidate(
-				sequences, blocks, comments, graph, threshold
+				sequences, blocks, comments, graph, threshold, unbounded_sequence_params
 			)
 
 			if prepared is None:
@@ -2567,17 +2574,24 @@ def specialize_procedures(project, stats, opts, progress):
 	opts.specialized_procedure_prototype_code_pairs = {}
 	opts.specialized_procedure_prototype_blocks = {}
 	opts.specialized_procedure_block_origins = {}
+	unbounded_procedure_specialization = getattr(opts, "unbounded_procedure_specialization", False)
 
 	max_passes = max(1, int(getattr(opts, "procedure_specialization_passes", 4)))
-	min_calls = max(2, int(getattr(opts, "procedure_specialization_min_calls", 2)))
+	min_calls = (
+		1
+		if unbounded_procedure_specialization
+		else max(2, int(getattr(opts, "procedure_specialization_min_calls", 2)))
+	)
 	total_variants = 0
 	total_calls = 0
 	completed_passes = 0
 	serial = 0
 
-	for pass_idx in range(max_passes):
+	pass_idx = 0
+	while unbounded_procedure_specialization or pass_idx < max_passes:
 		progress.detail(f"pass {pass_idx + 1}")
 		changed_this_pass = False
+
 		for ti, target in enumerate(targets):
 			blocks = target.get("blocks") or {}
 
@@ -2695,11 +2709,11 @@ def specialize_procedures(project, stats, opts, progress):
 
 				body_size = len(body_info["closure"])
 
-				if body_size > 192:
+				if not unbounded_procedure_specialization and body_size > 192:
 					continue
 
 				existing_variant_count = 0
-				for signature, members in qualifying[:8]:
+				for signature, members in (qualifying if unbounded_procedure_specialization else qualifying[:8]):
 					if existing_variant_count >= 8:
 						break
 
@@ -2865,6 +2879,7 @@ def specialize_procedures(project, stats, opts, progress):
 			break
 
 		completed_passes += 1
+		pass_idx += 1
 
 	stats["procedure_specialized"] += total_variants
 	stats["procedure_specialization_variants"] += total_variants

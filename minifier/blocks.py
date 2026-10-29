@@ -1291,7 +1291,7 @@ def _layout_parts(project, short_numbers=True, path=()):
 	return parts
 
 
-def _window_layout(project, orders, level, width=128):
+def _window_layout(project, orders, level, width=128, unbounded_layout=False):
 	parts, output, shapes = _layout_parts(project), [], {}
 	state = zlib.compressobj(level, zlib.DEFLATED, -15)
 	trials, index = 0, 0
@@ -1313,7 +1313,11 @@ def _window_layout(project, orders, level, width=128):
 			end += 1
 
 		records = parts[index:end]
-		lookahead = _render_layout(parts[end : end + 16], shapes=shapes)[:4096]
+		lookahead = (
+			_render_layout(parts[end : end + 16], shapes=shapes)[:4096]
+			if unbounded_layout
+			else _render_layout(parts[end : end + 16], shapes=shapes)[:4096]
+		)
 
 		def score(candidate):
 			probe = state.copy()
@@ -1355,7 +1359,7 @@ def _sample_blocks(project, width=64):
 	return result
 
 
-def _screen_record_orders(project, level):
+def _screen_record_orders(project, level, unbounded_json_ordering=False):
 	parts = _layout_parts(_sample_blocks(project))
 	shapes, scores = {}, []
 
@@ -1364,14 +1368,16 @@ def _screen_record_orders(project, level):
 			(len(deflate(_render_layout(parts, order, shapes), level)), order)
 		)
 
-	return [order for _, order in sorted(scores)[:4]], len(scores)
+	ordered = sorted(scores)
+	return [order for _, order in (ordered if unbounded_json_ordering else ordered[:4])], len(scores)
 
 
-def _specialized_layout(project, orders, level, grouping):
+def _specialized_layout(project, orders, level, grouping, unbounded_layout=False):
 	groups = {}
 
 	def group_key(ti, block):
 		shape = frozenset(block)
+
 		if grouping == "shape":
 			return shape
 
@@ -1387,7 +1393,7 @@ def _specialized_layout(project, orders, level, grouping):
 	trials = 0
 
 	for key, members in groups.items():
-		if len(members) > 96:
+		if not unbounded_layout and len(members) > 96:
 			members = (
 				members[:32]
 				+ members[len(members) // 2 - 16 : len(members) // 2 + 16]
@@ -1414,6 +1420,7 @@ def _specialized_layout(project, orders, level, grouping):
 
 	result = dict(project)
 	result["targets"] = []
+
 	for ti, target in enumerate(project.get("targets", [])):
 		target = dict(target)
 		if isinstance(target.get("blocks"), dict):

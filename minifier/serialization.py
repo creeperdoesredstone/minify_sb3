@@ -1059,7 +1059,11 @@ def optimize_project_json(
 	prune_unused_data=False,
 	rebuild_procedure_displays=False,
 	compact_terminal_links=False,
+	unbounded_json_ordering=False,
+	unbounded_layout=False
 ):
+	unbounded_json_search = bool(unbounded_json_ordering or unbounded_layout)
+	fast_json = bool(fast_json and not unbounded_json_search)
 	baseline = dumps_exact(project)
 	search_project = compact_representation(
 		project,
@@ -1078,6 +1082,7 @@ def optimize_project_json(
 		compact_terminal_links,
 	)
 	identifier_cost = None
+	
 	if relabel_block_ids:
 		search_project, _, identifier_cost = relabel_blocks(
 			search_project,
@@ -1087,6 +1092,7 @@ def optimize_project_json(
 				or strip_covered_shadows
 			),
 		)
+	
 	best_raw = dumps_exact(search_project, True) if minimum_json else baseline
 	best_compressed = deflate(best_raw, level)
 	rank = (
@@ -1114,7 +1120,9 @@ def optimize_project_json(
 	trials = 1
 	seen = set()
 	screened_orders, screen_trials = (
-		((), 0) if fast_json else _screen_record_orders(search_project, level)
+		((), 0)
+		if fast_json
+		else _screen_record_orders(search_project, level, unbounded_json_ordering)
 	)
 	trials += screen_trials
 	orders = (
@@ -1162,20 +1170,23 @@ def optimize_project_json(
 				if chosen_order is None
 				else _ordered_blocks(target, chosen_order)
 			)
+		
 		candidate = dumps_exact(adaptive, True)
+		
 		if hashlib.sha256(candidate).digest() not in seen and len(candidate) <= len(
 			baseline
 		):
 			for compressor, compressed in _compressions(candidate, level, False):
 				trials += 1
 				remember(candidate, compressed)
+
 				if rank(compressed, candidate) < rank(best_compressed, best_raw):
 					best_raw, best_compressed = candidate, compressed
 					best_label = f"per-target/short-numbers/{compressor}"
 
 	for grouping in (() if fast_json else ("shape", "opcode", "target-opcode")):
 		specialized, specialized_trials = _specialized_layout(
-			search_project, orders, level, grouping
+			search_project, orders, level, grouping, unbounded_layout
 		)
 		trials += specialized_trials
 
@@ -1197,18 +1208,48 @@ def optimize_project_json(
 					best_raw, best_compressed = candidate, compressed
 					best_label = f"per-{grouping}/{'short-numbers' if short_numbers else 'original-numbers'}/{compressor}"
 
-	for round_index in range(0 if fast_json else search_rounds):
-		candidate, window_trials = _window_layout(
-			loads_exact(best_raw), orders, level, 128 if round_index % 2 == 0 else 64
-		)
-		trials += window_trials
+	if unbounded_layout and not fast_json:
+		parts = _layout_parts(search_project)
+		longest_run = current_run = 0
 
-		for compressor, compressed in _compressions(candidate, level, False):
-			trials += 1
-			remember(candidate, compressed)
-			if rank(compressed, candidate) < rank(best_compressed, best_raw):
-				best_raw, best_compressed = candidate, compressed
-				best_label = f"window-{round_index + 1}/{compressor}"
+		for part in parts:
+			if isinstance(part, _LayoutRecord):
+				current_run += 1
+				longest_run = max(longest_run, current_run)
+			else:
+				current_run = 0
+
+		while True:
+			previous = best_raw
+
+			for width in range(1, longest_run + 1):
+				candidate, window_trials = _window_layout(
+					loads_exact(best_raw), orders, level, width, True
+				)
+				trials += window_trials
+
+				for compressor, compressed in _compressions(candidate, level, False):
+					trials += 1
+					remember(candidate, compressed)
+					if rank(compressed, candidate) < rank(best_compressed, best_raw):
+						best_raw, best_compressed = candidate, compressed
+						best_label = f"unbounded-window-{width}/{compressor}"
+			
+			if best_raw == previous:
+				break
+	else:
+		for round_index in range(0 if fast_json else search_rounds):
+			candidate, window_trials = _window_layout(
+				loads_exact(best_raw), orders, level, 128 if round_index % 2 == 0 else 64
+			)
+			trials += window_trials
+
+			for compressor, compressed in _compressions(candidate, level, False):
+				trials += 1
+				remember(candidate, compressed)
+				if rank(compressed, candidate) < rank(best_compressed, best_raw):
+					best_raw, best_compressed = candidate, compressed
+					best_label = f"window-{round_index + 1}/{compressor}"
 
 	for compressor, compressed in (
 		*_compressions(best_raw, level),

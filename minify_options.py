@@ -145,22 +145,38 @@ class Options:
 		prune_unused_data=False,
 		rebuild_procedure_displays=False,
 		compact_terminal_links=False,
+		unbounded_json_ordering=False,
+		unbounded_procedure_specialization=False,
+		unbounded_sequence_length=False,
+		unbounded_sequence_params=False,
+		unbounded_layout=False,
 	):
-		self.lossless = bool(lossless or all_lossless)
+		self.unbounded_json_ordering = unbounded_json_ordering
+		self.unbounded_procedure_specialization = unbounded_procedure_specialization
+		self.unbounded_sequence_length = unbounded_sequence_length
+		self.unbounded_sequence_params = unbounded_sequence_params
+		self.unbounded_layout = unbounded_layout
+		self.unbounded_json_search = (
+			self.unbounded_json_ordering or self.unbounded_layout
+		)
+		self.fast_json = fast_json and not self.unbounded_json_search
+		self.lossless = lossless or all_lossless
+
 		self.rebuild_procedure_displays = rebuild_procedure_displays or all_lossless
 		self.compact_terminal_links = compact_terminal_links or all_lossless
 		self.strip_covered_shadows = strip_covered_shadows or all_lossless
 		self.strip_editor_comments = strip_editor_comments or all_lossless
 		self.prune_unused_data = prune_unused_data or all_lossless
 		self.strip_script_positions = strip_script_positions or all_lossless
-		self.fast_json = fast_json
 		self.prune_orphan_arguments = prune_orphan_arguments or all_lossless
 		self.compact_procedure_symbols = compact_procedure_symbols or all_lossless
 		self.compact_reporter_defaults = compact_reporter_defaults or all_lossless
 		self.all_lossless = all_lossless
+
 		self.optimize_json = (
 			optimize_json
 			or self.lossless
+			or self.unbounded_json_search
 			or zopfli
 			or auto_zopfli
 			or compact_block_defaults
@@ -178,7 +194,7 @@ class Options:
 			or auto_zopfli
 		)
 		self.compact_block_defaults = compact_block_defaults or all_lossless
-		self.zopfli = zopfli or ((all_lossless or auto_zopfli) and not fast_json)
+		self.zopfli = zopfli or ((all_lossless or auto_zopfli) and not self.fast_json)
 		self.zopfli_assets = zopfli_assets or all_lossless
 		self.auto_zopfli = auto_zopfli
 		self.relabel_block_ids = relabel_block_ids or all_lossless
@@ -186,12 +202,15 @@ class Options:
 		self.zopfli_iterations = int(zopfli_iterations)
 		self.compact_costume_references = compact_costume_references or all_lossless
 		self.compact_block_flags = compact_block_flags or all_lossless
-		self.minimum_json = minimum_json or all_lossless or fast_json
+		self.minimum_json = minimum_json or all_lossless or self.fast_json
 		self.json_search_rounds = int(json_search_rounds) or int(all_lossless)
+
 		if self.json_search_rounds < 0:
 			raise ValueError("json_search_rounds must be nonnegative")
+		
 		if self.zopfli_iterations < 1:
 			raise ValueError("zopfli_iterations must be positive")
+		
 		self.comments, self.positions, self.covered, self.monitors = (
 			comments,
 			positions,
@@ -224,8 +243,10 @@ class Options:
 
 		self.remove_costume_metadata = remove_costume_metadata
 		self.remove_default_target_properties = remove_default_target_properties
+		
 		if remove_empty_target_containers is None:
 			remove_empty_target_containers = remove_empty_containers
+		
 		self.remove_empty_target_containers = remove_empty_target_containers
 		self.remove_empty_containers = remove_empty_target_containers
 
@@ -255,17 +276,25 @@ class Options:
 		self.merge_duplicate_procedures = merge_duplicate_procedures
 		self.inline_single_use_procedures = inline_single_use_procedures
 		self.procedure_inline_passes = int(procedure_inline_passes)
+		
 		if self.procedure_inline_passes < 1:
 			raise ValueError("procedure_inline_passes must be positive")
+		
 		self.specialize_procedures = specialize_procedures
 		self.procedure_specialization_passes = int(procedure_specialization_passes)
 		self.procedure_specialization_min_calls = int(
 			procedure_specialization_min_calls
 		)
+		
 		if self.procedure_specialization_passes < 1:
 			raise ValueError("procedure_specialization_passes must be positive")
-		if self.procedure_specialization_min_calls < 2:
-			raise ValueError("procedure_specialization_min_calls must be at least 2")
+		
+		minimum_specialization_calls = 2 - int(self.unbounded_procedure_specialization)
+		if self.procedure_specialization_min_calls < minimum_specialization_calls:
+			raise ValueError(
+				f"procedure_specialization_min_calls must be at least {minimum_specialization_calls}"
+			)
+		
 		self.branch_swapping = branch_swapping
 		self.branch_factoring = branch_factoring
 		self.trivial_loops = trivial_loops
@@ -407,6 +436,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 					values[key] = n
 					continue
 		bad.append(f)
+	
 	if bad:
 		print(Ansi.error(f"Unknown or malformed option(s): {bad}"))
 		print(
@@ -415,6 +445,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 			)
 		)
 		sys.exit(1)
+	
 	if not args:
 		print(Ansi.error("Path and flags are not specified."))
 		print(
@@ -426,6 +457,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 	if "--strip-covered-shadows" in flags and "--keep-covered" in flags:
 		print(Ansi.error("--strip-covered-shadows is incompatible with --keep-covered"))
 		sys.exit(1)
+	
 	for strip, keep in (
 		("--strip-editor-comments", "--keep-comments"),
 		("--strip-script-positions", "--keep-positions"),
@@ -436,9 +468,21 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 		if strip in flags and keep in flags:
 			print(Ansi.error(f"{strip} is incompatible with {keep}"))
 			sys.exit(1)
+	
 	if "--fast-json" in flags and "--thorough-json" in flags:
 		print(Ansi.error("--fast-json is incompatible with --thorough-json"))
 		sys.exit(1)
+
+	if "--unbounded-json-ordering" in flags or "--unbounded-layout" in flags:
+		print(Ansi.warning("These flag(s) only improve archive compression and can heavily increase runtime:"))
+
+		for flg in ("--unbounded-json-ordering", "--unbounded-layout"):
+			if flg in flags: print(Ansi.muted(f"  - {flg}"))
+
+		confirmation: str = input(Ansi.prompt("Are you sure you want to proceed with these flags? [y/n] > ")).lower().strip()
+		if confirmation != "y":
+			for flg in ("--unbounded-json-ordering", "--unbounded-layout"):
+				if flg in flags: flags.remove(flg)
 	
 	all_flags = "--all-flags" in flags
 	all_lossless = any(
@@ -628,6 +672,11 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 			"--procedure-specialization-min-calls", 2
 		),
 		branch_factoring="--branch-factoring" in flags,
+		unbounded_json_ordering="--unbounded-json-ordering" in flags,
+		unbounded_procedure_specialization="--unbounded-procedure-specialization" in flags,
+		unbounded_sequence_length="--unbounded-sequence-length" in flags,
+		unbounded_sequence_params="--unbounded-sequence-params" in flags,
+		unbounded_layout="--unbounded-layout" in flags,
 	)
 
 	return opts
