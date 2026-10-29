@@ -480,6 +480,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 			if flg in flags: print(Ansi.muted(f"  - {flg}"))
 
 		confirmation: str = input(Ansi.prompt("Are you sure you want to proceed with these flags? [y/n] > ")).lower().strip()
+		
 		if confirmation != "y":
 			for flg in ("--unbounded-json-ordering", "--unbounded-layout"):
 				if flg in flags: flags.remove(flg)
