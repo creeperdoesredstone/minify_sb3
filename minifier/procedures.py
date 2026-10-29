@@ -3002,7 +3002,7 @@ def specialize_procedures(project, stats, opts, progress):
 						)
 						call_delta += after_call - before_call
 
-					variant_probe = {
+					variant_obj = {
 						"clones": clones,
 						"members": members,
 						"specialized_proc": specialized_proc,
@@ -3011,7 +3011,7 @@ def specialize_procedures(project, stats, opts, progress):
 						projected_size = specialized_proc_trial_size(target, (), opts)
 						projected_sizes[ti] = projected_size
 					variant_size = specialized_proc_trial_size(
-						target, [variant_probe], opts
+						target, [variant_obj], opts
 					)
 					if variant_size >= projected_size:
 						continue

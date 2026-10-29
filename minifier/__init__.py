@@ -17,6 +17,7 @@ from .expressions import *
 from .names import *
 from .procedures import *
 from .serialization import *
+from .subgraph_factoring import *
 from .verification import *
 
 from . import blocks as _blocks
@@ -26,6 +27,7 @@ from . import expressions as _expressions
 from . import names as _names
 from . import procedures as _procedures
 from . import serialization as _serialization
+from . import subgraph_factoring as _subgraph_factoring
 from . import verification as _verification
 
 _implementation_modules = (
@@ -35,6 +37,7 @@ _implementation_modules = (
 	_names,
 	_procedures,
 	_serialization,
+	_subgraph_factoring,
 	_verification,
 )
 _shared_implementation_names = {

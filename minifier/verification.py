@@ -176,6 +176,10 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		stage("Rewrite script control structures")
 		simplify_script_structures(project, stats, opts)
 		_debug_structure_checkpoint(project, "script control-structure rewrites")
+	if opts.subgraph_factoring:
+		stage("Factor repeated nested subgraphs")
+		factor_repeated_subgraphs(project, stats, opts, progress)
+		_debug_structure_checkpoint(project, "generalized subgraph factoring")
 	if opts.specialize_procedures:
 		stage("Specialize custom procedures")
 		specialize_procedures(project, stats, opts, progress)

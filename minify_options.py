@@ -112,6 +112,7 @@ class Options:
 		procedure_specialization_min_calls=2,
 		branch_swapping=False,
 		branch_factoring=False,
+		subgraph_factoring=False,
 		trivial_loops=False,
 		nested_conditionals=False,
 		associative_constant_merging=False,
@@ -297,6 +298,7 @@ class Options:
 		
 		self.branch_swapping = branch_swapping
 		self.branch_factoring = branch_factoring
+		self.subgraph_factoring = subgraph_factoring
 		self.trivial_loops = trivial_loops
 		self.nested_conditionals = nested_conditionals
 		self.associative_constant_merging = associative_constant_merging
@@ -614,6 +616,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 			)
 		),
 		branch_swapping=any(f in flags for f in ("--branch-swapping", "--bs")),
+		subgraph_factoring="--subgraph-factoring" in flags,
 		trivial_loops=any(f in flags for f in ("--trivial-loops", "--tl")),
 		nested_conditionals=any(f in flags for f in ("--nested-conditionals", "--nc")),
 		associative_constant_merging=any(

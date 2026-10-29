@@ -8,5 +8,6 @@ from minifier.procedures import *
 from minifier.expressions import *
 from minifier.verification import *
 from minifier.cli import *
+from minifier.subgraph_factoring import *
 
 __all__ = [name for name in globals() if not name.startswith("_")]

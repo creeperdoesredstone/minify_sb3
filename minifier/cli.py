@@ -59,6 +59,7 @@ def print_transform_stats(stats, opts):
 		print(Ansi.subheading(f"  {number} {title}"))
 		for key, label in entries:
 			print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+		
 		if number == "12.":
 			if opts.simplify_blocks:
 				print(Ansi.subheading("  12a. Simplify set-variable arithmetic"))
@@ -110,8 +111,21 @@ def print_transform_stats(stats, opts):
 					("branch_factor_rejected_size", "candidates rejected for size"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
+			if opts.subgraph_factoring:
+				print(Ansi.subheading("  12e. Factor repeated nested subgraphs"))
+				for key, label in (
+					("subgraph_factor_candidates", "repeated candidates evaluated"),
+					("subgraph_factor_groups", "subgraphs factored into procedures"),
+					("subgraph_factor_occurrences", "occurrences replaced by calls"),
+					("subgraph_factor_blocks_removed", "original blocks removed"),
+					("subgraph_factor_blocks_added", "procedure and call blocks added"),
+					("subgraph_factor_bytes_saved", "measured JSON bytes saved"),
+					("subgraph_factor_rejected_size", "candidates rejected for size"),
+					("subgraph_factor_search_capped", "targets reaching search cap"),
+				):
+					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.specialize_procedures:
-				print(Ansi.subheading("  12d. Specialize custom procedures"))
+				print(Ansi.subheading("  12f. Specialize custom procedures"))
 				for key, label in (
 					("procedure_specialized", "procedure variants specialized"),
 					(
@@ -137,14 +151,14 @@ def print_transform_stats(stats, opts):
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.clear_procedure_definition_shadows:
-				print(Ansi.subheading("  12e. Clear procedure definition shadows"))
+				print(Ansi.subheading("  12g. Clear procedure definition shadows"))
 				print(
 					Ansi.muted(
 						f"    {'procedure definition shadows cleared':40} {stats['procedure_definition_shadows_cleared']:>8,}"
 					)
 				)
 			if opts.compact_procedure_prototypes:
-				print(Ansi.subheading("  12f. Compact procedure prototypes"))
+				print(Ansi.subheading("  12h. Compact procedure prototypes"))
 				for key, label in (
 					(
 						"procedure_prototypes_compacted",
@@ -157,7 +171,7 @@ def print_transform_stats(stats, opts):
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.optimize_procedure_arguments:
-				print(Ansi.subheading("  12g. Optimize custom procedure arguments"))
+				print(Ansi.subheading("  12i. Optimize custom procedure arguments"))
 				for key, label in (
 					("procedure_arguments_removed", "procedure arguments removed"),
 					(
@@ -171,7 +185,7 @@ def print_transform_stats(stats, opts):
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.merge_duplicate_procedures:
-				print(Ansi.subheading("  12g. Merge duplicate custom procedures"))
+				print(Ansi.subheading("  12j. Merge duplicate custom procedures"))
 				for key, label in (
 					("duplicate_procedures_merged", "duplicate procedures merged"),
 					(
@@ -181,7 +195,7 @@ def print_transform_stats(stats, opts):
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.inline_single_use_procedures:
-				print(Ansi.subheading("  12h. Inline safe single-use procedures"))
+				print(Ansi.subheading("  12k. Inline safe single-use procedures"))
 				for key, label in (
 					("procedure_inlined", "single-use procedures inlined"),
 					(
@@ -196,7 +210,7 @@ def print_transform_stats(stats, opts):
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.constant_propagation:
-				print(Ansi.subheading("  12i. Propagate script constants"))
+				print(Ansi.subheading("  12l. Propagate script constants"))
 				for key, label in (
 					("script_constants_propagated", "input expressions rewritten"),
 					("script_constant_cfg_changes", "CFG data-flow changes"),

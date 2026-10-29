@@ -122,6 +122,7 @@ def progress_stage_count(opts: Options) -> int:
 		or opts.trivial_loops
 		or opts.nested_conditionals
 	)
+	count += opts.subgraph_factoring
 	count += opts.simplify_boolean_control or opts.trivial_loops
 	count += opts.simplify_blocks
 	count += opts.group_similar_sequences

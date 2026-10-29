@@ -121,7 +121,8 @@ toggles = {
     "--unbounded-sequence-length",
     "--unbounded-sequence-params",
     "--unbounded-layout",
-    "--unbounded-search"
+    "--unbounded-search",
+    "--subgraph-factoring",
 }
 
 valued = {
@@ -246,6 +247,7 @@ groups = {
 		"--merge-duplicate-procedures",
 		"--inline-single-use-procedures",
 		"--specialize-procedures",
+        "--subgraph-factoring",
 		"--swap-branches",
 		"--branch-factoring",
 		"--trivial-loops",
@@ -296,6 +298,7 @@ groups = {
 	"--control-flow": (
 		"--swap-branches",
 		"--branch-factoring",
+        "--subgraph-factoring",
 		"--trivial-loops",
 		"--nested-conditionals",
 		"--associative-constants",
