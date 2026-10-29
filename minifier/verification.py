@@ -193,9 +193,10 @@ def apply_transforms(project, opts: Options, assets=None, progress=None):
 		simplify_boolean_controls(project, stats, opts, only_repeat_one=True)
 		_debug_structure_checkpoint(project, "trivial-loop simplification")
 	if opts.simplify_blocks:
-		stage("Simplify setter RHS blocks")
+		stage("Simplify setter arithmetic and repeated assignments")
 		_simplify_setter_rhs_blocks(project, stats, opts)
-		_debug_structure_checkpoint(project, "setter-RHS simplification")
+		_reduce_repeated_assignment_deltas(project, stats, opts)
+		_debug_structure_checkpoint(project, "variable assignment simplification")
 	if opts.optimize_procedure_arguments:
 		stage("Optimize procedure arguments")
 		optimize_procedure_arguments(project, stats, opts)

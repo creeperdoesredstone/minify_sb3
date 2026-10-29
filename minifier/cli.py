@@ -67,7 +67,9 @@ def print_transform_stats(stats, opts):
 					("blocks_simplified", "set blocks simplified"),
 					("set_to_change_add", "addition forms simplified"),
 					("set_to_change_subtract", "subtraction forms simplified"),
+					("set_to_change_delta", "repeated assignments replaced by deltas"),
 					("simplify_blocks_removed", "redundant reporter blocks removed"),
+					("assignment_delta_blocks_removed", "reporter blocks removed by delta rewrites"),
 				):
 					print(Ansi.muted(f"    {label:40} {stats[key]:>8,}"))
 			if opts.group_similar_sequences:

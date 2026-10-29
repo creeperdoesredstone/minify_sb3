@@ -1518,6 +1518,315 @@ def _simplify_setter_rhs_blocks(project, stats, opts):
 	return total
 
 
+def get_linear_var_offset(raw, blocks):
+	variable_id = _variable_reporter_id(raw, blocks)
+	root_id = _sequence_primary_input_block_id(raw, blocks)
+
+	if variable_id is not None:
+		if root_id is None:
+			return variable_id, 0.0
+		
+		root = blocks.get(root_id)
+
+		if isinstance(root, dict) and root.get("opcode") == "data_variable":
+			return variable_id, 0.0
+
+	if root_id is None:
+		return None
+
+	root = blocks.get(root_id)
+
+	if not isinstance(root, dict) or root.get("next") is not None:
+		return None
+	
+	operator = root.get("opcode")
+
+	if operator not in ("operator_add", "operator_subtract"):
+		return None
+
+	inputs = root.get("inputs") or {}
+	left_raw = inputs.get("NUM1")
+	right_raw = inputs.get("NUM2")
+
+	if left_raw is None or right_raw is None:
+		return None
+
+	def numeric_literal(value):
+		if not _is_literal_value(value):
+			return None
+		
+		literal = value[1]
+
+		if not isinstance(literal, list) or len(literal) != 2:
+			return None
+		
+		number = _to_scratch_number(literal[1])
+		return number if math.isfinite(number) else None
+
+	left_variable = _variable_reporter_id(left_raw, blocks)
+	right_variable = _variable_reporter_id(right_raw, blocks)
+	left_number = numeric_literal(left_raw)
+	right_number = numeric_literal(right_raw)
+
+	if operator == "operator_add":
+		if left_variable is not None and right_number is not None:
+			return left_variable, right_number
+		
+		if right_variable is not None and left_number is not None:
+			return right_variable, left_number
+		
+		return None
+
+	# subtraction is not commutative, accept only a - n
+	if left_variable is not None and right_number is not None:
+		return left_variable, -right_number
+	return None
+
+
+def _variable_write_id(block):
+	if not isinstance(block, dict) or block.get("opcode") not in (
+		"data_setvariableto",
+		"data_changevariableby",
+		"control_for_each",
+	):
+		return None
+	field = (block.get("fields") or {}).get("VARIABLE")
+	if isinstance(field, list) and len(field) > 1 and isinstance(field[1], str):
+		return field[1]
+	return None
+
+
+def _project_variable_writers(project):
+	writers = defaultdict(set)
+	for ti, target in enumerate(project.get("targets", [])):
+		for bid, block in (target.get("blocks") or {}).items():
+			var_id = _variable_write_id(block)
+			if var_id is not None:
+				writers[var_id].add((ti, bid))
+	return writers
+
+
+def next_chains(target):
+	blocks = target.get("blocks") or {}
+	for root_id, root in list(blocks.items()):
+		if not (
+			isinstance(root, dict)
+			and root.get("topLevel") is True
+			and root.get("parent") is None
+		):
+			continue
+
+		chain = []
+		seen = set()
+		bid = root_id
+
+		while isinstance(bid, str) and bid in blocks and bid not in seen:
+			seen.add(bid)
+			chain.append(bid)
+			block = blocks.get(bid)
+			bid = block.get("next") if isinstance(block, dict) else None
+
+		if chain:
+			yield chain
+
+
+def _numeric_literal_input(raw):
+	if not _is_literal_value(raw):
+		return None
+	
+	literal = raw[1]
+
+	if not isinstance(literal, list) or len(literal) != 2:
+		return None
+	
+	number = _to_scratch_number(literal[1])
+	return number if math.isfinite(number) else None
+
+
+def _reduce_repeated_assignment_deltas(project, stats, opts):
+	targets = project.get("targets", [])
+	writers = _project_variable_writers(project)
+	rewrites = removed_count = 0
+	chains_by_target = []
+	chain_by_block = {}
+	ambiguous_blocks = set()
+
+	for ti, target in enumerate(targets):
+		target_chains = []
+
+		for chain_index, chain in enumerate(next_chains(target)):
+			token = (ti, chain_index)
+			target_chains.append((token, chain))
+
+			for bid in chain:
+				location = (ti, bid)
+
+				if location in chain_by_block and chain_by_block[location] != token:
+					ambiguous_blocks.add(location)
+				else:
+					chain_by_block[location] = token
+
+		chains_by_target.append(target_chains)
+
+	for location in ambiguous_blocks:
+		chain_by_block.pop(location, None)
+
+	variable_writer_chain = {}
+
+	for var_id, locations in writers.items():
+		tokens = set()
+
+		for location in locations:
+			token = chain_by_block.get(location)
+
+			if token is None:
+				break
+
+			tokens.add(token)
+
+		if token is not None and len(tokens) == 1:
+			variable_writer_chain[var_id] = next(iter(tokens))
+
+	if not hasattr(opts, "simplified_block_removed_blocks") or len(
+		opts.simplified_block_removed_blocks
+	) != len(targets):
+		opts.simplified_block_removed_blocks = [set() for _ in targets]
+	if not hasattr(opts, "simplified_block_link_edits"):
+		opts.simplified_block_link_edits = {}
+	if not hasattr(opts, "simplified_block_input_edits"):
+		opts.simplified_block_input_edits = {}
+	if not hasattr(opts, "simplified_block_opcode_edits"):
+		opts.simplified_block_opcode_edits = {}
+
+	for ti, target in enumerate(targets):
+		blocks = target.get("blocks") or {}
+		graph = ProjectGraph(target)
+		commented_ids = {
+			comment.get("blockId")
+			for comment in (target.get("comments") or {}).values()
+			if isinstance(comment, dict) and isinstance(comment.get("blockId"), str)
+		}
+		commented_ids.update(
+			bid
+			for bid, block in blocks.items()
+			if isinstance(block, dict) and "comment" in block
+		)
+
+		for chain_token, chain in chains_by_target[ti]:
+			last_write_index = {}
+			last_write_id = {}
+			effective_forms = {}
+
+			def writers_confined_to_chain(var_id):
+				return not writers.get(var_id) or variable_writer_chain.get(var_id) == chain_token
+
+			for index, bid in enumerate(chain):
+				block = blocks.get(bid)
+				if not isinstance(block, dict):
+					continue
+
+				opcode = block.get("opcode")
+				var_id = _variable_write_id(block)
+				if var_id is None:
+					continue
+
+				current_form = None
+				if opcode == "data_setvariableto":
+					current_form = get_linear_var_offset(
+						(block.get("inputs") or {}).get("VALUE"), blocks
+					)
+
+				previous_id = last_write_id.get(var_id)
+				previous_index = last_write_index.get(var_id)
+				previous_form = effective_forms.get(previous_id)
+
+				if current_form is not None and previous_form is not None:
+					base_id, current_offset = current_form
+					previous_base_id, previous_offset = previous_form
+					can_rewrite = (
+						previous_index is not None
+						and base_id == previous_base_id
+						and base_id != var_id
+						and last_write_index.get(base_id, -1) <= previous_index
+						and writers_confined_to_chain(var_id)
+						and writers_confined_to_chain(base_id)
+					)
+					if can_rewrite:
+						delta = current_offset - previous_offset
+						if math.isfinite(delta) and delta != 0:
+							value_raw = (block.get("inputs") or {}).get("VALUE")
+							owned = _exclusive_input_block_subtree(
+								value_raw, blocks, bid, graph=graph
+							)
+
+							if owned and not any(
+								removed_id in commented_ids for removed_id in owned
+							):
+								if all(
+									isinstance(blocks.get(removed_id), dict)
+									and blocks[removed_id].get("opcode")
+									in ("data_variable", "operator_add", "operator_subtract")
+									and blocks[removed_id].get("next") is None
+									for removed_id in owned
+								):
+									delta_value = (
+										int(delta)
+										if float(delta).is_integer()
+										else delta
+									)
+									new_value = [
+										INPUT_SAME_BLOCK_SHADOW,
+										[PRIMITIVE_NUMBER, delta_value],
+									]
+									block["opcode"] = "data_changevariableby"
+									block.setdefault("inputs", {})["VALUE"] = new_value
+									opts.simplified_block_opcode_edits[(ti, bid)] = (
+										"data_changevariableby"
+									)
+									opts.simplified_block_input_edits[(ti, bid, "VALUE")] = (
+										copy.deepcopy(new_value)
+									)
+
+									for removed_id in owned:
+										blocks.pop(removed_id, None)
+
+									opts.simplified_block_removed_blocks[ti].update(owned)
+									graph.refresh_after_mutation(changed={bid}, removed=owned)
+									rewrites += 1
+									removed_count += len(owned)
+
+				if opcode == "data_setvariableto":
+					effective_forms[bid] = current_form
+				elif opcode == "data_changevariableby":
+					change = _numeric_literal_input(
+						(block.get("inputs") or {}).get("VALUE")
+					)
+					
+					if (
+						previous_form is not None
+						and previous_index is not None
+						and change is not None
+						and previous_form[0] != var_id
+						and last_write_index.get(previous_form[0], -1) <= previous_index
+					):
+						effective_forms[bid] = (
+							previous_form[0], previous_form[1] + change
+						)
+					else:
+						effective_forms[bid] = None
+				else:
+					effective_forms[bid] = None
+
+				last_write_index[var_id] = index
+				last_write_id[var_id] = bid
+
+	stats["blocks_simplified"] += rewrites
+	stats["set_to_change_delta"] += rewrites
+	stats["simplify_blocks_removed"] += removed_count
+	stats["assignment_delta_blocks_removed"] += removed_count
+	return rewrites
+
+
 def get_subtree_block_ids(raw, blocks):
 	out = set()
 	stack = list(_input_block_ids(raw, blocks))

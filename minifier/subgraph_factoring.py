@@ -18,6 +18,38 @@ SUBGRAPH_FORBIDDEN_OPCODES = {
 }
 
 
+def _subgraph_literal_tag(value):
+	if not (isinstance(value, list) and len(value) == 2):
+		return None
+
+	wrapper = scratch_numeric_tag(value[0])
+
+	if wrapper not in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW):
+		return None
+
+	literal = value[1]
+
+	if not (isinstance(literal, list) and len(literal) == 2):
+		return None
+
+	primitive_tag = scratch_numeric_tag(literal[0])
+	raw = literal[1]
+
+	if primitive_tag in NUMERIC_TAGS:
+		if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+			return None
+
+		if isinstance(raw, float) and not math.isfinite(raw):
+			return None
+
+		return primitive_tag
+
+	if primitive_tag == PRIMITIVE_TEXT and isinstance(raw, str):
+		return primitive_tag
+
+	return None
+
+
 def get_subgraph_literal(value: Any) -> list[None]:
 	if not (isinstance(value, list) and len(value) == 2):
 		return None
@@ -89,8 +121,16 @@ def _subgraph_signature(block_id, blocks, memo, active, include_next=False):
 		if tag not in INPUT_TAGS:
 			return copy.deepcopy(value)
 
-		normalized = copy.deepcopy(value)
-		literal = get_subgraph_literal(value)
+		literal_tag = (
+			_subgraph_literal_tag(value)
+			if tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW)
+			else None
+		)
+		if literal_tag is not None:
+			normalized = list(value)
+			normalized[1] = ["$literal", literal_tag]
+		else:
+			normalized = copy.deepcopy(value)
 		slots = (1, 2) if tag == INPUT_DIFF_BLOCK_SHADOW else (1,)
 		for index in slots:
 			if len(value) <= index:
@@ -101,9 +141,8 @@ def _subgraph_signature(block_id, blocks, memo, active, include_next=False):
 			if (
 				tag in (INPUT_SAME_BLOCK_SHADOW, INPUT_BLOCK_NO_SHADOW)
 				and index == 1
-				and literal is not None
+				and literal_tag is not None
 			):
-				normalized[index] = ["$literal", scratch_numeric_tag(literal[0])]
 				continue
 
 			if isinstance(item, str):
@@ -454,14 +493,57 @@ def are_compatible_subgraphs(info, selected):
 	return True
 
 
-def make_subgraph_plan(target, occurrences):
+class _SubgraphCompatibilityIndex:
+	__slots__ = ("closure_ids", "owners", "continuations")
+
+	def __init__(self):
+		self.closure_ids = set()
+		self.owners = set()
+		self.continuations = set()
+
+	def compatible(self, info):
+		closure = info["closure"]
+		owner_id = info["owner"]["owner_id"]
+		continuation_id = info["continuation_id"]
+		if closure & self.closure_ids:
+			return False
+		
+		if owner_id is not None and (
+			owner_id in self.closure_ids or owner_id in self.continuations
+		):
+			return False
+		
+		if continuation_id is not None and (
+			continuation_id in self.closure_ids or continuation_id in self.owners
+		):
+			return False
+		
+		if closure & self.owners or closure & self.continuations:
+			return False
+		
+		return True
+
+	def add(self, info):
+		self.closure_ids.update(info["closure"])
+		owner_id = info["owner"]["owner_id"]
+		if owner_id is not None:
+			self.owners.add(owner_id)
+		continuation_id = info["continuation_id"]
+		if continuation_id is not None:
+			self.continuations.add(continuation_id)
+
+
+def make_subgraph_plan(target, occurrences, existing_ids=None, proc_codes=None):
 	if len(occurrences) < 2 or len({item["warp"] for item in occurrences}) != 1:
 		return None
+	
 	blocks = target.get("blocks") or {}
 	slot_lists = [item["slots"] for item in occurrences]
 	slot_count = len(slot_lists[0])
+
 	if any(len(items) != slot_count for items in slot_lists):
 		return None
+	
 	for index in range(slot_count):
 		first = slot_lists[0][index]
 		if any(
@@ -476,40 +558,53 @@ def make_subgraph_plan(target, occurrences):
 	param_vectors = {}
 	parameter_slot_indices = []
 	parameter_defaults = []
+
 	for slot_index in range(slot_count):
 		vector = tuple(
 			dumps_compact(items[slot_index]["literal"]) for items in slot_lists
 		)
+
 		if len(set(vector)) <= 1:
 			continue
+
 		parameter_index = param_vectors.get(vector)
+
 		if parameter_index is None:
 			parameter_index = len(parameter_slot_indices)
 			param_vectors[vector] = parameter_index
 			parameter_slot_indices.append([])
 			raw = slot_lists[0][slot_index]["literal"][1]
 			parameter_defaults.append(str(raw))
+
 		parameter_slot_indices[parameter_index].append(slot_index)
 
-	existing_ids = set(blocks)
+	if existing_ids is None:
+		existing_ids = set(blocks)
+
 	def_id = _subgraph_new_id(existing_ids)
 	proto_id = _subgraph_new_id(existing_ids)
 	argument_ids = [_subgraph_new_id(existing_ids) for _ in parameter_slot_indices]
 	argument_names = [f"p{i}" for i in range(len(argument_ids))]
-	proc_codes = {
-		procedure_key(block)
-		for block in blocks.values()
-		if isinstance(block, dict)
-		and block.get("opcode") in ("procedures_prototype", "procedures_call")
-		and isinstance(procedure_key(block), str)
-	}
+
+	if proc_codes is None:
+		proc_codes = {
+			procedure_key(block)
+			for block in blocks.values()
+			if isinstance(block, dict)
+			and block.get("opcode") in ("procedures_prototype", "procedures_call")
+			and isinstance(procedure_key(block), str)
+		}
+
 	proc_counter = 0
+
 	while True:
 		proc_name = f"sg{proc_counter}" + (
 			" " + " ".join("%s" for _ in argument_ids) if argument_ids else ""
 		)
+
 		if proc_name not in proc_codes:
 			break
+
 		proc_counter += 1
 
 	representative = occurrences[0]
@@ -517,6 +612,7 @@ def make_subgraph_plan(target, occurrences):
 		bid: _subgraph_new_id(existing_ids) for bid in representative["closure"]
 	}
 	generated = {}
+
 	for old_id in representative["closure"]:
 		old = blocks[old_id]
 		new = copy.deepcopy(old)
@@ -524,20 +620,23 @@ def make_subgraph_plan(target, occurrences):
 		new.pop("x", None)
 		new.pop("y", None)
 		parent_id = old.get("parent")
+
 		if old_id == representative["sequence"][0]:
 			new["parent"] = def_id
 		elif parent_id in body_map:
 			new["parent"] = body_map[parent_id]
 		else:
 			return None
+		
 		next_id = old.get("next")
 		new["next"] = body_map.get(next_id)
+
 		for input_value in (new.get("inputs") or {}).values():
 			replace_input_block_ids(input_value, body_map)
+
 		generated[body_map[old_id]] = new
 
 	for parameter_index, slot_indices in enumerate(parameter_slot_indices):
-		arg_id = argument_ids[parameter_index]
 		for slot_index in slot_indices:
 			slot = slot_lists[0][slot_index]
 			clone_id = body_map[slot["block_id"]]
@@ -582,8 +681,8 @@ def make_subgraph_plan(target, occurrences):
 		"x": 5,
 		"y": 5,
 	}
-
 	call_blocks = []
+
 	for occurrence_index, occurrence in enumerate(occurrences):
 		call_id = _subgraph_new_id(existing_ids)
 		call_inputs = {}
@@ -606,10 +705,12 @@ def make_subgraph_plan(target, occurrences):
 				"warp": warp,
 			},
 		}
+
 		if occurrence["owner"]["owner_id"] is None:
 			call["topLevel"] = True
 			call["x"] = root.get("x", 5)
 			call["y"] = root.get("y", 5)
+
 		call_blocks.append({"id": call_id, "block": call, "occurrence": occurrence})
 
 	return {
@@ -623,33 +724,42 @@ def make_subgraph_plan(target, occurrences):
 def apply_subgraph_plan(target, plan, opts, stats, ti):
 	blocks = target.get("blocks") or {}
 	removed = plan["removed"]
+
 	for call_entry in plan["call_blocks"]:
 		occurrence = call_entry["occurrence"]
 		root_id = occurrence["sequence"][0]
 		tail_id = occurrence["sequence"][-1]
+
 		if root_id not in blocks or any(
 			bid not in blocks for bid in occurrence["closure"]
 		):
 			return False
+		
 		owner = occurrence["owner"]
 		owner_id = owner["owner_id"]
+
 		if owner_id is not None:
 			if owner_id in removed or owner_id not in blocks:
 				return False
+			
 			owner_block = blocks[owner_id]
+
 			if owner["edge_kind"] == "next":
 				if owner_block.get("next") != root_id:
 					return False
 			else:
 				value = (owner_block.get("inputs") or {}).get(owner["edge_name"])
+
 				if not (
 					isinstance(value, list) and len(value) > 1 and value[1] == root_id
 				):
 					return False
+				
 		continuation_id = occurrence["continuation_id"]
 		if isinstance(continuation_id, str):
 			if continuation_id in removed or continuation_id not in blocks:
 				return False
+			
 			if blocks[continuation_id].get("parent") != tail_id:
 				return False
 
@@ -660,8 +770,10 @@ def apply_subgraph_plan(target, plan, opts, stats, ti):
 		owner = occurrence["owner"]
 		owner_id = owner["owner_id"]
 		call_id = call_entry["id"]
+
 		if owner_id is not None:
 			owner_block = blocks[owner_id]
+
 			if owner["edge_kind"] == "next":
 				owner_block["next"] = call_id
 				opts.script_rewrite_link_edits[(ti, owner_id, "next")] = call_id
@@ -669,16 +781,20 @@ def apply_subgraph_plan(target, plan, opts, stats, ti):
 				replacement = get_input_replacement(
 					owner_block, "input", owner["edge_name"], root_id, call_id
 				)
+
 				if replacement is None:
 					return False
+				
 				opts.script_rewrite_input_edits[(ti, owner_id, owner["edge_name"])] = (
 					copy.deepcopy(owner_block.get("inputs", {}).get(owner["edge_name"]))
 				)
+
 		blocks[call_id] = call_entry["block"]
 		opts.script_rewrite_link_edits[(ti, call_id, "parent")] = owner_id
 		opts.script_rewrite_link_edits[(ti, call_id, "next")] = occurrence[
 			"continuation_id"
 		]
+
 		if isinstance(occurrence["continuation_id"], str):
 			blocks[occurrence["continuation_id"]]["parent"] = call_id
 			opts.script_rewrite_link_edits[
@@ -692,8 +808,10 @@ def apply_subgraph_plan(target, plan, opts, stats, ti):
 		set(plan["new_blocks"]) | {entry["id"] for entry in plan["call_blocks"]},
 	)
 	record_removed_blocks(opts, ti, removed)
+
 	for bid in removed:
 		blocks.pop(bid, None)
+
 	stats["subgraph_factor_groups"] += 1
 	stats["subgraph_factor_occurrences"] += len(plan["call_blocks"])
 	stats["subgraph_factor_blocks_removed"] += len(removed)
@@ -701,6 +819,71 @@ def apply_subgraph_plan(target, plan, opts, stats, ti):
 		plan["call_blocks"]
 	)
 	return True
+
+
+def get_subgraph_entry_size(block_id, block) -> int:
+	return (
+		len(dumps_compact(block_id).encode("utf-8"))
+		+ 1
+		+ len(dumps_compact(block).encode("utf-8"))
+	)
+
+
+def get_subgraph_plan_dsize(target, plan, ti) -> int | None:
+	blocks = target.get("blocks") or {}
+
+	if not isinstance(blocks, dict):
+		return None
+
+	changed_existing = set()
+
+	for entry in plan["call_blocks"]:
+		occurrence = entry["occurrence"]
+		owner_id = occurrence["owner"]["owner_id"]
+		continuation_id = occurrence["continuation_id"]
+
+		if owner_id is not None:
+			changed_existing.add(owner_id)
+
+		if isinstance(continuation_id, str):
+			changed_existing.add(continuation_id)
+
+	changed_existing.difference_update(plan["removed"])
+	trial_blocks = dict(blocks)
+
+	for bid in changed_existing:
+		original = blocks.get(bid)
+
+		if isinstance(original, dict):
+			trial_blocks[bid] = copy.deepcopy(original)
+
+	trial_target = dict(target)
+	trial_target["blocks"] = trial_blocks
+	trial_opts = Options()
+	script_prepare_maps(trial_opts, [trial_target])
+	trial_stats = Counter()
+
+	if not apply_subgraph_plan(trial_target, plan, trial_opts, trial_stats, ti):
+		return None
+
+	added = set(plan["new_blocks"])
+	added.update(entry["id"] for entry in plan["call_blocks"])
+	old_ids = set(plan["removed"]) | changed_existing
+	new_ids = added | changed_existing
+	old_bytes = sum(
+		get_subgraph_entry_size(bid, blocks[bid])
+		for bid in old_ids
+		if bid in blocks
+	)
+	new_bytes = sum(
+		get_subgraph_entry_size(bid, trial_blocks[bid])
+		for bid in new_ids
+		if bid in trial_blocks
+	)
+	before_count = len(blocks)
+	after_count = len(trial_blocks)
+	comma_delta = max(0, after_count - 1) - max(0, before_count - 1)
+	return new_bytes - old_bytes + comma_delta
 
 
 def factor_repeated_subgraphs(project, stats, opts, progress) -> int:
@@ -780,57 +963,71 @@ def factor_repeated_subgraphs(project, stats, opts, progress) -> int:
 
 		stats["subgraph_factor_candidates"] += len(candidates)
 
+		current_graph = None
+		current_commented = get_comment_ids(target)
+		graph_dirty = True
+		reserved_ids = set(blocks)
+		proc_codes = {
+			procedure_key(block)
+			for block in blocks.values()
+			if isinstance(block, dict)
+			and block.get("opcode") in ("procedures_prototype", "procedures_call")
+			and isinstance(procedure_key(block), str)
+		}
+
 		for _score, sequences in candidates:
-			if (
-				sum(
-					1
-					for seq in sequences
-					if all(bid in (target.get("blocks") or {}) for bid in seq)
-				)
-				< 2
-			):
+			available = 0
+			for seq in sequences:
+				if all(bid in blocks for bid in seq):
+					available += 1
+
+					if available >= 2:
+						break
+
+			if available < 2:
 				continue
 
-			current_graph = ProjectGraph(target)
-			current_commented = get_comment_ids(target)
+			if graph_dirty:
+				current_graph = ProjectGraph(target)
+				graph_dirty = False
+
 			selected = []
+			selected_warp = None
+			selected_index = _SubgraphCompatibilityIndex()
 
 			for sequence in sequences:
 				info = analyze_occurence(
 					target, sequence, current_graph, current_commented
 				)
 
-				if info is None or any(
-					info["warp"] != item["warp"] for item in selected
-				):
+				if info is None:
+					continue
+				if selected and info["warp"] != selected_warp:
+					continue
+				if not selected_index.compatible(info):
 					continue
 
-				if not are_compatible_subgraphs(info, selected):
-					continue
 				selected.append(info)
+
+				if selected_warp is None:
+					selected_warp = info["warp"]
+				selected_index.add(info)
 
 			if len(selected) < 2:
 				continue
 
-			plan = make_subgraph_plan(target, selected)
+			plan = make_subgraph_plan(
+				target, selected, existing_ids=reserved_ids, proc_codes=proc_codes
+			)
 
 			if plan is None:
 				continue
 
-			before = _json_len(target)
-			trial_target = copy.deepcopy(target)
-			trial_opts = Options()
-			script_prepare_maps(trial_opts, [trial_target])
-			trial_stats = Counter()
-
-			if not apply_subgraph_plan(
-				trial_target, copy.deepcopy(plan), trial_opts, trial_stats, ti
-			):
+			size_delta = get_subgraph_plan_dsize(target, plan, ti)
+			
+			if size_delta is None:
 				continue
-
-			after = _json_len(trial_target)
-
-			if after >= before:
+			if size_delta >= 0:
 				stats["subgraph_factor_rejected_size"] += 1
 				continue
 
@@ -839,11 +1036,13 @@ def factor_repeated_subgraphs(project, stats, opts, progress) -> int:
 			if not apply_subgraph_plan(target, plan, opts, local_stats, ti):
 				continue
 
-			stats["subgraph_factor_bytes_saved"] += before - after
+			stats["subgraph_factor_bytes_saved"] += -size_delta
+			proc_codes.add(plan["proc_name"])
 
 			for key, value in local_stats.items():
 				stats[key] += value
 
 			total += 1
+			graph_dirty = True
 
 	return total
