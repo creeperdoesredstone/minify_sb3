@@ -714,7 +714,7 @@ def factor_repeated_subgraphs(project, stats, opts, progress) -> int:
 		if len(blocks) < 6:
 			continue
 
-		progress.detail(f"target {target['name']}")
+		progress.detail(f"target {target['name']} {ti+1}/{len(targets)}")
 
 		signature_memo = {}
 		groups = defaultdict(list)

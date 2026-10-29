@@ -599,7 +599,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 		fold_constant_variables="--fold-constant-variables" in flags,
 		fold_constant_expressions="--fold-constant-expressions" in flags,
 		factor_math_expressions="--factor-math-expressions" in flags
-		or "--fms" in flags,
+		or "--fme" in flags,
 		simplify_boolean_control="--simplify-boolean-control" in flags,
 		simplify_blocks="--simplify-blocks" in flags,
 		deduplicate_assets="--deduplicate-assets" in flags,

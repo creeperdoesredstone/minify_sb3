@@ -2648,10 +2648,14 @@ def plan_math_expr_factoring(value, blocks, owner_id, incoming_refs, graph):
 		and value[0] in (INPUT_BLOCK_NO_SHADOW, INPUT_DIFF_BLOCK_SHADOW)
 	):
 		return None
+
 	block_id = value[1]
+
 	if not isinstance(block_id, str) or block_id == owner_id:
 		return None
+
 	block = blocks.get(block_id)
+
 	if (
 		not isinstance(block, dict)
 		or block.get("opcode") != "operator_add"
@@ -2662,11 +2666,13 @@ def plan_math_expr_factoring(value, blocks, owner_id, incoming_refs, graph):
 
 	inputs = block.get("inputs") or {}
 	left_raw, right_raw = inputs.get("NUM1"), inputs.get("NUM2")
+
 	if left_raw is None or right_raw is None:
 		return None
 
 	left_id = get_input_root(left_raw, blocks)
 	right_id = get_input_root(right_raw, blocks)
+
 	if (
 		left_id is None
 		or right_id is None
@@ -2678,6 +2684,7 @@ def plan_math_expr_factoring(value, blocks, owner_id, incoming_refs, graph):
 
 	left = blocks.get(left_id)
 	right = blocks.get(right_id)
+
 	if not (
 		isinstance(left, dict)
 		and left.get("opcode") == "operator_multiply"
@@ -2693,46 +2700,185 @@ def plan_math_expr_factoring(value, blocks, owner_id, incoming_refs, graph):
 	left_inputs = left.get("inputs") or {}
 	right_inputs = right.get("inputs") or {}
 
-	def coefficient_and_term(factors):
-		for coefficient_name, term_name in (("NUM1", "NUM2"), ("NUM2", "NUM1")):
-			raw_coefficient = factors.get(coefficient_name)
-			raw_term = factors.get(term_name)
+	left_factors = (left_inputs.get("NUM1"), left_inputs.get("NUM2"))
+	right_factors = (right_inputs.get("NUM1"), right_inputs.get("NUM2"))
 
-			if raw_coefficient is None or raw_term is None:
-				continue
+	if any(raw is None for raw in (*left_factors, *right_factors)):
+		return None
 
-			constant = constexpr_from_input(raw_coefficient, blocks)
+	pure_opcodes = {
+		"operator_add",
+		"operator_subtract",
+		"operator_multiply",
+		"operator_divide",
+		"operator_mod",
+		"operator_round",
+		"operator_mathop",
+		"operator_gt",
+		"operator_lt",
+		"operator_equals",
+		"operator_and",
+		"operator_or",
+		"operator_not",
+		"operator_join",
+		"operator_length",
+		"operator_letter_of",
+		"operator_contains",
+	}
 
-			if constant is None:
-				continue
+	commutative_opcodes = {
+		"operator_add",
+		"operator_multiply",
+		"operator_equals",
+		"operator_and",
+		"operator_or",
+	}
 
-			coefficient = constant_to_number(constant[0])
+	forbidden_ids = {owner_id, block_id, left_id, right_id}
 
-			if coefficient is None or not math.isfinite(coefficient):
-				continue
+	def block_signature(block_id, visiting):
+		if block_id in forbidden_ids or block_id in visiting:
+			return None
+
+		current = blocks.get(block_id)
+
+		if (
+			not isinstance(current, dict)
+			or current.get("next") is not None
+		):
+			return None
+
+		opcode = current.get("opcode")
+
+		if opcode == "data_variable":
+			fields = current.get("fields") or {}
+			variable = fields.get("VARIABLE")
+
+			if not isinstance(variable, list) or len(variable) < 2:
+				return None
+
+			return ("variable", variable[1], variable[0])
+
+		if opcode not in pure_opcodes:
+			return None
+
+		visiting.add(block_id)
+		try:
+			fields_sig = dumps_compact(current.get("fields") or {})
+			mutation_sig = dumps_compact(current.get("mutation"))
+
+			input_signatures = {}
+
+			for name, raw in sorted((current.get("inputs") or {}).items()):
+				signature = input_signature(raw, visiting)
+
+				if signature is None:
+					return None
+				
+				input_signatures[name] = signature
 
 			if (
-				constexpr_from_input(raw_term, blocks) is not None
-				or not (
-					value_is_numeric(raw_term, blocks)
-					or _variable_reporter_id(raw_term, blocks) is not None
-				)
+				opcode in commutative_opcodes
+				and set(input_signatures) == {"NUM1", "NUM2"}
+			):
+				operands = tuple(sorted(
+					(
+						input_signatures["NUM1"],
+						input_signatures["NUM2"],
+					),
+					key=dumps_compact,
+				))
+				inputs_sig = ("COMMUTATIVE", operands)
+			else:
+				inputs_sig = tuple(sorted(input_signatures.items()))
+
+			return (
+				opcode,
+				fields_sig,
+				mutation_sig,
+				inputs_sig,
+			)
+		finally:
+			visiting.remove(block_id)
+
+	def input_signature(raw, visiting=None):
+		if visiting is None:
+			visiting = set()
+
+		constant = constexpr_from_input(raw, blocks)
+		if constant is not None:
+			number = constant_to_number(constant[0])
+
+			if number is not None:
+				try:
+					number = float(number)
+				except (TypeError, ValueError, OverflowError):
+					number = None
+
+				if number is not None and math.isfinite(number):
+					return ("number", number)
+
+		root_id = get_input_root(raw, blocks)
+
+		if not isinstance(root_id, str):
+			return None
+
+		return block_signature(root_id, visiting)
+
+	def subtree_weight(raw):
+		subtree = get_subtree_block_ids(raw, blocks)
+		return sum(
+			len(dumps_compact(blocks[bid])) + len(bid)
+			for bid in subtree
+			if isinstance(blocks.get(bid), dict)
+		)
+
+	left_signatures = tuple(input_signature(raw) for raw in left_factors)
+	right_signatures = tuple(input_signature(raw) for raw in right_factors)
+
+	candidates = []
+
+	for left_index in range(2):
+		common_signature = left_signatures[left_index]
+
+		if common_signature is None:
+			continue
+
+		for right_index in range(2):
+			if common_signature != right_signatures[right_index]:
+				continue
+
+			left_term = left_factors[1 - left_index]
+			right_term = right_factors[1 - right_index]
+
+			if (
+				input_signature(left_term) is None
+				or input_signature(right_term) is None
 			):
 				continue
 
-			return coefficient, raw_coefficient, raw_term
+			left_common = left_factors[left_index]
+			right_common = right_factors[right_index]
+			candidates.append((
+				subtree_weight(right_common),
+				left_common,
+				left_term,
+				right_term,
+			))
+			candidates.append((
+				subtree_weight(left_common),
+				right_common,
+				left_term,
+				right_term,
+			))
 
+	if not candidates:
 		return None
 
-	left_parts = coefficient_and_term(left_inputs)
-	right_parts = coefficient_and_term(right_inputs)
-
-	if (
-		left_parts is None
-		or right_parts is None
-		or left_parts[0] != right_parts[0]
-	):
-		return None
+	_, raw_common, left_term, right_term = max(
+		candidates,
+		key=lambda candidate: candidate[0],
+	)
 
 	owned = get_exclusive_input_subtree(
 		value, blocks, owner_id, incoming_refs, graph=graph
@@ -2741,19 +2887,18 @@ def plan_math_expr_factoring(value, blocks, owner_id, incoming_refs, graph):
 	if owned is None or not {block_id, left_id, right_id} <= owned:
 		return None
 
-	_, raw_coefficient, left_term = left_parts
-	_, _, right_term = right_parts
 	outer_inputs = {
-		"NUM1": copy.deepcopy(raw_coefficient),
+		"NUM1": copy.deepcopy(raw_common),
 		"NUM2": [INPUT_BLOCK_NO_SHADOW, left_id],
 	}
 	inner_inputs = {
 		"NUM1": copy.deepcopy(left_term),
 		"NUM2": copy.deepcopy(right_term),
 	}
+
 	preserved = {block_id, left_id}
 
-	for raw in (raw_coefficient, left_term, right_term):
+	for raw in (raw_common, left_term, right_term):
 		preserved.update(get_subtree_block_ids(raw, blocks))
 
 	if not preserved <= owned:
@@ -2767,7 +2912,7 @@ def plan_math_expr_factoring(value, blocks, owner_id, incoming_refs, graph):
 	link_updates = {}
 
 	for raw, parent_id in (
-		(raw_coefficient, block_id),
+		(raw_common, block_id),
 		(left_term, left_id),
 		(right_term, left_id),
 	):
@@ -2789,12 +2934,13 @@ def plan_math_expr_factoring(value, blocks, owner_id, incoming_refs, graph):
 		"old_parent": block.get("parent"),
 		"removed": removed,
 		"touched": removed | {block_id, left_id} | set(link_updates),
-		"law": "factoring"
+		"law": "factoring",
 	}
 
 
 def factor_math_expressions(project, stats, opts):
 	targets = project.get("targets", [])
+
 	if opts.folded_constant_expression_link_edits is None:
 		opts.folded_constant_expression_link_edits = {}
 	if opts.folded_constant_expression_inputs is None:
@@ -2807,6 +2953,7 @@ def factor_math_expressions(project, stats, opts):
 		opts.folded_constant_expression_blocks = [set() for _ in targets]
 
 	total = 0
+
 	for ti, target in enumerate(targets):
 		blocks = target.get("blocks") or {}
 		graph = ProjectGraph(target)
@@ -2818,6 +2965,7 @@ def factor_math_expressions(project, stats, opts):
 
 		while True:
 			changed = False
+
 			for owner_id, owner in list(blocks.items()):
 				if not isinstance(owner, dict):
 					continue
@@ -2825,8 +2973,10 @@ def factor_math_expressions(project, stats, opts):
 					plan = plan_math_expr_factoring(
 						value, blocks, owner_id, graph.incoming, graph
 					)
+					
 					if plan is None:
 						continue
+
 					if apply_plan(
 						plan,
 						blocks,
@@ -2844,6 +2994,7 @@ def factor_math_expressions(project, stats, opts):
 						break
 				if changed:
 					break
+			
 			if not changed:
 				break
 
