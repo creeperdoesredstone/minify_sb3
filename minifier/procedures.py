@@ -224,12 +224,12 @@ def repair_dangling_block_ref(value, blocks) -> tuple[list, bool]:
 		if len(value) > 2:
 			shadow = value[2]
 			if isinstance(shadow, str) and shadow not in blocks:
-				return [value[0], value[1]], True
+				return [INPUT_BLOCK_NO_SHADOW, value[1]], True
 			if isinstance(shadow, (list, dict)):
 				fixed, shadow_changed = repair_dangling_block_ref(shadow, blocks)
 
 				if fixed is None:
-					return [value[0], value[1]], True
+					return [INPUT_BLOCK_NO_SHADOW, value[1]], True
 
 				if shadow_changed:
 					value[2] = fixed
@@ -314,6 +314,7 @@ def repair_dangling_block_refs(
 				fixed += 1
 
 		inputs = block.get("inputs")
+
 		if not isinstance(inputs, dict):
 			continue
 

@@ -1462,20 +1462,27 @@ def _dangling_block_ids(target):
 	blocks = target.get("blocks", {})
 	ids = set(blocks)
 	dangling = set()
+
 	for block in blocks.values():
 		if not isinstance(block, dict):
 			continue
+
 		for key in ("next", "parent"):
 			v = block.get(key)
+
 			if isinstance(v, str) and v not in ids:
 				dangling.add(v)
+
 		for value in block.get("inputs", {}).values():
 			collect_dangling_in_input(value, ids, dangling)
+
 	for comment in target.get("comments", {}).values():
 		if isinstance(comment, dict):
 			bid = comment.get("blockId")
+
 			if isinstance(bid, str) and bid not in ids:
 				dangling.add(bid)
+				
 	return dangling
 
 
@@ -1574,7 +1581,7 @@ def relabel_blocks(project, *, copy_result=True):
 		if not isinstance(blocks, dict) or not blocks:
 			continue
 
-		for block in blocks.values():
+		for block_id, block in blocks.items():
 			if not isinstance(block, dict):
 				continue
 
@@ -1584,34 +1591,45 @@ def relabel_blocks(project, *, copy_result=True):
 					not isinstance(value, str) or isinstance(value, JsonNumber)
 				):
 					raise ValueError(
-						"verified block relabeling requires string or null next/parent links"
+						"block relabeling requires string or null next/parent links"
 					)
 
-			for desc in block.get("inputs", {}).values():
+			inputs = block.get("inputs", {})
+			if not isinstance(inputs, dict):
+				raise ValueError(
+					f"block relabeling requires an input mapping for block {block_id!r}"
+				)
+
+			for input_name, desc in inputs.items():
 				if (
 					not isinstance(desc, list)
 					or not desc
 					or _input_tag(desc[0]) is None
 				):
 					raise ValueError(
-						"verified block relabeling requires serialized SB3 input descriptors"
+						f"block relabeling found an invalid input descriptor "
+						f"for block {block_id!r}, input {input_name!r}"
 					)
 
-				for position in (
-					(1, 2) if _input_tag(desc[0]) == INPUT_DIFF_BLOCK_SHADOW else (1,)
-				):
-					if len(desc) <= position:
-						raise ValueError(
-							"verified block relabeling rejects truncated input descriptors"
-						)
+				tag = _input_tag(desc[0])
+				expected_length = 3 if tag == INPUT_DIFF_BLOCK_SHADOW else 2
+				if len(desc) != expected_length:
+					raise ValueError(
+						f"block relabeling found an input descriptor with "
+						f"{len(desc)} elements; expected {expected_length} "
+						f"for block {block_id!r}, input {input_name!r}"
+					)
 
+				for position in range(1, expected_length):
 					value = desc[position]
 					if value is not None and (
 						not isinstance(value, (str, list))
 						or isinstance(value, JsonNumber)
 					):
 						raise ValueError(
-							"verified block relabeling rejects numeric or opaque input references"
+							f"block relabeling found an invalid value at input "
+							f"position {position} for block {block_id!r}, "
+							f"input {input_name!r}"
 						)
 
 		for comment in target.get("comments", {}).values():
@@ -1621,18 +1639,21 @@ def relabel_blocks(project, *, copy_result=True):
 					not isinstance(value, str) or isinstance(value, JsonNumber)
 				):
 					raise ValueError(
-						"verified block relabeling requires string or null comment block IDs"
+						"block relabeling requires string or null comment block IDs"
 					)
 
 		ids = javascript_keys(blocks)
+
 		if any(key in blocks for key in ("__proto__", "constructor", "prototype")):
 			raise ValueError("cannot relabel prototype-sensitive block IDs")
 
 		frequencies = {bid: 1 for bid in ids}
 		slots = list(_block_slots(target))
 		reserved = set()
+
 		for container, key in slots:
 			value = container[key]
+
 			if value in frequencies:
 				frequencies[value] += 1
 			else:
@@ -1644,14 +1665,16 @@ def relabel_blocks(project, *, copy_result=True):
 
 		if any(len(quote(name).encode("utf-8")) - 2 > 3 for name in mapping.values()):
 			raise ValueError(
-				"block ID minimum certificate supports names of at most 3 payload bytes"
+				"block ID supports names of at most 3 payload bytes"
 			)
 
 		maps[ti] = mapping
+
 		for container, key in slots:
 			container[key] = mapping.get(container[key], container[key])
 
 		target["blocks"] = {mapping[bid]: blocks[bid] for bid in ids}
+
 		for bid in ids:
 			frequency = frequencies[bid]
 			cost["before"] += frequency * (

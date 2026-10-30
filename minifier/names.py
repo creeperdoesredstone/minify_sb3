@@ -365,6 +365,9 @@ def minify_blocks(project):
 			if not isinstance(block, dict):  # primitive [12, name, id, x, y]
 				continue
 
+			if block.get("shadow") is True and block.get("topLevel") is True:
+				block["topLevel"] = False
+
 			if block.get("topLevel") is False:
 				del block["topLevel"]
 				stats["topLevel"] += 1

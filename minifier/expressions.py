@@ -3907,10 +3907,12 @@ def plan_nested_if(blocks, outer_id, incoming_refs, graph, commented):
 	)
 	if body_closure is None:
 		return None
+	condition_a = outer_inputs.get("CONDITION")
+	if condition_a is None:
+		return None
 	condition_b = inner_inputs.get("CONDITION")
 	if not condition_is_pure(condition_b, blocks, graph):
 		return None
-	condition_a = outer_inputs.get("CONDITION")
 	outer_owned = get_exclusive_input_subtree(
 		condition_a, blocks, outer_id, incoming_refs, graph=graph
 	)
