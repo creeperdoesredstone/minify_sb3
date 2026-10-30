@@ -713,6 +713,48 @@ def _check_argument_id_consistency(target, where, opts=None):
 	return None
 
 
+def _describe_list_difference(lo, lm, limit=3):
+	"""Explain how a minified list entry differs from the original one."""
+	if not (isinstance(lo, list) and isinstance(lm, list)):
+		return f"entry changed from {type(lo).__name__} to {type(lm).__name__}"
+
+	parts = []
+
+	if lo[:1] != lm[:1]:
+		parts.append(
+			f"name changed from {lo[0] if lo else None!r} to {lm[0] if lm else None!r}"
+		)
+
+	items_o = lo[1] if len(lo) > 1 else None
+	items_m = lm[1] if len(lm) > 1 else None
+
+	if isinstance(items_o, list) and isinstance(items_m, list):
+		if len(items_o) != len(items_m):
+			parts.append(f"item count changed from {len(items_o)} to {len(items_m)}")
+
+		diffs = [
+			index
+			for index, (a, b) in enumerate(zip(items_o, items_m))
+			if a != b or type(a) is not type(b)
+		]
+
+		if diffs:
+			shown = ", ".join(
+				f"[{i}] {items_o[i]!r} ({type(items_o[i]).__name__}) -> "
+				f"{items_m[i]!r} ({type(items_m[i]).__name__})"
+				for i in diffs[:limit]
+			)
+			more = f" (+{len(diffs) - limit} more)" if len(diffs) > limit else ""
+			parts.append(f"{len(diffs)} item(s) differ: {shown}{more}")
+	elif items_o != items_m:
+		parts.append("items changed shape")
+
+	if lo[2:] != lm[2:]:
+		parts.append(f"extra fields changed from {lo[2:]!r} to {lm[2:]!r}")
+
+	return "; ".join(parts) or "entries differ"
+
+
 def _input_val_eq(vo, vm, opts):
 	if vo == vm:
 		return True
@@ -2523,7 +2565,7 @@ def verify(original_path, minified_path, opts):
 			for lid in target.get("lists", {}):
 				orig_list_owners[lid] = ti
 
-		approved = set(getattr(opts, "cleared_lists", ()) or ())
+		approved = set(getattr(opts, "cleared_lists", ()))
 		mini_var_refs, mini_list_refs, mini_bcast_refs = get_data_refs(
 			mini, var_owners=orig_var_owners, list_owners=orig_list_owners
 		)
@@ -2709,12 +2751,15 @@ def verify(original_path, minified_path, opts):
 
 			to_lists = to.get("lists", {})
 			tm_lists = tm.get("lists", {})
+
 			if set(tm_lists) - set(to_lists):
 				return (
 					False,
 					f"Target {ti} ({name!r}): unexpected new list ID(s) appeared in minified project: {sorted(set(tm_lists) - set(to_lists))}",
 				)
+			
 			missing_lists = set(to_lists) - set(tm_lists)
+
 			if missing_lists and not (
 				opts.remove_unused_lists or opts.prune_unused_data
 			):
@@ -2722,12 +2767,14 @@ def verify(original_path, minified_path, opts):
 					False,
 					f"Target {ti} ({name!r}): {len(missing_lists)} list(s) removed without --remove-unused-lists: {sorted(missing_lists)}",
 				)
+			
 			if missing_lists:
 				still_used = {
 					lid: mini_list_refs.get((ti, lid), [])
 					for lid in missing_lists
 					if (ti, lid) in mini_list_refs
 				}
+				
 				if still_used:
 					first_lid = next(iter(still_used))
 					first_name = (
@@ -2739,21 +2786,27 @@ def verify(original_path, minified_path, opts):
 						f"Target {ti} ({name!r}): list {first_name!r} (id: {first_lid!r}) was removed, "
 						f"but is still referenced in the minified project by: {', '.join(still_used[first_lid])}"
 					)
+				
 			for lid, lo in to_lists.items():
 				if lid not in tm_lists:
 					continue
+				
 				lm = tm_lists[lid]
+				
 				if lo == lm:
 					continue
+				
 				if getattr(
 					opts, "compact_data_literals", False
 				) and _compact_data_entry_equal(lo, lm):
 					continue
+				
 				allow_numeric_reencoding = (
 					opts.normalize_numbers
 					or getattr(opts, "optimize_json", False)
 					or getattr(opts, "minimum_json", False)
 				)
+				
 				if (
 					allow_numeric_reencoding
 					and isinstance(lo, list)
@@ -2773,16 +2826,33 @@ def verify(original_path, minified_path, opts):
 					)
 				):
 					continue
+				
 				if not (
 					(ti, lid) in approved
 					and isinstance(lm, list)
 					and len(lm) == 2
 					and lm[0] == lo[0]
 					and lm[1] == []
+					and len(lo[1]) == len(lm[1])
 				):
+					emptied = (
+						isinstance(lm, list)
+						and len(lm) > 1
+						and lm[1] == []
+						and isinstance(lo, list)
+						and len(lo) > 1
+						and lo[1] != []
+					)
+					reason = (
+						"was emptied but not approved for clearing"
+						if emptied
+						else "was modified unexpectedly: "
+						+ _describe_list_difference(lo, lm)
+					)
 					return (
 						False,
-						f"Target {ti} ({name!r}): list {lo[0]!r} (id: {lid!r}) changed from {len(lo[1]) if isinstance(lo, list) and len(lo)>1 and isinstance(lo[1], list) else 'N/A'} items to {len(lm[1]) if isinstance(lm, list) and len(lm)>1 and isinstance(lm[1], list) else 'N/A'} items but was not approved for clearing",
+						f"Target {ti} ({name!r}): list {lo[0] if isinstance(lo, list) and lo else lid!r} "
+						f"(id: {lid!r}) {reason}",
 					)
 
 			new_block_sets = (

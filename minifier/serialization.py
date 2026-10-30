@@ -18,7 +18,7 @@ import uuid
 import zipfile
 import zlib
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import Generator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
@@ -114,6 +114,7 @@ def _number_components(token: str) -> tuple[bool, str, int]:
 	)
 
 
+@lru_cache(maxsize=262144)
 def get_shortest_num_repr(token) -> str:
 	sign, coefficient, exponent = _number_components(token)
 	prefix = "-" if sign else ""
@@ -155,7 +156,13 @@ def get_shortest_num_repr(token) -> str:
 	return prefix + mantissa + (f"e{power}" if power else "")
 
 
+_encode_basestring = json.encoder.encode_basestring
+
+
 def quote(value) -> str:
+	if isinstance(value, str):
+		return _encode_basestring(value)
+
 	return json.dumps(value, ensure_ascii=False)
 
 
@@ -896,6 +903,9 @@ def minimum_json_size(
 
 	@lru_cache(maxsize=65536)
 	def string_size(value) -> int:
+		if value.isascii() and value.isprintable() and '"' not in value and "\\" not in value:
+			return 2 + len(value)
+
 		return 2 + sum(
 			(
 				2
@@ -1036,6 +1046,47 @@ def zopfli_deflate(data, compress, iterations=15, *, parallel=False):
 	return min(candidates, key=len)
 
 
+def _ordered_parallel(items, work, workers=None):
+	if workers is None:
+		workers = min(4, os.cpu_count() or 1)
+
+	if workers <= 1:
+		for item in items:
+			yield item, work(item)
+		return
+
+	pending = deque()
+
+	with ThreadPoolExecutor(max_workers=workers) as pool:
+		for item in items:
+			pending.append((item, pool.submit(work, item)))
+
+			if len(pending) > workers:
+				done, future = pending.popleft()
+				yield done, future.result()
+
+		while pending:
+			done, future = pending.popleft()
+			yield done, future.result()
+
+
+def _layout_candidates(parts, shapes, orders, max_length, seen):
+	for order_index, order in enumerate((None, *orders)):
+		candidate = _render_layout(parts, order, shapes)
+		fingerprint = hashlib.sha256(candidate).digest()
+
+		if fingerprint in seen or len(candidate) > max_length:
+			continue
+
+		seen.add(fingerprint)
+		yield order_index, candidate
+
+
+def _target_order_items(parts, shapes, orders):
+	for order in (None, *orders):
+		yield order, _render_layout(parts, order, shapes)
+
+
 def optimize_project_json(
 	project,
 	level=9,
@@ -1095,6 +1146,7 @@ def optimize_project_json(
 	
 	best_raw = dumps_exact(search_project, True) if minimum_json else baseline
 	best_compressed = deflate(best_raw, level)
+	baseline_compressed = best_compressed if best_raw is baseline else None
 	rank = (
 		(lambda encoded, raw: (len(raw), len(encoded)))
 		if minimum_json
@@ -1136,14 +1188,11 @@ def optimize_project_json(
 			continue
 		parts, shapes = _layout_parts(search_project, short_numbers), {}
 
-		for order_index, order in enumerate((None, *orders)):
-			candidate = _render_layout(parts, order, shapes)
-			fingerprint = hashlib.sha256(candidate).digest()
-			if fingerprint in seen or len(candidate) > len(baseline):
-				continue
-			seen.add(fingerprint)
-
-			for compressor, compressed in _compressions(candidate, level, False):
+		for (order_index, candidate), results in _ordered_parallel(
+			_layout_candidates(parts, shapes, orders, len(baseline), seen),
+			lambda item: list(_compressions(item[1], level, False)),
+		):
+			for compressor, compressed in results:
 				trials += 1
 				remember(candidate, compressed)
 				if rank(compressed, candidate) < rank(best_compressed, best_raw):
@@ -1157,10 +1206,16 @@ def optimize_project_json(
 		for target in search_project["targets"]:
 			parts, shapes = _layout_parts(target, path=("targets", 0)), {}
 			chosen_order = None
-			chosen_size = len(deflate(_render_layout(parts, shapes=shapes), level))
+			chosen_size = None
 
-			for order in orders:
-				size = len(deflate(_render_layout(parts, order, shapes), level))
+			for (order, _), size in _ordered_parallel(
+				_target_order_items(parts, shapes, orders),
+				lambda item: len(deflate(item[1], level)),
+			):
+				if chosen_size is None:  # the default order is rendered first
+					chosen_size = size
+					continue
+
 				trials += 1
 				if size < chosen_size:
 					chosen_order, chosen_size = order, size
@@ -1251,9 +1306,19 @@ def optimize_project_json(
 					best_raw, best_compressed = candidate, compressed
 					best_label = f"window-{round_index + 1}/{compressor}"
 
-	for compressor, compressed in (
-		*_compressions(best_raw, level),
-		("zlib-mem5", deflate(best_raw, level, 5)),
+	trials += 1
+	final_variants = (
+		(
+			("zlib-mem9", 9, zlib.Z_DEFAULT_STRATEGY),
+			("zlib-filtered", 8, zlib.Z_FILTERED),
+		)
+		if level
+		else ()
+	) + (("zlib-mem5", 5, zlib.Z_DEFAULT_STRATEGY),)
+
+	for (compressor, _, _), compressed in _ordered_parallel(
+		final_variants,
+		lambda variant: deflate(best_raw, level, variant[1], variant[2]),
 	):
 		trials += 1
 
@@ -1333,7 +1398,11 @@ def optimize_project_json(
 		{
 			"json_encoding_trials": trials,
 			"json_encoding_bytes_saved": len(baseline) - len(best_raw),
-			"json_deflate_bytes_saved": len(deflate(baseline, level))
+			"json_deflate_bytes_saved": len(
+				baseline_compressed
+				if baseline_compressed is not None
+				else deflate(baseline, level)
+			)
 			- len(best_compressed),
 			"json_encoding": best_label,
 			"zopfli_available": zopfli is not None,

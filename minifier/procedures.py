@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .constants import *
+from .names import _procedure_name_map
 
 import copy
 import hashlib
@@ -420,6 +421,21 @@ def remove_unreachable_blocks(project, stats, stat_key="unreachable_blocks_remov
 
 def _new_id():
 	return str(uuid.uuid4()).replace("-", "")[:20]
+
+
+def copy_json(value):
+	cls = value.__class__
+
+	if cls is dict:
+		return {k: copy_json(v) for k, v in value.items()}
+
+	if cls is list:
+		return [copy_json(v) for v in value]
+
+	if cls is str or cls is int or cls is float or cls is bool or value is None:
+		return value
+
+	return copy.deepcopy(value)
 
 
 def procedure_key(block):
@@ -1477,7 +1493,7 @@ def _estimate_group_savings(
 def _sequence_projected_json_size(
 	target, *, rename_block_ids=False, rename_argument_ids=False
 ):
-	projected = copy.deepcopy(target)
+	projected = copy_json(target)
 	dummy_stats = defaultdict(int)
 
 	if rename_argument_ids:
@@ -1489,6 +1505,11 @@ def _sequence_projected_json_size(
 		rename_block_ids_fn(projected, dummy_stats)
 
 	return _json_len(projected)
+
+
+def _sequence_entry_cost(bid, block):
+	"""Bytes one `"id":{...}` entry adds to the serialized blocks dict (no comma)."""
+	return len(quote(bid).encode("utf-8", "backslashreplace")) + 1 + _json_len(block)
 
 
 def group_similar_sequences(project, stats, threshold=3, opts=None):
@@ -1544,6 +1565,8 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			and block.get("opcode") in ("procedures_prototype", "procedures_call")
 			and isinstance(procedure_key(block), str)
 		}
+
+		projected_old_bytes = None  # projected size of `target`; valid until a commit
 
 		for _, candidate_sequences in scored_candidates:
 			sequences = [
@@ -1738,6 +1761,10 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 				seq[0]: _sequence_new_id(blocks, generated) for seq in sequences
 			}
 
+			seqs_by_last = defaultdict(list)
+			for other_seq in sequences:
+				seqs_by_last[other_seq[-1]].append(other_seq)
+
 			for seq in sequences:
 				root = seq[0]
 				root_block = blocks[root]
@@ -1781,8 +1808,8 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 					else continuation_id if isinstance(continuation_id, str) else None
 				)
 				internal_parent = None
-				for previous_seq in sequences:
-					if previous_seq[-1] == root and previous_seq is not seq:
+				for previous_seq in seqs_by_last.get(root, ()):
+					if previous_seq is not seq:
 						internal_parent = call_ids[previous_seq[0]]
 						break
 				call_parent = (
@@ -1884,38 +1911,52 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 			for seq in sequences:
 				removed.update(closures[tuple(seq)])
 
-			candidate_blocks = dict(blocks)
-			for owner_id, preview in owner_previews.items():
-				candidate_blocks[owner_id] = preview
-
-			for new_id, block in generated.items():
-				candidate_blocks[new_id] = block
-
-			for old_id in removed:
-				candidate_blocks.pop(old_id, None)
-
-			candidate_target = copy.copy(target)
-			candidate_target["blocks"] = candidate_blocks
-
 			if opts is not None and (
 				getattr(opts, "rename_block_ids", False)
 				or getattr(opts, "rename_argument_ids", False)
 			):
-				old_target_bytes = _sequence_projected_json_size(
-					target,
-					rename_block_ids=getattr(opts, "rename_block_ids", False),
-					rename_argument_ids=getattr(opts, "rename_argument_ids", False),
-				)
+				# renaming is global, so the projected size can't be computed per block
+				candidate_blocks = dict(blocks)
+				candidate_blocks.update(owner_previews)
+				candidate_blocks.update(generated)
+
+				for old_id in removed:
+					candidate_blocks.pop(old_id, None)
+
+				candidate_target = copy.copy(target)
+				candidate_target["blocks"] = candidate_blocks
+
+				if projected_old_bytes is None:
+					projected_old_bytes = _sequence_projected_json_size(
+						target,
+						rename_block_ids=getattr(opts, "rename_block_ids", False),
+						rename_argument_ids=getattr(opts, "rename_argument_ids", False),
+					)
+				old_target_bytes = projected_old_bytes
 				new_target_bytes = _sequence_projected_json_size(
 					candidate_target,
 					rename_block_ids=getattr(opts, "rename_block_ids", False),
 					rename_argument_ids=getattr(opts, "rename_argument_ids", False),
 				)
+				byte_delta = old_target_bytes - new_target_bytes
 			else:
-				old_target_bytes = _json_len(target)
-				new_target_bytes = _json_len(candidate_target)
+				# only these entries differ, so price just them (+1 byte per comma)
+				old_cost = new_cost = old_count = new_count = 0
 
-			byte_delta = old_target_bytes - new_target_bytes
+				for bid in set(owner_previews) | set(generated) | removed:
+					if bid in blocks:
+						old_cost += _sequence_entry_cost(bid, blocks[bid])
+						old_count += 1
+
+					if bid in removed:
+						continue
+
+					new_block = generated.get(bid, owner_previews.get(bid))
+					if new_block is not None:
+						new_cost += _sequence_entry_cost(bid, new_block)
+						new_count += 1
+
+				byte_delta = (old_cost - new_cost) + (old_count - new_count)
 
 			if byte_delta <= 0:
 				if opts is not None:
@@ -1931,6 +1972,8 @@ def group_similar_sequences(project, stats, threshold=3, opts=None):
 
 			for old_id in removed:
 				blocks.pop(old_id, None)
+
+			projected_old_bytes = None
 
 			if opts is not None:
 				while len(opts.grouped_sequence_removed_blocks) <= ti:
@@ -2398,6 +2441,7 @@ def _clone_procedure_closure(
 	constant_replacements,
 	stats,
 	opts,
+	graph=None,
 ):
 	blocks = target.get("blocks") or {}
 	closure = set(info["closure"])
@@ -2405,7 +2449,9 @@ def _clone_procedure_closure(
 	if not closure:
 		return None
 
-	graph = ProjectGraph(target)
+	if graph is None:
+		graph = ProjectGraph(target)
+
 	comments = target.get("comments") or {}
 
 	if any(
@@ -2448,7 +2494,7 @@ def _clone_procedure_closure(
 
 	for old_id in old_ids:
 		old = blocks.get(old_id)
-		new = copy.deepcopy(old)
+		new = copy_json(old)
 
 		if isinstance(new.get("next"), str):
 			new["next"] = new_ids.get(new["next"], new["next"])
@@ -2499,6 +2545,25 @@ def _clone_procedure_closure(
 		return None
 
 	removed_reporters = set()
+	all_target_reporters = set()
+
+	for arg_index in constant_replacements:
+		for rid in reporter_map.get(arg_index, ()):
+			if rid in new_ids:
+				all_target_reporters.add(new_ids[rid])
+
+	referrers = {}
+
+	if all_target_reporters:
+		for block_id, block in clones.items():
+			if not isinstance(block, dict):
+				continue
+
+			for raw in (block.get("inputs") or {}).values():
+				for ref in iter_input_block_refs(raw):
+					if ref in all_target_reporters:
+						referrers.setdefault(ref, set()).add(block_id)
+
 	for arg_index, replacement in constant_replacements.items():
 		reporter_ids = set(reporter_map.get(arg_index, ()))
 
@@ -2510,7 +2575,12 @@ def _clone_procedure_closure(
 		if not cloned_reporters:
 			continue
 
-		for block_id in list(clones):
+		owners = set()
+
+		for rid in cloned_reporters:
+			owners.update(referrers.get(rid, ()))
+
+		for block_id in owners:
 			if block_id in cloned_reporters:
 				continue
 
@@ -2520,16 +2590,24 @@ def _clone_procedure_closure(
 				continue
 
 			for name, raw in list((block.get("inputs") or {}).items()):
-				new_raw = copy.deepcopy(raw)
+				if not any(
+					ref in cloned_reporters for ref in iter_input_block_refs(raw)
+				):
+					continue
+
+				# in-place inlining is safe here
 				new_raw, changed = _inline_argument_reporter_refs(
-					new_raw, cloned_reporters, replacement
+					raw, cloned_reporters, replacement
 				)
 
 				if changed:
 					block.setdefault("inputs", {})[name] = new_raw
 
 		still_referenced = False
-		for block_id, block in clones.items():
+
+		for block_id in owners:
+			block = clones.get(block_id)
+
 			if not isinstance(block, dict):
 				continue
 
@@ -2566,16 +2644,725 @@ def _clone_procedure_closure(
 	return clones, new_ids, new_definition_id, new_prototype_id, len(removed_reporters)
 
 
-def specialized_proc_trial_size(target, variants, opts):
-	probe = copy.deepcopy(target)
+class RemovalTrial:
+	def __init__(self, target, opts):
+		self.ok = False
+		self.base_value = None
+		blocks = target.get("blocks") or {}
+
+		if not blocks:
+			return
+
+		self.sort_keys = getattr(opts, "sort_keys", False)
+		self.rename = bool(getattr(opts, "rename_procedure_names", False))
+		self.blocks = blocks
+		self.str_sizes = {}
+
+		for block in blocks.values():
+			if not isinstance(block, dict):
+				return
+
+		comments = target.get("comments") or {}
+		self.commented = set()
+
+		for comment in comments.values():
+			if isinstance(comment, dict) and comment.get("blockId") is not None:
+				if comment["blockId"] not in blocks:
+					return
+
+				self.commented.add(comment["blockId"])
+
+		probe = {"blocks": copy_json(blocks)}
+
+		if repair_dangling_block_refs(probe):
+			return
+
+		graph = ProjectGraph(target)
+		self.graph = graph
+		self.parent_children = {}
+
+		for bid, block in blocks.items():
+			parent = block.get("parent")
+
+			if isinstance(parent, str):
+				self.parent_children.setdefault(parent, []).append(bid)
+
+		self.defs = {}
+		self.defs_by_proc = {}
+		owned = set()
+
+		for bid, block in blocks.items():
+			if block.get("opcode") != "procedures_definition":
+				continue
+
+			custom = block.get("inputs", {}).get("custom_block", [None, None])
+			proto_id = (
+				custom[1] if len(custom) > 1 and isinstance(custom[1], str) else None
+			)
+			proto = blocks.get(proto_id)
+			proc = procedure_key(proto) if isinstance(proto, dict) else None
+
+			if proc is None:
+				continue
+
+			todo, seen = [bid], set()
+
+			while todo:
+				x = todo.pop()
+
+				if x in seen or x not in blocks:
+					continue
+
+				seen.add(x)
+				todo.extend(graph.edges.get(x, ()))
+
+			key = (proc, bid)
+			self.defs[key] = seen
+			self.defs_by_proc.setdefault(proc, []).append(key)
+			owned.update(seen)
+
+		if not self.defs:
+			return
+
+		self.owned = owned
+		self.block_size = {}
+		self.entries = {}
+		self.call_proc = {}
+		self.top_calls = Counter()
+		self.call_owners = {}
+		self.freq = Counter()
+		total = 0
+
+		for bid, block in blocks.items():
+			size = self._str_size(bid) + 1 + len(
+				dumps_compact(block, self.sort_keys).encode("utf-8", "backslashreplace")
+			)
+			self.block_size[bid] = size
+			total += size
+			opcode = block.get("opcode")
+
+			if opcode in _PROCCODE_BLOCK_OPCODES:
+				mutation = block.get("mutation")
+
+				if isinstance(mutation, dict):
+					proccode = mutation.get("proccode")
+
+					if isinstance(proccode, str) and proccode:
+						self.entries[bid] = proccode
+						self.freq[proccode] += 1
+
+			if opcode == "procedures_call":
+				proc = procedure_key(block)
+
+				if proc is not None:
+					self.call_proc[bid] = proc
+
+					if bid not in owned:
+						self.top_calls[proc] += 1
+
+		self.total_size = total
+		self.def_callees = {}
+
+		for key, closure in self.defs.items():
+			callees = Counter()
+
+			for bid in closure:
+				proc = self.call_proc.get(bid)
+
+				if proc is not None:
+					callees[proc] += 1
+					self.call_owners.setdefault(bid, []).append(key)
+
+			self.def_callees[key] = callees
+
+		self.ok = True
+		self.base_value = self.value(())
+
+		if self.base_value is None:
+			self.ok = False
+
+	def _str_size(self, text):
+		size = self.str_sizes.get(text)
+
+		if size is None:
+			size = len(
+				dumps_compact(text, self.sort_keys).encode("utf-8", "backslashreplace")
+			)
+			self.str_sizes[text] = size
+
+		return size
+
+	def _clone_info(self, variant):
+		info = variant.get("_removal_clone_info")
+
+		if info is not None:
+			return info
+
+		clones = variant["clones"]
+		sizes = {}
+		entries = {}
+		callees = Counter()
+		call_procs = {}
+		definition_id = None
+		proc = None
+
+		for bid, block in clones.items():
+			if not isinstance(block, dict) or bid in self.blocks:
+				return None
+
+			sizes[bid] = self._str_size(bid) + 1 + len(
+				dumps_compact(block, self.sort_keys).encode("utf-8", "backslashreplace")
+			)
+			opcode = block.get("opcode")
+
+			if opcode == "procedures_definition":
+				if definition_id is not None:
+					return None
+
+				definition_id = bid
+
+			if opcode in _PROCCODE_BLOCK_OPCODES:
+				mutation = block.get("mutation")
+
+				if isinstance(mutation, dict):
+					proccode = mutation.get("proccode")
+
+					if isinstance(proccode, str) and proccode:
+						entries[bid] = proccode
+
+			if opcode == "procedures_call":
+				called = procedure_key(block)
+
+				if called is not None:
+					callees[called] += 1
+					call_procs[bid] = called
+
+		if definition_id is None:
+			return None
+
+		custom = clones[definition_id].get("inputs", {}).get("custom_block", [None, None])
+		proto_id = custom[1] if len(custom) > 1 and isinstance(custom[1], str) else None
+		proto = clones.get(proto_id)
+		proc = procedure_key(proto) if isinstance(proto, dict) else None
+
+		if proc is None:
+			return None
+
+		seen = set()
+		todo = [definition_id]
+
+		while todo:
+			x = todo.pop()
+
+			if x in seen or x not in clones:
+				continue
+
+			seen.add(x)
+			block = clones[x]
+			nxt = block.get("next")
+
+			if isinstance(nxt, str) and nxt in clones:
+				todo.append(nxt)
+
+			for raw in (block.get("inputs") or {}).values():
+				for ref in iter_input_block_refs(raw):
+					if ref in clones:
+						todo.append(ref)
+
+		if len(seen) != len(clones):
+			return None
+
+		info = (proc, definition_id, sizes, entries, callees, call_procs)
+		variant["_removal_clone_info"] = info
+		return info
+
+	def apply(self, variant):
+		if not self.ok:
+			return False
+
+		info = self._clone_info(variant)
+
+		if info is None:
+			self.ok = False
+			return False
+
+		proc, definition_id, sizes, entries, callees, call_procs = info
+		blocks = self.blocks
+		spec = variant["specialized_proc"]
+
+		for call_id, _call, _constants in variant["members"]:
+			if call_id not in self.call_proc:
+				if call_id in blocks:
+					self.ok = False
+					return False
+
+				continue
+
+			mutation = blocks[call_id].get("mutation")
+
+			if not isinstance(mutation, dict) or "proccode" not in mutation:
+				self.ok = False
+				return False
+
+			old_proc = self.call_proc[call_id]
+			old_code = mutation["proccode"]
+			delta = self._str_size(spec) - self._str_size(old_code)
+			self.block_size[call_id] += delta
+			self.total_size += delta
+			self.call_proc[call_id] = spec
+
+			if call_id in self.owned:
+				for key in self.call_owners.get(call_id, ()):
+					counts = self.def_callees[key]
+					counts[old_proc] -= 1
+
+					if counts[old_proc] <= 0:
+						del counts[old_proc]
+
+					counts[spec] += 1
+			else:
+				self.top_calls[old_proc] -= 1
+
+				if self.top_calls[old_proc] <= 0:
+					del self.top_calls[old_proc]
+
+				self.top_calls[spec] += 1
+
+			if call_id in self.entries:
+				self.freq[self.entries[call_id]] -= 1
+
+				if self.freq[self.entries[call_id]] <= 0:
+					del self.freq[self.entries[call_id]]
+
+				self.entries[call_id] = spec
+				self.freq[spec] += 1
+
+		key = (proc, definition_id)
+		closure = set(sizes)
+		self.defs[key] = closure
+		self.defs_by_proc.setdefault(proc, []).append(key)
+		self.owned |= closure
+		self.def_callees[key] = Counter(callees)
+
+		for bid, size in sizes.items():
+			self.block_size[bid] = size
+			self.total_size += size
+
+		for bid, called in call_procs.items():
+			self.call_proc[bid] = called
+			self.call_owners[bid] = [key]
+
+		for bid, proccode in entries.items():
+			self.entries[bid] = proccode
+			self.freq[proccode] += 1
+
+		for bid in sizes:
+			block = variant["clones"][bid]
+			parent = block.get("parent")
+
+			if isinstance(parent, str):
+				self.parent_children.setdefault(parent, []).append(bid)
+
+			nxt = block.get("next")
+
+			if isinstance(nxt, str) and nxt in closure:
+				self.graph.parents.setdefault(nxt, set()).add(bid)
+
+			for raw in (block.get("inputs") or {}).values():
+				for ref in set(iter_input_block_refs(raw)):
+					if ref in closure:
+						self.graph.parents.setdefault(ref, set()).add(bid)
+
+		self.base_value = self.value(())
+
+		if self.base_value is None:
+			self.ok = False
+
+		return self.ok
+
+	def value(self, variants):
+		blocks = self.blocks
+		moved = {}
+		clone_defs = []
+
+		for variant in variants:
+			info = self._clone_info(variant)
+
+			if info is None:
+				return None
+
+			clone_defs.append((variant, info))
+
+			for call_id, _call, _constants in variant["members"]:
+				if call_id in self.call_proc:
+					moved[call_id] = variant["specialized_proc"]
+				elif call_id in blocks:
+					return None
+
+		adj_top = Counter()
+		adj_callee = {}
+
+		for call_id, new_proc in moved.items():
+			old_proc = self.call_proc[call_id]
+			mutation = blocks[call_id].get("mutation")
+
+			if not isinstance(mutation, dict) or "proccode" not in mutation:
+				return None
+
+			if call_id in self.owned:
+				for key in self.call_owners.get(call_id, ()):
+					delta = adj_callee.setdefault(key, Counter())
+					delta[old_proc] -= 1
+					delta[new_proc] += 1
+			else:
+				adj_top[old_proc] -= 1
+				adj_top[new_proc] += 1
+
+		defs_by_proc = {proc: list(keys) for proc, keys in self.defs_by_proc.items()}
+		clone_by_key = {}
+
+		for variant, (proc, definition_id, _s, _e, callees, _cp) in clone_defs:
+			key = (proc, definition_id)
+			defs_by_proc.setdefault(proc, []).append(key)
+			clone_by_key[key] = (variant, callees)
+
+		live = set()
+		queue = [
+			proc
+			for proc in set(self.top_calls) | set(adj_top)
+			if self.top_calls.get(proc, 0) + adj_top.get(proc, 0) > 0
+		]
+
+		while queue:
+			proc = queue.pop()
+
+			if proc in live:
+				continue
+
+			live.add(proc)
+
+			for key in defs_by_proc.get(proc, ()):
+				if key in clone_by_key:
+					counts = clone_by_key[key][1]
+					extra = None
+				else:
+					counts = self.def_callees[key]
+					extra = adj_callee.get(key)
+
+				for callee, count in counts.items():
+					if extra is not None:
+						count += extra.get(callee, 0)
+
+					if count > 0 and callee not in live:
+						queue.append(callee)
+
+				if extra is not None:
+					for callee, count in extra.items():
+						if (
+							callee not in counts
+							and count > 0
+							and callee not in live
+						):
+							queue.append(callee)
+
+		dead_base = set()
+		dead_clone = set()
+
+		for proc, keys in defs_by_proc.items():
+			if proc in live:
+				continue
+
+			for key in keys:
+				if key in clone_by_key:
+					dead_clone.add(key)
+				else:
+					dead_base.add(key)
+
+		deleted = set()
+
+		for key in dead_base:
+			deleted.update(self.defs[key])
+
+		if deleted:
+			if not deleted.isdisjoint(self.commented):
+				return None
+
+			for bid in deleted:
+				parents = self.graph.parents.get(bid)
+
+				if parents and not parents <= deleted:
+					return None
+
+				children = self.parent_children.get(bid)
+
+				if children and not deleted.issuperset(children):
+					return None
+
+		items = self.total_size
+		count_blocks = len(self.block_size)
+
+		for bid in deleted:
+			items -= self.block_size[bid]
+
+		count_blocks -= len(deleted)
+		freq_delta = Counter()
+
+		for bid in deleted:
+			proccode = self.entries.get(bid)
+
+			if proccode is not None:
+				freq_delta[proccode] -= 1
+
+		for call_id, new_proc in moved.items():
+			if call_id in deleted:
+				continue
+
+			old_proc = self.call_proc[call_id]
+			old_code = blocks[call_id]["mutation"]["proccode"]
+			items += self._str_size(new_proc) - self._str_size(old_code)
+
+			if call_id in self.entries:
+				freq_delta[self.entries[call_id]] -= 1
+				freq_delta[new_proc] += 1
+
+		for variant, (proc, definition_id, sizes, entries, _c, _cp) in clone_defs:
+			if (proc, definition_id) in dead_clone:
+				continue
+
+			items += sum(sizes.values())
+			count_blocks += len(sizes)
+
+			for proccode in entries.values():
+				freq_delta[proccode] += 1
+
+		if count_blocks <= 0:
+			return None
+
+		value = items + count_blocks
+
+		if self.rename:
+			frequencies = Counter()
+
+			for proccode, count in self.freq.items():
+				count += freq_delta.get(proccode, 0)
+
+				if count > 0:
+					frequencies[proccode] = count
+
+			for proccode, count in freq_delta.items():
+				if proccode not in self.freq and count > 0:
+					frequencies[proccode] = count
+
+			renamed = _procedure_name_map(frequencies)
+
+			for proccode, count in frequencies.items():
+				new_proccode = renamed[proccode]
+
+				if new_proccode != proccode:
+					value += count * (
+						self._str_size(new_proccode) - self._str_size(proccode)
+					)
+
+		return value
+
+
+def specialized_proc_trial_size(
+	target, variants, opts, baseline_size=None, cache=None
+):
+	if (
+		baseline_size is not None
+		and not getattr(opts, "remove_unused_procedures", False)
+	):
+		blocks = target.get("blocks") or {}
+		candidate_clones = {}
+		call_proccodes = {}
+
+		for variant in variants:
+			candidate_clones.update(variant["clones"])
+
+			for call_id, _call, _replacement_constants in variant["members"]:
+				call_proccodes[call_id] = variant["specialized_proc"]
+
+		sort_keys = getattr(opts, "sort_keys", False)
+		delta = 0
+		added_blocks = 0
+		str_sizes = cache.setdefault("str_sizes", {}) if cache is not None else {}
+
+		def str_size(text):
+			size = str_sizes.get(text)
+
+			if size is None:
+				size = len(
+					dumps_compact(text, sort_keys).encode("utf-8", "backslashreplace")
+				)
+				str_sizes[text] = size
+
+			return size
+
+		for block_id, block in candidate_clones.items():
+			serialized_block = dumps_compact(block, sort_keys).encode(
+				"utf-8", "backslashreplace"
+			)
+
+			if block_id in blocks:
+				original = dumps_compact(blocks[block_id], sort_keys).encode(
+					"utf-8", "backslashreplace"
+				)
+				delta += len(serialized_block) - len(original)
+			else:
+				delta += str_size(block_id) + 1 + len(serialized_block)
+				added_blocks += 1
+
+		if added_blocks:
+			delta += added_blocks if blocks else added_blocks - 1
+
+		for call_id, proccode in call_proccodes.items():
+			call = blocks.get(call_id)
+			mutation = call.get("mutation") if isinstance(call, dict) else None
+
+			if not isinstance(mutation, dict):
+				continue
+
+			new_len = str_size(proccode)
+
+			if "proccode" in mutation:
+				old_proccode = mutation["proccode"]
+				old_len = (
+					str_size(old_proccode)
+					if isinstance(old_proccode, str)
+					else len(
+						dumps_compact(old_proccode, sort_keys).encode(
+							"utf-8", "backslashreplace"
+						)
+					)
+				)
+				delta += new_len - old_len
+			else:
+				delta += str_size("proccode") + 1 + new_len
+				if mutation:
+					delta += 1
+
+		if getattr(opts, "rename_procedure_names", False):
+			entries = None
+			baseline_rename_delta = None
+
+			if cache is not None:
+				entries = cache.get("proccode_entries")
+
+				if entries is None:
+					entries = _procedure_proccode_entries(blocks)
+					cache["proccode_entries"] = entries
+
+				baseline_rename_delta = cache.get("rename_baseline")
+
+			if baseline_rename_delta is None:
+				baseline_rename_delta = _specialized_procedure_rename_delta(
+					blocks, {}, {}, sort_keys, entries
+				)
+
+				if cache is not None:
+					cache["rename_baseline"] = baseline_rename_delta
+
+			candidate_rename_delta = _specialized_procedure_rename_delta(
+				blocks, candidate_clones, call_proccodes, sort_keys, entries
+			)
+			delta += candidate_rename_delta - baseline_rename_delta
+
+		return baseline_size + delta
+
+	if (
+		baseline_size is None
+		and not getattr(opts, "remove_unused_procedures", False)
+	):
+		probe = dict(target)
+		probe["blocks"] = target.get("blocks") or {}
+		serialized_size = len(
+			dumps_compact(probe, getattr(opts, "sort_keys", False)).encode(
+				"utf-8", "backslashreplace"
+			)
+		)
+
+		if getattr(opts, "rename_procedure_names", False):
+			serialized_size += _specialized_procedure_rename_delta(
+				target.get("blocks") or {},
+				{},
+				{},
+				getattr(opts, "sort_keys", False),
+			)
+
+		if not variants:
+			return serialized_size
+
+		return specialized_proc_trial_size(
+			target, variants, opts, serialized_size, cache
+		)
+
+	if cache is not None and getattr(opts, "remove_unused_procedures", False):
+		model = _removal_model(cache, target, opts)
+
+		if model is not None:
+			if not variants:
+				base_abs = _full_trial_size(target, (), opts)
+				cache["removal_base_abs"] = base_abs
+				return base_abs
+
+			base_abs = baseline_size
+
+			if base_abs is None:
+				base_abs = cache.get("removal_base_abs")
+
+			if base_abs is None:
+				base_abs = _full_trial_size(target, (), opts)
+				cache["removal_base_abs"] = base_abs
+
+			value = model.value(variants)
+
+			if value is not None:
+				return base_abs + value - model.base_value
+
+	return _full_trial_size(target, variants, opts)
+
+
+def _accept_into_trial_cache(cache, variant):
+	model = cache.get("removal_model")
+
+	if model is not None and model is not False:
+		if not model.apply(variant):
+			cache["removal_model"] = False
+
+	for key in ("proccode_entries", "rename_baseline", "removal_base_abs"):
+		cache.pop(key, None)
+
+
+def _removal_model(cache, target, opts):
+	model = cache.get("removal_model", False)
+
+	if model is False:
+		try:
+			model = RemovalTrial(target, opts)
+		except (AttributeError, TypeError, KeyError, IndexError, ValueError):
+			model = None
+
+		if model is not None and not model.ok:
+			model = None
+
+		cache["removal_model"] = model
+
+	return model
+
+
+def _full_trial_size(target, variants, opts):
+	probe = copy_json(target)
 	blocks = probe.get("blocks") or {}
 	probe["blocks"] = blocks
 
 	for variant in variants:
-		blocks.update(copy.deepcopy(variant["clones"]))
+		blocks.update(copy_json(variant["clones"]))
+
 		for call_id, _call, _replacement_constants in variant["members"]:
 			call = blocks.get(call_id)
 			mutation = call.get("mutation") if isinstance(call, dict) else None
+
 			if isinstance(mutation, dict):
 				mutation["proccode"] = variant["specialized_proc"]
 
@@ -2598,6 +3385,123 @@ def specialized_proc_trial_size(target, variants, opts):
 	return len(serialized.encode("utf-8", "backslashreplace"))
 
 
+_PROCCODE_BLOCK_OPCODES = ("procedures_prototype", "procedures_call")
+
+
+def _procedure_proccode_entries(blocks):
+	entries = []
+
+	for block_id, block in blocks.items():
+		if not isinstance(block, dict):
+			continue
+
+		opcode = block.get("opcode")
+
+		if opcode not in _PROCCODE_BLOCK_OPCODES:
+			continue
+
+		mutation = block.get("mutation")
+
+		if not isinstance(mutation, dict):
+			continue
+
+		entries.append((block_id, opcode, mutation.get("proccode")))
+
+	return entries
+
+
+def _specialized_procedure_rename_delta(
+	blocks, candidate_clones, call_proccodes, sort_keys, entries=None
+):
+	if entries is not None:
+		frequencies = Counter()
+
+		for block_id, opcode, proccode in entries:
+			if block_id in candidate_clones:
+				continue
+
+			if opcode == "procedures_call" and block_id in call_proccodes:
+				proccode = call_proccodes[block_id]
+
+			if isinstance(proccode, str) and proccode:
+				frequencies[proccode] += 1
+
+		for block_id, block in candidate_clones.items():
+			if (
+				not isinstance(block, dict)
+				or block.get("opcode") not in _PROCCODE_BLOCK_OPCODES
+			):
+				continue
+
+			mutation = block.get("mutation")
+
+			if not isinstance(mutation, dict):
+				continue
+
+			proccode = mutation.get("proccode")
+
+			if block.get("opcode") == "procedures_call" and block_id in call_proccodes:
+				proccode = call_proccodes[block_id]
+
+			if isinstance(proccode, str) and proccode:
+				frequencies[proccode] += 1
+
+		return _rename_delta_from_frequencies(frequencies, sort_keys)
+
+	frequencies = Counter()
+
+	def add_proccode(block_id, block):
+		if (
+			not isinstance(block, dict)
+			or block.get("opcode")
+			not in ("procedures_prototype", "procedures_call")
+		):
+			return
+
+		mutation = block.get("mutation")
+		if not isinstance(mutation, dict):
+			return
+
+		proccode = mutation.get("proccode")
+		if block.get("opcode") == "procedures_call" and block_id in call_proccodes:
+			proccode = call_proccodes[block_id]
+
+		if isinstance(proccode, str) and proccode:
+			frequencies[proccode] += 1
+
+	for block_id, block in blocks.items():
+		if block_id not in candidate_clones:
+			add_proccode(block_id, block)
+
+	for block_id, block in candidate_clones.items():
+		add_proccode(block_id, block)
+
+	return _rename_delta_from_frequencies(frequencies, sort_keys)
+
+
+def _rename_delta_from_frequencies(frequencies, sort_keys):
+	renamed = _procedure_name_map(frequencies)
+	delta = 0
+
+	for proccode, count in frequencies.items():
+		new_proccode = renamed[proccode]
+
+		if new_proccode != proccode:
+			old_size = len(
+				dumps_compact(proccode, sort_keys).encode(
+					"utf-8", "backslashreplace"
+				)
+			)
+			new_size = len(
+				dumps_compact(new_proccode, sort_keys).encode(
+					"utf-8", "backslashreplace"
+				)
+			)
+			delta += count * (new_size - old_size)
+
+	return delta
+
+
 def try_specialize_procedure_variants(
 	target, ti, proc, info, by_proc, qualifying, stats, opts, serial,
 	unbounded_procedure_specialization,
@@ -2614,11 +3518,13 @@ def try_specialize_procedure_variants(
 			break
 
 		representative_constants = members[0][2]
+
 		if not representative_constants:
 			continue
 
 		serial += 1
 		specialized_proc = _specialized_proccode(proc, serial)
+
 		if not specialized_proc or specialized_proc in by_proc:
 			continue
 
@@ -2630,6 +3536,7 @@ def try_specialize_procedure_variants(
 			stats,
 			opts,
 		)
+
 		if cloned is None:
 			continue
 
@@ -2669,6 +3576,7 @@ def try_specialize_procedure_variants(
 
 	for idx, variant in enumerate(variant_plans):
 		size = specialized_proc_trial_size(target, [variant], opts)
+
 		if size < selected_size:
 			selected_size = size
 			selected_indices = [idx]
@@ -2773,6 +3681,51 @@ def try_specialize_procedure_variants(
 	return serial, len(selected_indices), total_calls
 
 
+def _clone_specialization_group_worker(job):
+	target, info, proc, replacements = job
+	graph = ProjectGraph(target)
+	results = []
+
+	for replacement_constants in replacements:
+		results.append(
+			_clone_procedure_closure(
+				target,
+				info,
+				proc,
+				replacement_constants,
+				None,
+				None,
+				graph=graph,
+			)
+		)
+
+	return results
+
+
+_SPECIALIZATION_TRIAL_TARGET = None
+_SPECIALIZATION_TRIAL_OPTS = None
+
+
+def _init_specialization_trial_worker(target, opts):
+	global _SPECIALIZATION_TRIAL_TARGET, _SPECIALIZATION_TRIAL_OPTS
+	_SPECIALIZATION_TRIAL_TARGET = target
+	_SPECIALIZATION_TRIAL_OPTS = opts
+
+
+def _specialization_trial_size_worker(variant):
+	return specialized_proc_trial_size(
+		_SPECIALIZATION_TRIAL_TARGET, [variant], _SPECIALIZATION_TRIAL_OPTS
+	)
+
+
+def _should_parallelize_specialization(block_count, procedure_count, block_work):
+	return (
+		block_count >= 10000
+		and procedure_count >= 4
+		and block_work >= 512
+	)
+
+
 def specialize_procedures(project, stats, opts, progress):
 	targets = project.get("targets", [])
 	opts.specialized_procedure_new_blocks = [set() for _ in targets]
@@ -2796,18 +3749,29 @@ def specialize_procedures(project, stats, opts, progress):
 	serial = 0
 	pass_idx = 0
 	projected_sizes = [None for _ in targets]
+	dirty_targets = set(range(len(targets)))
+	persistent_caches = {}
+	skip_clean_targets = getattr(
+		opts, "procedure_specialization_skip_clean_targets", False
+	)
 
 	while unbounded_procedure_specialization or pass_idx < max_passes:
 		progress.detail(f"pass {pass_idx + 1}")
 		changed_this_pass = False
+		next_dirty_targets = set()
 
 		for ti, target in enumerate(targets):
+			# a target where nothing was specialized during the last pass cannot have more work
+			if skip_clean_targets and ti not in dirty_targets:
+				continue
+
+			trial_cache = persistent_caches.setdefault(ti, {})
 			blocks = target.get("blocks") or {}
+			progress.detail(f"pass {pass_idx + 1}, {target['name']}, {len(blocks)}")
 
 			if not blocks:
 				continue
 
-			progress.detail(f"pass {pass_idx + 1}, {target['name']}, {len(blocks)}")
 			projected_size = projected_sizes[ti]
 			by_proc, graph = _procedure_infos(target)
 
@@ -2833,6 +3797,8 @@ def specialize_procedures(project, stats, opts, progress):
 
 				if proc is not None:
 					calls_by_proc.setdefault(proc, []).append((call_id, block))
+
+			planned = []
 
 			for proc, infos in list(by_proc.items()):
 				if proc in recursive or len(infos) != 1:
@@ -2923,15 +3889,228 @@ def specialize_procedures(project, stats, opts, progress):
 				if not unbounded_procedure_specialization and body_size > 192:
 					continue
 
-				existing_variant_count = 0
-				for signature, members in (qualifying if unbounded_procedure_specialization else qualifying[:8]):
-					if existing_variant_count >= 8:
-						break
-
+				candidates = []
+				for signature, members in (
+					qualifying
+					if unbounded_procedure_specialization
+					else qualifying[:8]
+				):
 					representative_constants = members[0][2]
 
 					if not representative_constants:
 						continue
+
+					candidates.append(
+						{
+							"signature": signature,
+							"members": members,
+							"replacement_constants": representative_constants,
+						}
+					)
+
+				if candidates:
+					planned.append(
+						{
+							"proc": proc,
+							"info": info,
+							"candidates": candidates,
+							"parallel_results": None,
+						}
+					)
+
+			candidate_procs = {item["proc"] for item in planned}
+			parallel_plans = []
+			estimated_parallel_blocks = 0
+
+			for item in planned:
+				info = item["info"]
+				other_candidate_procs = candidate_procs - {item["proc"]}
+				has_candidate_call_dependency = any(
+					isinstance(blocks.get(block_id), dict)
+					and blocks[block_id].get("opcode") == "procedures_call"
+					and procedure_key(blocks[block_id]) in other_candidate_procs
+					for block_id in info["closure"]
+				)
+
+				if has_candidate_call_dependency:
+					continue
+
+				parallel_plans.append(item)
+				estimated_parallel_blocks += len(info["closure"]) * len(
+					item["candidates"]
+				)
+
+			closure_owners = {}
+			for item in parallel_plans:
+				for block_id in item["info"]["closure"]:
+					closure_owners.setdefault(block_id, set()).add(item["proc"])
+
+			parallelize_clones = _should_parallelize_specialization(
+				len(blocks), len(parallel_plans), estimated_parallel_blocks
+			)
+			parallel_trial_plans = [
+				item
+				for item in parallel_plans
+				if all(
+					len(closure_owners.get(block_id, ())) == 1
+					for block_id in item["info"]["closure"]
+				)
+			]
+			parallelize_trial_sizes = (
+				getattr(opts, "remove_unused_procedures", False)
+				and not getattr(opts, "rename_procedure_names", False)
+				and not unbounded_procedure_specialization
+				and parallelize_clones
+				and len(blocks) >= 10000
+				and len(parallel_trial_plans) >= 4
+				and _removal_model(trial_cache, target, opts) is None
+			)
+
+			parallel_trial_base_size = None
+			if parallelize_trial_sizes and projected_size is None:
+				parallel_trial_base_size = specialized_proc_trial_size(target, (), opts)
+				projected_size = parallel_trial_base_size
+				projected_sizes[ti] = projected_size
+			elif parallelize_trial_sizes:
+				parallel_trial_base_size = projected_size
+
+			planned_serial = serial
+			if not unbounded_procedure_specialization:
+				for item in planned:
+					for candidate in item["candidates"]:
+						planned_serial += 1
+						candidate["planned_serial"] = planned_serial
+
+			if parallelize_clones or parallelize_trial_sizes:
+				jobs = []
+				for item in parallel_plans if parallelize_clones else ():
+					info = item["info"]
+					closure = info["closure"]
+					worker_target = {
+						"blocks": {block_id: blocks[block_id] for block_id in closure},
+						"comments": {
+							comment_id: comment
+							for comment_id, comment in (target.get("comments") or {}).items()
+							if isinstance(comment, dict)
+							and comment.get("blockId") in closure
+						},
+					}
+					worker_info = {
+						"definition_id": info["definition_id"],
+						"prototype_id": info["prototype_id"],
+						"closure": closure,
+						"argument_ids": info["argument_ids"],
+						"mutation": info["mutation"],
+					}
+					jobs.append(
+						(
+							worker_target,
+							worker_info,
+							item["proc"],
+							[
+								candidate["replacement_constants"]
+								for candidate in item["candidates"]
+							],
+						)
+					)
+
+				worker_count = min(
+					max(len(jobs), len(parallel_trial_plans)),
+					os.cpu_count() or 1,
+					4 if parallelize_trial_sizes else 8,
+				)
+				progress.detail(
+					f"pass {pass_idx + 1}, {target['name']}, "
+					f"{len(jobs)} jobs, "
+					f"{len(parallel_trial_plans) if parallelize_trial_sizes else 0} size checks"
+				)
+				pool_args = {}
+				if parallelize_trial_sizes:
+					pool_args = {
+						"initializer": _init_specialization_trial_worker,
+						"initargs": (target, opts),
+					}
+				with ProcessPoolExecutor(
+					max_workers=worker_count, **pool_args
+				) as executor:
+					if parallelize_clones:
+						results = list(
+							executor.map(_clone_specialization_group_worker, jobs)
+						)
+
+						for item, clones in zip(parallel_plans, results):
+							item["parallel_results"] = clones
+
+					if parallelize_trial_sizes:
+						trial_items = []
+						trial_variants = []
+						for item in parallel_trial_plans:
+							for candidate_index, candidate in enumerate(
+								item["candidates"]
+							):
+								candidate_serial = candidate.get("planned_serial")
+								if candidate_serial is None:
+									continue
+								specialized_proc = _specialized_proccode(
+									item["proc"], candidate_serial
+								)
+								if (
+									not specialized_proc
+									or specialized_proc in by_proc
+								):
+									continue
+								cloned = (
+									item["parallel_results"][candidate_index]
+									if item["parallel_results"] is not None
+									else None
+								)
+								if cloned is None:
+									continue
+								clones = cloned[0]
+								_, _, _, new_prototype_id, _ = cloned
+								prototype = clones.get(new_prototype_id)
+								mutation = (
+									prototype.get("mutation")
+									if isinstance(prototype, dict)
+									else None
+								)
+								if isinstance(mutation, dict):
+									mutation["proccode"] = specialized_proc
+								trial_items.append((item, candidate_index))
+								trial_variants.append(
+									{
+										"clones": clones,
+										"members": [
+											(call_id, None, {})
+											for call_id, _call, _replacements in candidate[
+												"members"
+											]
+										],
+										"specialized_proc": specialized_proc,
+									}
+								)
+
+						if trial_variants:
+							trial_sizes = list(
+								executor.map(
+									_specialization_trial_size_worker, trial_variants
+								)
+							)
+							for (item, candidate_index), size in zip(
+								trial_items, trial_sizes
+							):
+								item.setdefault("parallel_trial_sizes", {})[
+									candidate_index
+								] = size
+
+			for item in planned:
+				proc = item["proc"]
+				info = item["info"]
+				existing_variant_count = 0
+
+				for candidate_index, candidate in enumerate(item["candidates"]):
+					if existing_variant_count >= 8:
+						break
 
 					serial += 1
 					specialized_proc = _specialized_proccode(proc, serial)
@@ -2939,14 +4118,18 @@ def specialize_procedures(project, stats, opts, progress):
 					if not specialized_proc or specialized_proc in by_proc:
 						continue
 
-					cloned = _clone_procedure_closure(
-						target,
-						info,
-						specialized_proc,
-						representative_constants,
-						stats,
-						opts,
-					)
+					if item["parallel_results"] is None:
+						cloned = _clone_procedure_closure(
+							target,
+							info,
+							specialized_proc,
+							candidate["replacement_constants"],
+							stats,
+							opts,
+							graph=graph,
+						)
+					else:
+						cloned = item["parallel_results"][candidate_index]
 
 					if cloned is None:
 						continue
@@ -2958,62 +4141,55 @@ def specialize_procedures(project, stats, opts, progress):
 						new_prototype_id,
 						removed_reporter_count,
 					) = cloned
-
-					def estimated_variant_block(block_id, block):
-						if not isinstance(block, dict):
-							return block
-
-						if not getattr(opts, "rename_procedure_names", False):
-							return block
-
-						if block_id != new_prototype_id:
-							return block
-
-						probe = copy.deepcopy(block)
-						mutation = probe.get("mutation")
-
-						if (
-							isinstance(mutation, dict)
-							and mutation.get("proccode") == specialized_proc
-						):
-							mutation["proccode"] = "a"
-
-						return probe
-
-					call_delta = 0
-
-					for call_id, call, _ in members:
-						before_call = len(
-							dumps_compact(call).encode("utf-8", "backslashreplace")
+					if set(clones).intersection(blocks):
+						cloned = _clone_procedure_closure(
+							target,
+							info,
+							specialized_proc,
+							candidate["replacement_constants"],
+							stats,
+							opts,
+							graph=graph,
 						)
-						probe_call = copy.deepcopy(call)
-						probe_mutation = probe_call.get("mutation")
-
-						if isinstance(probe_mutation, dict):
-							probe_mutation["proccode"] = (
-								"a"
-								if getattr(opts, "rename_procedure_names", False)
-								else specialized_proc
-							)
-
-						after_call = len(
-							dumps_compact(probe_call).encode(
-								"utf-8", "backslashreplace"
-							)
-						)
-						call_delta += after_call - before_call
-
+						if cloned is None:
+							continue
+						(
+							clones,
+							id_map,
+							new_definition_id,
+							new_prototype_id,
+							removed_reporter_count,
+						) = cloned
+					prototype_mutation = (
+						clones.get(new_prototype_id, {}).get("mutation")
+						if isinstance(clones.get(new_prototype_id), dict)
+						else None
+					)
+					if isinstance(prototype_mutation, dict):
+						prototype_mutation["proccode"] = specialized_proc
+					members = candidate["members"]
 					variant_obj = {
 						"clones": clones,
 						"members": members,
 						"specialized_proc": specialized_proc,
 					}
 					if projected_size is None:
-						projected_size = specialized_proc_trial_size(target, (), opts)
+						projected_size = specialized_proc_trial_size(
+							target, (), opts, None, trial_cache
+						)
 						projected_sizes[ti] = projected_size
-					variant_size = specialized_proc_trial_size(
-						target, [variant_obj], opts
-					)
+					parallel_trial_size = item.get(
+						"parallel_trial_sizes", {}
+					).get(candidate_index)
+					if parallel_trial_size is not None:
+						variant_size = projected_size + (
+							parallel_trial_size - parallel_trial_base_size
+						)
+					else:
+						variant_size = specialized_proc_trial_size(
+							target, [variant_obj], opts, projected_size, trial_cache
+						)
+
 					if variant_size >= projected_size:
 						continue
 
@@ -3031,6 +4207,7 @@ def specialize_procedures(project, stats, opts, progress):
 						else None
 					)
 
+					_accept_into_trial_cache(trial_cache, variant_obj)
 					blocks.update(clones)
 					stats["procedure_specialization_blocks_added"] += len(clones)
 					stats[
@@ -3079,9 +4256,12 @@ def specialize_procedures(project, stats, opts, progress):
 					total_calls += len(members)
 					existing_variant_count += 1
 					changed_this_pass = True
+					next_dirty_targets.add(ti)
 
 		if not changed_this_pass:
 			break
+
+		dirty_targets = next_dirty_targets
 
 		completed_passes += 1
 		pass_idx += 1

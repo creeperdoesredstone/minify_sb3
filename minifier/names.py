@@ -80,8 +80,10 @@ class ProgressBar:
 		self._render(force=True)
 
 	def detail(self, text):
-		self.detail_text = str(text)
-		self._render()
+		text = str(text)
+		changed = text != self.detail_text
+		self.detail_text = text
+		self._render(force=changed)
 
 	def finish(self, label="Complete"):
 		self.completed = self.total
@@ -1167,6 +1169,46 @@ def _frequency_optimal_id_map(ids, frequencies=None, existing_ids=(), prefix="")
 	return _rename_id_map(ordered, existing_ids=existing_ids, prefix=prefix)
 
 
+def _procedure_name_map(procedure_frequencies):
+	procedure_alphabet = (
+		"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	)
+
+	def short_procedure_name(index):
+		base = len(procedure_alphabet)
+		name = ""
+		n = index
+
+		while True:
+			name = procedure_alphabet[n % base] + name
+			n = n // base
+			if n == 0:
+				return name
+
+	result = {}
+
+	for index, old_proccode in enumerate(
+		sorted(
+			procedure_frequencies,
+			key=lambda proccode: (-procedure_frequencies[proccode], proccode),
+		)
+	):
+		new_name = short_procedure_name(index)
+		percent = old_proccode.find("%")
+
+		if percent >= 0:
+			suffix_start = percent
+			while suffix_start > 0 and old_proccode[suffix_start - 1].isspace():
+				suffix_start -= 1
+			new_proccode = new_name + old_proccode[suffix_start:]
+		else:
+			new_proccode = new_name
+
+		result[old_proccode] = new_proccode
+
+	return result
+
+
 def _replace_field_id(block, field_names, mapping):
 	if not isinstance(block, dict):
 		return 0
@@ -1871,36 +1913,9 @@ def rename_identifiers(
 				if isinstance(proccode, str) and proccode:
 					procedure_frequencies[proccode] += 1
 
-			old_proccodes = list(procedure_frequencies)
-			procedure_alphabet = (
-				"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-			)
-
-			def short_procedure_name(index):
-				base = len(procedure_alphabet)
-				name = ""
-				n = index
-
-				while True:
-					name = procedure_alphabet[n % base] + name
-					n = n // base
-					if n == 0:
-						return name
-
-			for index, old_proccode in enumerate(
-				sorted(old_proccodes, key=lambda p: (-procedure_frequencies[p], p))
-			):
-				new_name = short_procedure_name(index)
-				percent = old_proccode.find("%")
-
-				if percent >= 0:
-					suffix_start = percent
-					while suffix_start > 0 and old_proccode[suffix_start - 1].isspace():
-						suffix_start -= 1
-					new_proccode = new_name + old_proccode[suffix_start:]
-				else:
-					new_proccode = new_name
-
+			for old_proccode, new_proccode in _procedure_name_map(
+				procedure_frequencies
+			).items():
 				procedure_new_names[(ti, old_proccode)] = new_proccode
 
 				if old_proccode != new_proccode:

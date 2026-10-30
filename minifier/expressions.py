@@ -4,6 +4,7 @@ from .constants import *
 
 import copy
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -5625,6 +5626,38 @@ def _compact_data_entry_equal(original, minified):
 	return _compact_data_value_equal(original[1], minified[1])
 
 
+class _TouchRecorder:
+	__slots__ = ("_graph", "touched")
+
+	def __init__(self, graph):
+		object.__setattr__(self, "_graph", graph)
+		object.__setattr__(self, "touched", set())
+
+	def __getattr__(self, name):
+		return getattr(self._graph, name)
+
+	def refresh_blocks(self, ids, *args, **kwargs):
+		ids = tuple(ids)
+		self.touched.update(ids)
+		return self._graph.refresh_blocks(ids, *args, **kwargs)
+
+
+def _ancestor_owner_ids(graph, ids):
+	seen = set()
+	stack = list(ids)
+
+	while stack:
+		bid = stack.pop()
+
+		if bid in seen:
+			continue
+
+		seen.add(bid)
+		stack.extend(graph.parents.get(bid, ()))
+
+	return seen
+
+
 def fold_constant_expressions(
 	project: dict[str, Any], stats: dict[str, int], opts: Options
 ):
@@ -5652,7 +5685,7 @@ def fold_constant_expressions(
 
 	for ti, target in enumerate(targets):
 		blocks = target.get("blocks") or {}
-		graph = ProjectGraph(target)
+		graph = _TouchRecorder(ProjectGraph(target))
 		incoming_refs = graph.incoming
 		candidate_inputs = [
 			(block_id, input_name)
@@ -5674,10 +5707,22 @@ def fold_constant_expressions(
 			if isinstance(c, dict) and c.get("blockId") is not None
 		}
 
-		while True:
+		cand_by_owner = defaultdict(list)
+		for idx, (owner_id, _) in enumerate(candidate_inputs):
+			cand_by_owner[owner_id].append(idx)
+
+		dirty = list(range(len(candidate_inputs)))  # already a valid heap
+		queued = set(dirty)
+
+		while dirty:
 			changed = False
-			for block_id, input_name in candidate_inputs:
+			idx = heapq.heappop(dirty)
+			queued.discard(idx)
+			incoming_refs = graph.incoming
+
+			for block_id, input_name in (candidate_inputs[idx],):
 				block = blocks.get(block_id)
+
 				if not isinstance(block, dict):
 					continue
 
@@ -6000,7 +6045,7 @@ def fold_constant_expressions(
 						for remove_id in folded_ids:
 							blocks.pop(remove_id, None)
 
-						graph.refresh_blocks((block_id, *owned_ids))
+						graph.refresh_blocks((block_id, *folded_ids))
 						incoming_refs = graph.incoming
 						folded += 1
 						changed = True
@@ -6125,8 +6170,15 @@ def fold_constant_expressions(
 				if changed:
 					break
 
-			if not changed:
-				break
+			if changed:
+				graph.touched.add(block_id)
+				for owner in _ancestor_owner_ids(graph, graph.touched):
+					for i in cand_by_owner.get(owner, ()):
+						if i not in queued:
+							queued.add(i)
+							heapq.heappush(dirty, i)
+							
+			graph.touched.clear()
 
 	stats["constant_expressions_folded"] += folded
 	return folded
