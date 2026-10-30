@@ -2801,32 +2801,6 @@ def verify(original_path, minified_path, opts):
 				) and _compact_data_entry_equal(lo, lm):
 					continue
 				
-				allow_numeric_reencoding = (
-					opts.normalize_numbers
-					or getattr(opts, "optimize_json", False)
-					or getattr(opts, "minimum_json", False)
-				)
-				
-				if (
-					allow_numeric_reencoding
-					and isinstance(lo, list)
-					and isinstance(lm, list)
-					and len(lo) == len(lm)
-					and isinstance(lo[1], list)
-					and isinstance(lm[1], list)
-					and len(lo[1]) == len(lm[1])
-					and all(
-						x == y or _num_eq(x, y, opts.normalize_epsilon)
-						for x, y in zip(lo[1], lm[1])
-					)
-					and (
-						lo[0] == lm[0]
-						or getattr(opts, "rename_list_names", False)
-						or getattr(opts, "rename_identifiers", False)
-					)
-				):
-					continue
-				
 				if not (
 					(ti, lid) in approved
 					and isinstance(lm, list)

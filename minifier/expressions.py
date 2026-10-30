@@ -66,8 +66,13 @@ def normalize_numbers(project, stats, epsilon):
 
 		return v
 
-	for i, target in enumerate(project.get("targets", [])):
-		project["targets"][i] = rec(target)
+	for target in project.get("targets", []):
+		if not isinstance(target, dict):
+			continue
+
+		for key, value in list(target.items()):
+			if key != "lists":
+				target[key] = rec(value)
 
 	project["monitors"] = rec(project.get("monitors", []))
 	stats["numbers_normalized"] += changed
@@ -5539,6 +5544,7 @@ def _numeric_data_literal(value):
 
 def compact_data_literals(project, stats):
 	count = 0
+	
 	for target in project.get("targets", []):
 		for entry in (target.get("variables") or {}).values():
 			if isinstance(entry, list) and len(entry) >= 2:
@@ -5546,18 +5552,7 @@ def compact_data_literals(project, stats):
 				if new is not None:
 					entry[1] = new
 					count += 1
-		for entry in (target.get("lists") or {}).values():
-			if not (
-				isinstance(entry, list)
-				and len(entry) >= 2
-				and isinstance(entry[1], list)
-			):
-				continue
-			for i, value in enumerate(entry[1]):
-				new = _numeric_data_literal(value)
-				if new is not None:
-					entry[1][i] = new
-					count += 1
+		
 	stats["data_literals_compacted"] += count
 	return count
 
@@ -5605,6 +5600,7 @@ def remove_unused_extensions(project, stats, opts):
 def _compact_data_value_equal(original, minified):
 	if original == minified:
 		return True
+	
 	converted = _numeric_data_literal(original) if isinstance(original, str) else None
 	return converted is not None and converted == minified
 
@@ -5617,12 +5613,13 @@ def _compact_data_entry_equal(original, minified):
 		and original[0] == minified[0]
 	):
 		return False
+	
 	if len(original) < 2:
 		return original == minified
-	if isinstance(original[1], list) and isinstance(minified[1], list):
-		return len(original[1]) == len(minified[1]) and all(
-			_compact_data_value_equal(a, b) for a, b in zip(original[1], minified[1])
-		)
+	
+	if isinstance(original[1], list) or isinstance(minified[1], list):
+		return False
+	
 	return _compact_data_value_equal(original[1], minified[1])
 
 
