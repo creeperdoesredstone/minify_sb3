@@ -1801,7 +1801,7 @@ def _reduce_repeated_assignment_deltas(project, stats, opts):
 					change = _numeric_literal_input(
 						(block.get("inputs") or {}).get("VALUE")
 					)
-					
+
 					if (
 						previous_form is not None
 						and previous_index is not None
@@ -6152,12 +6152,12 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 	)
 	print(
 		Ansi.muted(
-			f"  Positive-size candidates: {len(positive)} (about {total_positive:,} bytes saved)"
+			f"  {len(positive)} candidates when folded can save about {total_positive:,} bytes"
 		)
 	)
 	print(
 		Ansi.muted(
-			f"  Negative-size candidates: {len(negative)} (folding would increase project.json)"
+			f"  {len(negative)} candidates when folded would increase project.json"
 		)
 	)
 	print()
@@ -6169,15 +6169,15 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 		nm = (
 			c["name"]
 			if len(c["name"]) <= w_name
-			else c["name"][: w_name - 1] + "Ã¢â‚¬Â¦"
+			else c["name"][: w_name - 1] + "..."
 		)
 		notes = []
 		if c["bytes"] < 0:
-			notes.append("LOSS")
+			notes.append("!")
 		if c["changes"]:
-			notes.append(f"+{c['changes']} change")
+			notes.append(f"-{c['changes']} change")
 		print(
-			f" {i:>4}  {c['scope']:<{w_scope}}  {nm:<{w_name}}  {c['reporters']:>5,}  {c['bytes']:>+8,}  {'; '.join(notes)}"
+			f" {i:>4}  {c['scope']:<{w_scope}}  {nm:<{w_name}}  {c['reporters']:>5,}  {-c['bytes']:>+8,}  {'; '.join(notes)}"
 		)
 
 	print()
@@ -6189,7 +6189,7 @@ def prompt_for_constant_variables(project, candidates) -> dict:
 	)
 	print(
 		Ansi.muted(
-			"  Negative byte estimates are marked LOSS and are not selected by 'p'."
+			"  Positive byte estimates are marked '!' and are not selected by 'p'."
 		)
 	)
 	print()

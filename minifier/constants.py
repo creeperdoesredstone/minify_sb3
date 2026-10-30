@@ -589,11 +589,12 @@ _VERIFY_BLOCK_MAP_ATTRS = (
 STAT_GROUPS = [
 	(
 		"1.",
-		"Drop topLevel:false / shadow:false; normalize mutation.warp",
+		"Optimize blocks",
 		[
 			("topLevel", "topLevel:false dropped"),
 			("shadow", "shadow:false dropped"),
 			("warp", "mutation.warp normalized to boolean"),
+            ("orphaned_reporters_removed", "orphaned reporters removed"),
 		],
 	),
 	(

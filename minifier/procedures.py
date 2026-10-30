@@ -394,7 +394,7 @@ def remove_unreachable_blocks(project, stats, stat_key="unreachable_blocks_remov
 		roots = {
 			bid
 			for bid, b in blocks.items()
-			if isinstance(b, list) or (isinstance(b, dict) and b.get("topLevel"))
+			if isinstance(b, list) or (isinstance(b, dict) and b.get("topLevel") and (is_hat_block(b) or b.get("opcode") == "procedures_definition"))
 		}
 		graph = ProjectGraph(target)
 		edges = graph.edges

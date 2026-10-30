@@ -45,6 +45,7 @@ toggles = {
 	"--rename-broadcast-names",
 	"--rename-argument-names",
 	"--rename-procedure-names",
+    "--rename-sprite-names",
 	"--remove-unused-variables",
 	"--remove-unused-lists",
 	"--remove-unused-broadcasts",

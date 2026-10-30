@@ -67,6 +67,7 @@ class Options:
 		rename_broadcast_names=False,
 		rename_argument_names=False,
 		rename_procedure_names=False,
+		rename_sprite_names=False,
 		remove_unused_variables=False,
 		remove_unused_lists=False,
 		remove_unused_broadcasts=False,
@@ -233,6 +234,7 @@ class Options:
 		self.rename_broadcast_names = rename_broadcast_names
 		self.rename_argument_names = rename_argument_names
 		self.rename_procedure_names = rename_procedure_names
+		self.rename_sprite_names = rename_sprite_names
 
 		self.remove_unused_variables = remove_unused_variables
 		self.remove_unused_lists = remove_unused_lists
@@ -573,6 +575,7 @@ def build_options(raw_flags: list[str], args: list[str]) -> Options:
 		rename_broadcast_names="--rename-broadcast-names" in flags,
 		rename_argument_names="--rename-argument-names" in flags,
 		rename_procedure_names="--rename-procedure-names" in flags,
+		rename_sprite_names="--rename-sprite-names" in flags,
 		rename_argument_ids="--rename-argument-ids" in flags,
 		remove_unused_variables="--remove-unused-variables" in flags,
 		remove_unused_lists="--remove-unused-lists" in flags,
